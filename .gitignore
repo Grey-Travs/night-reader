@@ -1,0 +1,33 @@
+# Secrets / OAuth — never commit
+client_secret*.json
+token.json
+.env
+
+# Personal config (holds your settings; copy from config.example.toml)
+config.toml
+
+# Your translated novels & progress (per-user data)
+projects/
+chapters/
+audit/
+glossary.json
+glossary.md
+glossary_pending.json
+state.json
+full-novel.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Web
+web/node_modules/
+web/dist/
+
+# OS / editor / local tooling
+.DS_Store
+.claude/
+.vscode/
+.idea/

@@ -1,0 +1,42 @@
+# Korean Web-Novel Translation Pipeline — configuration
+# Copy to config.toml and fill in source_doc_id.
+
+[anthropic]
+model = "claude-opus-4-8"      # API model id. Configurable.
+effort = "high"                # low | medium | high | xhigh | max  (drives consistency/fidelity)
+thinking = true                # adaptive thinking on/off
+# temperature: Opus 4.8/4.7 REMOVED temperature (sending it -> 400). Leave unset for those
+# models. Only set a value if you switch `model` to one that still accepts it (e.g. an
+# older Sonnet/Opus). Uncomment to use:
+# temperature = 0.3
+max_output_tokens = 32000      # streamed; raise for very long chapters (Opus supports up to 128000)
+web_access = false             # if true, give the model the web_search tool to look up canonical spellings
+api_retry_count = 4            # SDK-level retries on 429/5xx (exponential backoff)
+
+[google]
+source_doc_id = "REPLACE_WITH_GOOGLE_DOC_ID"
+credentials_file = "client_secret.json"   # OAuth desktop-app client secret from Google Cloud Console
+token_file = "token.json"                 # cached user token (created on first auth)
+flatten_child_tabs = true                 # depth-first flatten nested child tabs into their parent chapter
+
+[paths]
+output_dir = "chapters"
+glossary_json = "glossary.json"
+glossary_md = "glossary.md"
+glossary_pending = "glossary_pending.json"
+state_file = "state.json"
+audit_dir = "audit"
+
+[translation]
+chunk_threshold = 12000        # Korean chars; chapters at/under this translate in one call (preserves voice)
+continuity_paragraphs = 3      # trailing source paragraphs of the previous chunk passed as do-not-translate context
+include_prev_translation = false  # also pass the previous chunk's translation as continuity context
+romanization = "Revised Romanization (RR)"
+honorific_note = "Keep -hyung and similar relational honorifics attached to names; localize or drop the address particles -ssi, -ya, -ah, -nim into natural English."
+
+[validation]
+length_ratio_min = 1.6          # English/Korean char ratio lower bound (below -> likely omission)
+length_ratio_max = 3.2          # upper bound. Korean is dense; faithful EN runs ~2.0-2.5x, so the band is wide.
+paragraph_tolerance = 2         # absolute floor for |output - source| paragraph-count difference
+paragraph_tolerance_pct = 0.05  # OR this fraction of source paragraphs, whichever is larger
+dialogue_tolerance = 3          # allowed |output - source| dialogue-line difference (secondary signal)

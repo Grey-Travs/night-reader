@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Web-Novel Translator</title>
+    <script>
+      // Apply the saved theme before paint to avoid a flash. Dark is the default.
+      try {
+        if (localStorage.getItem('theme') === 'light')
+          document.documentElement.setAttribute('data-theme', 'light')
+      } catch (e) {}
+    </script>
+    <style>html { background: #181520 } html[data-theme="light"] { background: #FBF8F3 }</style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

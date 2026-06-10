@@ -1,0 +1,8 @@
+# Backend (engine + web API)
+claude-agent-sdk>=0.2.9
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+pydantic>=2.6
+fastapi>=0.110
+uvicorn[standard]>=0.29

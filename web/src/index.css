@@ -1,0 +1,168 @@
+@import url('https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Inter:wght@400;500;600&display=swap');
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css');
+@import "tailwindcss";
+
+/* ── Night Reader tokens ───────────────────────────────────────────────────
+   Dark is the default (:root); light is the derived override. Every surface
+   colour is a CSS variable, so the theme swap is a single attribute change
+   (data-theme="light" on <html>). Tailwind utilities below map to these vars. */
+:root {
+  --page: #181520;
+  --surface: #221E2A;
+  --reading: #1E1A26;
+  --elevated: #2A2531;
+  --border: rgba(255, 255, 255, .08);
+  --border-strong: rgba(255, 255, 255, .14);
+  --ink: #ECE6DF;
+  --muted: #B3AAB0;
+  --hint: #968E9C;            /* AA on all dark surfaces incl. --elevated (>=4.7:1) */
+  --accent: #D9A85C;          /* fill / progress / icons */
+  --accent-text: #D9A85C;     /* accent used as TEXT (passes on dark) */
+  --accent-hover: #E6B86E;
+  --accent-press: #C2924A;
+  --accent-ink: #1F1A0C;
+  --scrim: rgba(10, 8, 14, .55);
+  --danger: #F0A98E;
+
+  --b-translated-bg: rgba(99, 153, 34, .18);  --b-translated-tx: #B9D98A;
+  --b-translating-bg: rgba(55, 138, 221, .18); --b-translating-tx: #9CC6F0;
+  --b-queued-bg: rgba(186, 117, 23, .18);      --b-queued-tx: #E3B873;
+  --b-review-bg: rgba(216, 90, 48, .20);       --b-review-tx: #F0A98E;
+  --b-english-bg: rgba(127, 119, 221, .20);    --b-english-tx: #BBB5EF;
+  --b-muted-bg: rgba(255, 255, 255, .06);      --b-muted-tx: #A7A0AC;
+}
+
+[data-theme="light"] {
+  --page: #FBF8F3;
+  --surface: #FFFFFF;
+  --reading: #FFFDF9;
+  --elevated: #FFFFFF;
+  --border: rgba(0, 0, 0, .08);
+  --border-strong: rgba(0, 0, 0, .14);
+  --ink: #2A2622;
+  --muted: #6E665E;
+  --hint: #6F685F;            /* AA on the off-white light surfaces (>=5.1:1) */
+  --accent: #9C6420;          /* fill — white label clears AA (4.9:1) */
+  --accent-text: #8A5A18;     /* accent used as TEXT (>=5.5:1 on light surfaces) */
+  --accent-hover: #8A5618;
+  --accent-press: #7A4C14;
+  --accent-ink: #FFFFFF;
+  --scrim: rgba(40, 34, 26, .35);
+  --danger: #712B13;
+
+  --b-translated-bg: #EAF3DE; --b-translated-tx: #27500A;
+  --b-translating-bg: #E6F1FB; --b-translating-tx: #0C447C;
+  --b-queued-bg: #FAEEDA;      --b-queued-tx: #633806;
+  --b-review-bg: #FAECE7;      --b-review-tx: #712B13;
+  --b-english-bg: #EEEDFE;     --b-english-tx: #3C3489;
+  --b-muted-bg: rgba(0, 0, 0, .05); --b-muted-tx: #6E665E;
+}
+
+/* Map the runtime vars into Tailwind tokens (utilities like bg-page, text-ink,
+   border-line, rounded-card, font-reading resolve the live variable). */
+@theme inline {
+  --color-page: var(--page);
+  --color-surface: var(--surface);
+  --color-reading: var(--reading);
+  --color-elevated: var(--elevated);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-hint: var(--hint);
+  --color-accent: var(--accent);
+  --color-accent-text: var(--accent-text);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-ink: var(--accent-ink);
+  --color-danger: var(--danger);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+
+  --font-reading: 'Spectral', Georgia, 'Times New Roman', serif;
+  --font-ui: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-korean: 'Pretendard Variable', 'Pretendard', 'Apple SD Gothic Neo', sans-serif;
+
+  --radius-card: 16px;
+  --radius-btn: 10px;
+}
+
+@layer base {
+  html { color-scheme: dark; }
+  [data-theme="light"] { color-scheme: light; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: color-mix(in oklab, var(--accent) 30%, transparent); color: var(--ink); }
+  *:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+}
+
+/* ── Reusable pieces (keep components terse + consistent) ──────────────────── */
+@layer components {
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-card); }
+  .sunken { background: var(--page); border: 1px solid var(--border); border-radius: var(--radius-card); }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: .4rem;
+    border-radius: var(--radius-btn); font-weight: 500; font-size: 14px;
+    transition: background .15s ease, border-color .15s ease, color .15s ease, opacity .15s ease;
+  }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: var(--accent-ink); }
+  .btn-primary:not(:disabled):hover { background: var(--accent-hover); }
+  .btn-primary:not(:disabled):active { background: var(--accent-press); }
+  .btn-ghost { border: 1px solid var(--border); color: var(--ink); background: transparent; }
+  .btn-ghost:not(:disabled):hover { border-color: var(--border-strong); background: color-mix(in oklab, var(--ink) 6%, transparent); }
+  .btn-quiet { color: var(--muted); background: transparent; }
+  .btn-quiet:hover { color: var(--ink); }
+
+  .input {
+    background: color-mix(in oklab, var(--ink) 4%, transparent);
+    border: 1px solid var(--border); border-radius: var(--radius-btn);
+    color: var(--ink); padding: .5rem .75rem; font-size: 14px;
+  }
+  .input::placeholder { color: var(--hint); }
+  .input:focus { outline: none; border-color: var(--accent); }
+
+  .pill { display: inline-flex; align-items: center; border-radius: 9999px; padding: 2px 10px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+  .pill-translated { background: var(--b-translated-bg); color: var(--b-translated-tx); }
+  .pill-translating { background: var(--b-translating-bg); color: var(--b-translating-tx); }
+  .pill-queued { background: var(--b-queued-bg); color: var(--b-queued-tx); }
+  .pill-review { background: var(--b-review-bg); color: var(--b-review-tx); }
+  .pill-english { background: var(--b-english-bg); color: var(--b-english-tx); }
+  .pill-muted { background: var(--b-muted-bg); color: var(--b-muted-tx); }
+
+  /* Reading typography (the rendered English chapter). */
+  .reading { font-family: var(--font-reading); font-size: 18px; line-height: 1.75; color: var(--ink); }
+  .reading > :first-child { margin-top: 0; }
+  .reading p { margin: 0 0 1.15em; }
+  .reading h1 { font-family: var(--font-reading); font-size: 1.7rem; font-weight: 500; line-height: 1.25; margin: 1.5em 0 .7em; }
+  .reading h2 { font-family: var(--font-reading); font-size: 1.3rem; font-weight: 500; margin: 1.3em 0 .5em; }
+  .reading em { font-style: italic; color: var(--muted); }
+  .reading strong { font-weight: 600; }
+  .reading blockquote { border-left: 2px solid var(--border-strong); padding-left: 1em; color: var(--muted); margin: 0 0 1.15em; }
+  .reading hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+
+  /* Korean source column. */
+  .korean { font-family: var(--font-korean); font-size: 17px; line-height: 1.8; color: var(--muted); white-space: pre-wrap; }
+
+  /* Table row hover (subtle ink wash). */
+  .rowhover { transition: background .12s ease; }
+  .rowhover:hover { background: color-mix(in oklab, var(--ink) 4%, transparent); }
+}
+
+/* Gentle entrance for live-console rows (the one orchestrated moment). */
+@keyframes rowIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.row-in { animation: rowIn .28s ease both; }
+
+/* Touch targets — ensure >=44px hit areas on coarse pointers (phones). */
+@media (pointer: coarse) {
+  .btn { min-height: 44px; }
+  .tap { min-width: 44px; min-height: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
