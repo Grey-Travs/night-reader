@@ -11,6 +11,8 @@ Run from the project root:  uvicorn server.app:app --port 8000
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import re
 import uuid
@@ -20,18 +22,20 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from translation_bot import state as state_mod
 from translation_bot.config import Config
 from translation_bot.docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
-from translation_bot.glossary import Glossary, GlossaryEntry, load_pending, save_pending
+from translation_bot.epub import build_epub
+from translation_bot.glossary import VALID_TYPES, Glossary, GlossaryEntry, load_pending, save_pending
 from translation_bot.google_auth import build_docs_service, get_credentials
-from translation_bot.pipeline import chapter_filename, process_chapter
+from translation_bot.pipeline import chapter_filename, process_chapter, write_chapter_file
 from translation_bot.state import State
+from translation_bot.text_source import split_text_into_chapters
 from translation_bot.translator import RateLimitedError, Translator
 
 from . import projects as pj
@@ -95,11 +99,16 @@ def classify(ch: Chapter, cfg: Config) -> str:
 
 def get_chapters(pid: str, cfg: Config, refresh: bool = False) -> list[Chapter]:
     if refresh or pid not in _chapter_cache:
-        creds = get_credentials(cfg.google.credentials_file, cfg.google.token_file)
-        doc = fetch_document(build_docs_service(creds), cfg.google.source_doc_id)
-        _chapter_cache[pid] = extract_chapters(
-            doc, flatten_child_tabs=cfg.google.flatten_child_tabs
-        )
+        project = pj.get_project(pid) or {}
+        if project.get("source_type") == "text":
+            # Pasted / uploaded text — read from the stored source, no network.
+            _chapter_cache[pid] = pj.load_text_chapters(pid)
+        else:
+            creds = get_credentials(cfg.google.credentials_file, cfg.google.token_file)
+            doc = fetch_document(build_docs_service(creds), cfg.google.source_doc_id)
+            _chapter_cache[pid] = extract_chapters(
+                doc, flatten_child_tabs=cfg.google.flatten_child_tabs
+            )
     return _chapter_cache[pid]
 
 
@@ -229,6 +238,12 @@ def project_summary(project: dict) -> dict:
         "needs_review": counts.get("needs-review", 0),
         "cost_usd": state.totals().get("cost_usd", 0.0),
         "chapter_count": project.get("chapter_count"),
+        "source_type": project.get("source_type", "gdoc"),
+        # Effective per-novel style (project override, else global default) so the
+        # novel-settings UI shows what's actually in force.
+        "style_note": cfg.translation.style_note,
+        "instructions": cfg.translation.extra_instruction,
+        "honorific_note": cfg.translation.honorific_note,
     }
 
 
@@ -267,6 +282,107 @@ def delete_project(pid: str) -> dict:
         raise HTTPException(404, "project not found")
     _chapter_cache.pop(pid, None)
     return {"ok": True}
+
+
+class CreateTextProject(BaseModel):
+    name: str = ""
+    text: str
+    split_mode: str = "separator"  # separator | heading | single
+    separator: str = "---"
+
+
+@app.post("/api/projects/text")
+def create_text_project(body: CreateTextProject) -> dict:
+    """Create a novel from pasted/uploaded text (no Google account needed)."""
+    chapters = split_text_into_chapters(body.text, body.split_mode, body.separator)
+    if not chapters:
+        raise HTTPException(400, "Couldn't find any chapters in that text.")
+    project = pj.create_text_project(body.name or "Untitled novel", chapters)
+    _chapter_cache[project["id"]] = chapters
+    return project_summary(project)
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = None
+    style_note: str | None = None
+    instructions: str | None = None
+    honorific_note: str | None = None
+
+
+@app.post("/api/projects/{pid}")
+def update_project(pid: str, body: ProjectUpdate) -> dict:
+    """Rename a novel and/or edit its per-novel translation style settings."""
+    require_project(pid)
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    project = pj.update_project(pid, **fields)
+    return project_summary(project)
+
+
+@app.get("/api/projects/{pid}/search")
+def search_chapters(pid: str, q: str = "") -> dict:
+    """Case-insensitive substring search over the translated chapter text."""
+    _, cfg = project_cfg(pid)
+    needle = (q or "").strip().lower()
+    if not needle:
+        return {"results": []}
+    chapters = get_chapters(pid, cfg)
+    total = len(chapters)
+    results = []
+    for ch in chapters:
+        path = cfg.paths.output_dir / chapter_filename(ch.index, total)
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        pos = text.lower().find(needle)
+        if pos == -1:
+            continue
+        start, end = max(0, pos - 40), min(len(text), pos + len(needle) + 60)
+        snippet = (("…" if start else "") + text[start:end].replace("\n", " ").strip()
+                   + ("…" if end < len(text) else ""))
+        results.append({"index": ch.index, "title": ch.title, "snippet": snippet})
+    return {"results": results}
+
+
+def _safe_name(name: str) -> str:
+    base = re.sub(r"[^\w\- ]+", "", name or "novel").strip().replace(" ", "_")
+    return base[:60] or "novel"
+
+
+def _translated_chapters(pid: str, cfg: Config) -> list[tuple[int, str, str]]:
+    """(index, title, markdown) for every chapter that has a written translation."""
+    chapters = get_chapters(pid, cfg)
+    total = len(chapters)
+    out = []
+    for ch in chapters:
+        path = cfg.paths.output_dir / chapter_filename(ch.index, total)
+        if path.exists():
+            out.append((ch.index, ch.title, path.read_text(encoding="utf-8")))
+    return out
+
+
+@app.get("/api/projects/{pid}/export")
+def export_novel(pid: str, format: str = "md") -> Response:
+    """Download the finished translation as Markdown, plain text, or EPUB."""
+    project, cfg = project_cfg(pid)
+    items = _translated_chapters(pid, cfg)
+    if not items:
+        raise HTTPException(400, "No translated chapters to export yet.")
+    name = project.get("name", "novel")
+    fmt = (format or "md").lower()
+
+    if fmt == "epub":
+        out_path = pj.PROJECTS_DIR / pid / "export.epub"
+        build_epub(name, "Night Reader", [(t, body) for _i, t, body in items], out_path)
+        return FileResponse(out_path, media_type="application/epub+zip",
+                            filename=f"{_safe_name(name)}.epub")
+    if fmt == "txt":
+        parts = [f"{t}\n\n{re.sub(r'[*_#>`]', '', body).strip()}\n" for _i, t, body in items]
+        content, media, ext = "\n\n\n".join(parts) + "\n", "text/plain; charset=utf-8", "txt"
+    else:
+        parts = [f"# {t}\n\n{body.strip()}\n" for _i, t, body in items]
+        content, media, ext = "\n\n".join(parts) + "\n", "text/markdown; charset=utf-8", "md"
+    return Response(content=content, media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{_safe_name(name)}.{ext}"'})
 
 
 @app.get("/api/projects/{pid}/chapters")
@@ -308,7 +424,38 @@ def chapter_detail(pid: str, index: int) -> dict:
         "status": rec.get("status", "pending"),
         "validation": rec.get("validation"),
         "failures": rec.get("failures", []),
+        "manual_edit": rec.get("manual_edit", False),
     }
+
+
+class ChapterEdit(BaseModel):
+    translation: str
+
+
+@app.put("/api/projects/{pid}/chapters/{index}")
+def save_chapter(pid: str, index: int, body: ChapterEdit) -> dict:
+    """Save a hand-edited translation. Marks the chapter validated (user-approved)."""
+    project, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    total = len(chapters)
+    ch = next((c for c in chapters if c.index == index), None)
+    if ch is None:
+        raise HTTPException(404, f"chapter {index} not found")
+    text = body.translation.strip()
+    if not text:
+        raise HTTPException(400, "The translation is empty.")
+    write_chapter_file(cfg.paths.output_dir, index, total, text)
+    state = State.load(cfg.paths.state_file)
+    state.update(
+        index,
+        status=state_mod.STATUS_VALIDATED,
+        title=ch.title,
+        source_hash=ch.metrics.content_hash,
+        failures=[],
+        manual_edit=True,
+    )
+    state.save(cfg.paths.state_file)
+    return {"ok": True, "status": state_mod.STATUS_VALIDATED}
 
 
 # ----------------------------------------------------------------------------- glossary
@@ -343,6 +490,126 @@ def review_glossary(pid: str, review: GlossaryReview) -> dict:
     remaining = [p for p in load_pending(cfg.paths.glossary_pending) if p["korean"] not in decided]
     save_pending(cfg.paths.glossary_pending, remaining)
     return {"approved": len(review.approve), "rejected": len(review.reject), "pending": len(remaining)}
+
+
+class TermUpsert(BaseModel):
+    # Accept the wire/CSV key "register" but avoid shadowing a BaseModel attribute.
+    model_config = ConfigDict(populate_by_name=True)
+    korean: str
+    english: str
+    type: str = "other"
+    note: str = ""
+    pronoun: str = ""   # character profile: he / she / they
+    speech_register: str = Field("", alias="register")  # formal / casual / polite …
+    original_korean: str | None = None  # set when editing/renaming an existing term
+
+
+class TermDelete(BaseModel):
+    korean: str
+
+
+class GlossaryImport(BaseModel):
+    entries: list[TermUpsert] = []
+    mode: str = "merge"  # merge | replace
+
+
+def _entry_from(body: TermUpsert) -> GlossaryEntry:
+    typ = body.type.strip().lower()
+    return GlossaryEntry(
+        korean=body.korean.strip(),
+        english=body.english.strip(),
+        type=typ if typ in VALID_TYPES else "other",
+        note=body.note.strip(),
+        pronoun=body.pronoun.strip(),
+        register=body.speech_register.strip(),
+    )
+
+
+def _affected_chapters(pid: str, cfg: Config, koreans: set[str]) -> list[dict]:
+    """Already-translated chapters whose source contains any of these Korean terms —
+    i.e. the chapters that would go stale after a glossary spelling change."""
+    koreans = {k for k in koreans if k}
+    if not koreans:
+        return []
+    chapters = get_chapters(pid, cfg)
+    total = len(chapters)
+    out = []
+    for ch in chapters:
+        path = cfg.paths.output_dir / chapter_filename(ch.index, total)
+        if path.exists() and any(k in ch.text for k in koreans):
+            out.append({"index": ch.index, "title": ch.title})
+    return out
+
+
+def _locked_payload(g: Glossary) -> dict:
+    return {"locked": [asdict(e) for e in g.entries()]}
+
+
+@app.post("/api/projects/{pid}/glossary/term")
+def upsert_glossary_term(pid: str, body: TermUpsert) -> dict:
+    """Add a new locked glossary term, or edit/rename an existing one directly.
+
+    Unlike the review queue, this commits straight to the master glossary — the
+    user is the authority here. Renaming (changing the Korean key) drops the old
+    entry so it can't linger as a stale duplicate. The response lists already-
+    translated chapters that reference the term so the UI can offer to refresh them.
+    """
+    _, cfg = project_cfg(pid)
+    if not body.korean.strip() or not body.english.strip():
+        raise HTTPException(400, "Both the Korean term and its English form are required.")
+    g = Glossary.load(cfg.paths.glossary_json)
+    original = (body.original_korean or "").strip()
+    entry = _entry_from(body)
+    if original and original != entry.korean:
+        g.remove(original)
+    g.add(entry)
+    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return {**_locked_payload(g),
+            "affected": _affected_chapters(pid, cfg, {entry.korean, original})}
+
+
+@app.post("/api/projects/{pid}/glossary/term/delete")
+def delete_glossary_term(pid: str, body: TermDelete) -> dict:
+    _, cfg = project_cfg(pid)
+    g = Glossary.load(cfg.paths.glossary_json)
+    if not g.remove(body.korean.strip()):
+        raise HTTPException(404, "term not found")
+    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return _locked_payload(g)
+
+
+@app.post("/api/projects/{pid}/glossary/import")
+def import_glossary(pid: str, body: GlossaryImport) -> dict:
+    """Bulk add terms from a CSV/JSON the client parsed. mode=replace clears first."""
+    _, cfg = project_cfg(pid)
+    g = Glossary([]) if body.mode == "replace" else Glossary.load(cfg.paths.glossary_json)
+    imported = 0
+    for t in body.entries:
+        entry = _entry_from(t)
+        if not entry.korean or not entry.english:
+            continue
+        g.add(entry)
+        imported += 1
+    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return {**_locked_payload(g), "imported": imported}
+
+
+@app.get("/api/projects/{pid}/glossary/export")
+def export_glossary(pid: str, format: str = "csv") -> Response:
+    project, cfg = project_cfg(pid)
+    entries = Glossary.load(cfg.paths.glossary_json).entries()
+    name = _safe_name(project.get("name", "glossary"))
+    if (format or "csv").lower() == "json":
+        content = json.dumps([asdict(e) for e in entries], ensure_ascii=False, indent=2)
+        return Response(content, media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{name}-glossary.json"'})
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["korean", "english", "type", "pronoun", "register", "note"])
+    for e in entries:
+        writer.writerow([e.korean, e.english, e.type, e.pronoun, e.register, e.note])
+    return Response(buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}-glossary.csv"'})
 
 
 # ----------------------------------------------------------------------------- translation jobs
@@ -386,7 +653,8 @@ async def _run_job(job: Job, cfg: Config, force: bool) -> None:
         except RateLimitedError as exc:
             state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
             state.save(cfg.paths.state_file)
-            ev = {"type": "paused", "index": idx, "message": str(exc)}
+            ev = {"type": "paused", "index": idx, "message": str(exc),
+                  "resets_at": getattr(getattr(exc, "info", None), "resets_at", None)}
             job.terminal = ev
             job.done = True
             await job.queue.put(ev)
@@ -442,6 +710,17 @@ async def start_translation(pid: str, req: TranslateRequest) -> dict:
 
     task.add_done_callback(_cleanup)
     return {"job_id": job.id, "indices": indices}
+
+
+@app.get("/api/projects/{pid}/active-job")
+def active_job(pid: str) -> dict:
+    """The in-flight translation job for this project, if any — lets the UI
+    reattach its live progress stream after a reload or navigating away."""
+    require_project(pid)
+    jid = _active_job_by_project.get(pid)
+    if jid and jid in _jobs and not _jobs[jid].done:
+        return {"job_id": jid, "indices": _jobs[jid].indices}
+    return {"job_id": None}
 
 
 @app.get("/api/projects/{pid}/translate/{job_id}/stream")

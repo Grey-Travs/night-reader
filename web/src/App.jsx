@@ -8,9 +8,12 @@ import SettingsModal from './components/SettingsModal'
 export default function App() {
   const [status, setStatus] = useState(undefined) // undefined = still loading
   const [pid, setPid] = useState(null)
+  const [openChapter, setOpenChapter] = useState(null) // jump straight into the reader
   const [skipSetup, setSkipSetup] = useState(false)
   const [forceSetup, setForceSetup] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+
+  function openProject(id, chapter = null) { setPid(id); setOpenChapter(chapter) }
 
   useEffect(() => { api.status().then(setStatus).catch(() => setStatus({})) }, [])
 
@@ -37,13 +40,14 @@ export default function App() {
         <ProjectView
           pid={pid}
           status={status}
+          initialChapter={openChapter}
           onBack={() => setPid(null)}
           onSettings={() => setShowSettings(true)}
         />
       ) : (
         <ProjectLibrary
           status={status}
-          onOpen={setPid}
+          onOpen={openProject}
           onSettings={() => setShowSettings(true)}
           onSetup={() => setForceSetup(true)}
         />

@@ -45,6 +45,12 @@ class TranslationConfig(BaseModel):
     continuity_paragraphs: int = 3
     include_prev_translation: bool = False
     romanization: str = "Revised Romanization (RR)"
+    # Per-novel framing for the system prompt (genre/tone/audience). Empty = a neutral
+    # "Korean web novel". Set per project so a fantasy serial isn't framed as romance.
+    style_note: str = ""
+    # Per-novel free-form instructions appended to every chapter's user message
+    # (e.g. "render sound effects in italics", "the protagonist speaks formally").
+    extra_instruction: str = ""
     honorific_note: str = (
         "Keep -hyung and similar relational honorifics attached to names; "
         "localize or drop the address particles -ssi, -ya, -ah, -nim into natural English."

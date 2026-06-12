@@ -16,6 +16,8 @@ async function req(path, opts) {
 const get = (p) => req(p)
 const post = (p, body) =>
   req(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
+const put = (p, body) =>
+  req(p, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
 const del = (p) => req(p, { method: 'DELETE' })
 
 export const api = {
@@ -27,16 +29,26 @@ export const api = {
 
   listProjects: () => get('/api/projects'),
   createProject: (url, name) => post('/api/projects', { url, name }),
+  createTextProject: (body) => post('/api/projects/text', body),
   getProject: (pid) => get(`/api/projects/${pid}`),
+  updateProject: (pid, body) => post(`/api/projects/${pid}`, body),
   deleteProject: (pid) => del(`/api/projects/${pid}`),
 
   chapters: (pid, refresh = false) =>
     get(`/api/projects/${pid}/chapters` + (refresh ? '?refresh=true' : '')),
   chapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}`),
+  saveChapter: (pid, i, translation) => put(`/api/projects/${pid}/chapters/${i}`, { translation }),
+  searchChapters: (pid, q) => get(`/api/projects/${pid}/search?q=${encodeURIComponent(q)}`),
+  exportUrl: (pid, format) => `/api/projects/${pid}/export?format=${format}`,
 
   glossary: (pid) => get(`/api/projects/${pid}/glossary`),
   reviewGlossary: (pid, body) => post(`/api/projects/${pid}/glossary/review`, body),
+  saveGlossaryTerm: (pid, body) => post(`/api/projects/${pid}/glossary/term`, body),
+  deleteGlossaryTerm: (pid, korean) => post(`/api/projects/${pid}/glossary/term/delete`, { korean }),
+  importGlossary: (pid, body) => post(`/api/projects/${pid}/glossary/import`, body),
+  glossaryExportUrl: (pid, format) => `/api/projects/${pid}/glossary/export?format=${format}`,
 
   translate: (pid, body) => post(`/api/projects/${pid}/translate`, body),
+  activeJob: (pid) => get(`/api/projects/${pid}/active-job`),
   streamUrl: (pid, jobId) => `/api/projects/${pid}/translate/${jobId}/stream`,
 }

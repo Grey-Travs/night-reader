@@ -10,8 +10,8 @@ from __future__ import annotations
 NEW_TERMS_DELIMITER = "===NEW_TERMS==="
 
 SYSTEM_PROMPT_TEMPLATE = """\
-You are an expert literary translator who adapts web novels into dynamic, natural, native-English web-novel prose. You are translating a Korean boy's love web novel (all characters are adults) into high-quality English. Output clean Markdown.
-
+You are an expert literary translator who adapts web novels into dynamic, natural, native-English web-novel prose. You are translating a Korean web novel into high-quality English. Output clean Markdown.
+{style_note_line}
 **Fidelity (highest priority):**
 - Translate completely. Do not omit or condense any sentence, phrase, or detail, however small. Do not embellish or add anything not in the source.
 - Render meaning naturally rather than word-for-word. Proofread, edit, and rephrase as needed for smooth, readable, native-sounding English. Use contractions.
@@ -43,13 +43,16 @@ def build_system_prompt(
     *,
     web_access: bool = False,
     honorific_note: str | None = None,
+    style_note: str | None = None,
 ) -> str:
     """Render the system prompt with the per-chapter glossary injected.
 
     ``glossary_block`` is the formatted list of relevant glossary entries (or a
-    placeholder when none apply). ``web_access`` appends the optional lookup note
-    only when the web tool is actually available, so the prompt never invites a
-    capability the model lacks.
+    placeholder when none apply). ``style_note`` is the per-novel framing (genre,
+    tone, audience) — when empty the novel is treated neutrally rather than baking
+    in a fixed genre. ``web_access`` appends the optional lookup note only when the
+    web tool is actually available, so the prompt never invites a capability the
+    model lacks.
     """
     web_access_line = (
         "\n(If web access is available, you may look up canonical English spellings "
@@ -58,9 +61,11 @@ def build_system_prompt(
         else ""
     )
     honorific_note_line = f"- {honorific_note}\n\n" if honorific_note else "\n"
+    style_note_line = f"\n{style_note.strip()}\n" if style_note and style_note.strip() else ""
     return SYSTEM_PROMPT_TEMPLATE.format(
         glossary_block=glossary_block,
         delimiter=NEW_TERMS_DELIMITER,
         web_access_line=web_access_line,
         honorific_note_line=honorific_note_line,
+        style_note_line=style_note_line,
     )

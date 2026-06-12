@@ -22,6 +22,11 @@ class GlossaryEntry:
     english: str
     type: str = "other"
     note: str = ""
+    # Character profile hints (most useful on `name` entries). Korean omits pronouns
+    # and encodes social register in verb endings; pinning these keeps the English
+    # pronoun and tone consistent across chapters instead of being re-guessed.
+    pronoun: str = ""   # e.g. "he", "she", "they"
+    register: str = ""  # e.g. "formal", "casual/banmal", "polite/jondaemal"
 
     @classmethod
     def from_dict(cls, d: dict) -> "GlossaryEntry":
@@ -30,6 +35,8 @@ class GlossaryEntry:
             english=str(d.get("english", "")).strip(),
             type=(str(d.get("type", "other")).strip().lower() or "other"),
             note=str(d.get("note", "")).strip(),
+            pronoun=str(d.get("pronoun", "")).strip(),
+            register=str(d.get("register", "")).strip(),
         )
 
 
@@ -79,6 +86,10 @@ class Glossary:
     def add(self, entry: GlossaryEntry) -> None:
         self._by_korean[entry.korean] = entry
 
+    def remove(self, korean: str) -> bool:
+        """Drop a term by its Korean key. Returns True if something was removed."""
+        return self._by_korean.pop(korean, None) is not None
+
     # ---- rendering ---------------------------------------------------------
     def to_markdown(self) -> str:
         lines = ["# Glossary", "", "| Korean | English | Type | Note |", "| --- | --- | --- | --- |"]
@@ -88,12 +99,22 @@ class Glossary:
         return "\n".join(lines) + "\n"
 
 
+def _profile_hint(e: GlossaryEntry) -> str:
+    """The bracketed pronoun/register hint for a character entry, if any."""
+    bits = []
+    if e.pronoun:
+        bits.append(f"pronoun: {e.pronoun}")
+    if e.register:
+        bits.append(f"register: {e.register}")
+    return f" [{'; '.join(bits)}]" if bits else ""
+
+
 def format_injection(entries: list[GlossaryEntry]) -> str:
     """Render the glossary block for the system prompt."""
     if not entries:
         return "(No established glossary entries appear in this chapter yet.)"
     return "\n".join(
-        f"- {e.korean} -> {e.english} ({e.type})" + (f" — {e.note}" if e.note else "")
+        f"- {e.korean} -> {e.english} ({e.type})" + _profile_hint(e) + (f" — {e.note}" if e.note else "")
         for e in entries
     )
 

@@ -89,8 +89,9 @@ def _translate_with_retry(
 ) -> tuple[TranslationResult, ValidationResult]:
     """Translate, validate, and auto-retry once on failure with the same glossary."""
     relevant = glossary.relevant_to(chapter.text)
+    extra = cfg.translation.extra_instruction
 
-    result = translator.translate_chapter(chapter, relevant)
+    result = translator.translate_chapter(chapter, relevant, extra_instruction=extra)
     state.add_usage(chapter.index, result.usage, result.cost_usd)
     state.update(chapter.index, status=state_mod.STATUS_TRANSLATED)
     validation = validate_translation(chapter, result.prose, cfg.validation)
@@ -99,7 +100,7 @@ def _translate_with_retry(
         return result, validation
 
     # One emphatic corrective retry with the same glossary.
-    retry = translator.translate_chapter(chapter, relevant, retry_reminder=True)
+    retry = translator.translate_chapter(chapter, relevant, extra_instruction=extra, retry_reminder=True)
     state.add_usage(chapter.index, retry.usage, retry.cost_usd)
     retry_validation = validate_translation(chapter, retry.prose, cfg.validation)
     retry.warnings = ["[retry attempt]", *retry.warnings]

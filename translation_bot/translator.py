@@ -250,6 +250,7 @@ class Translator:
             format_injection(glossary_entries),
             web_access=self.cfg.web_access,
             honorific_note=self.tcfg.honorific_note,
+            style_note=self.tcfg.style_note,
         )
         reminder = (_RETRY_REMINDER if retry_reminder else "") + extra_instruction
 
