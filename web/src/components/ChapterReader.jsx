@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api'
 import { Badge } from './ui'
-import { getReadingPrefs, setLastRead, setReadingPrefs } from '../prefs'
+import { getReadingPrefs, markChapterRead, setLastRead, setReadingPrefs } from '../prefs'
 
 const SEPIA_BG = '#f4ecd8'
 const SEPIA_INK = '#43361f'
@@ -111,7 +111,7 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
   }, [pid, index])
 
   useEffect(() => { setEditing(false); load() }, [load])
-  useEffect(() => { setLastRead(pid, index) }, [pid, index])
+  useEffect(() => { setLastRead(pid, index); markChapterRead(pid, index) }, [pid, index])
 
   // Neighbour chapters for prev/next (across the whole novel, in order).
   const order = (chapters || []).map((c) => c.index)
@@ -210,7 +210,7 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
               </div>
             )}
           </div>
-          {hasTranslation && !editing && (
+          {hasTranslation && !editing && !!data?.source && (
             <button onClick={() => setShowSource((v) => !v)} className="btn btn-ghost px-2.5 py-1.5 text-xs">
               {showSource ? 'Hide original' : 'Show original'}
             </button>
@@ -233,7 +233,7 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
               <>
                 <button onClick={() => { setDraft(data.translation || ''); setEditing(true); setShowSource(false) }} className="btn btn-ghost px-3 py-1.5 text-xs">Edit</button>
                 <button onClick={() => downloadText(`chapter-${index}.md`, data.translation)} className="btn btn-ghost px-3 py-1.5 text-xs">Download</button>
-                {data.language === 'korean' && onRetranslate && (
+                {data.language === 'korean' && onRetranslate && !data.offline && (
                   <button onClick={() => { onRetranslate(index); onClose() }} className="btn btn-ghost px-3 py-1.5 text-xs">Re-translate</button>
                 )}
               </>

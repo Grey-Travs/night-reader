@@ -48,6 +48,28 @@ def get_credentials(credentials_file: Path, token_file: Path) -> Credentials:
     return creds
 
 
+def load_saved_credentials(token_file: Path) -> Credentials:
+    """Return cached/refreshed credentials WITHOUT ever launching the consent flow.
+
+    Used on hot paths (loading a novel's chapters) where popping a browser sign-in
+    inside the server would hang or fail on a device that can't show it. Raises if
+    there's no usable token, so the caller can degrade gracefully (e.g. show the
+    saved offline copy) instead of blocking. Interactive sign-in stays in
+    :func:`get_credentials`, reached only from the explicit Login action.
+    """
+    token_file = Path(token_file)
+    if not token_file.exists():
+        raise FileNotFoundError("Not signed in to Google on this device.")
+    creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+    if creds.valid:
+        return creds
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        token_file.write_text(creds.to_json(), encoding="utf-8")
+        return creds
+    raise RuntimeError("Google sign-in needs renewing — open Login to reconnect.")
+
+
 def build_docs_service(creds: Credentials):
     """Build the Docs service client from credentials."""
     return build("docs", "v1", credentials=creds, cache_discovery=False)

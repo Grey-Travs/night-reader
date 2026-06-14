@@ -5,7 +5,7 @@ import ChapterReader from './ChapterReader'
 import GlossaryPanel from './GlossaryPanel'
 import ProjectSettingsModal from './ProjectSettingsModal'
 import ThemeToggle from './ThemeToggle'
-import { clearPausedJob, getLastRead, getPausedJob, setPausedJob } from '../prefs'
+import { clearPausedJob, getLastRead, getPausedJob, getReadChapters, setPausedJob } from '../prefs'
 
 // Korean chapters that can be (re)translated — validated ones included, so they can
 // be bulk-selected for a re-translate. (Empty/English/in-flight excluded.)
@@ -31,6 +31,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
   const [showExport, setShowExport] = useState(false)
   const [pendingCount, setPendingCount] = useState(0)
   const [lastRead, setLastReadState] = useState(() => getLastRead(pid))
+  const [readSet, setReadSet] = useState(() => getReadChapters(pid))
 
   const [running, setRunning] = useState(false)
   const [log, setLog] = useState([])
@@ -228,9 +229,10 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
   }
 
   function openReader(index) { setReader(index) }
-  function closeReader() { setReader(null); setLastReadState(getLastRead(pid)) }
+  function closeReader() { setReader(null); setLastReadState(getLastRead(pid)); setReadSet(getReadChapters(pid)) }
 
   const chapters = data?.chapters || []
+  const offline = !!data?.offline
   const counts = {}
   for (const c of chapters) counts[c.status] = (counts[c.status] || 0) + 1
   const koreanTotal =
@@ -243,7 +245,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
   const visible = filter === 'all'
     ? chapters
     : chapters.filter((c) => c.status === filter || c.status === 'translating')
-  const selectableVisible = visible.filter(isSelectable)
+  const selectableVisible = offline ? [] : visible.filter(isSelectable)
   const allVisibleSelected = selectableVisible.length > 0 && selectableVisible.every((c) => selected.has(c.index))
   const availableFilters = FILTER_ORDER.filter((s) => (counts[s] || 0) > 0)
 
@@ -300,10 +302,12 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
               <div className="relative">
                 <button onClick={() => setShowExport((v) => !v)} className="btn btn-ghost px-3 py-1.5">Export</button>
                 {showExport && (
-                  <div className="absolute right-0 top-full z-20 mt-1 w-40 rounded-card border border-line p-1 text-sm shadow-lg" style={{ background: 'var(--elevated)' }} onMouseLeave={() => setShowExport(false)}>
+                  <div className="absolute right-0 top-full z-20 mt-1 w-48 rounded-card border border-line p-1 text-sm shadow-lg" style={{ background: 'var(--elevated)' }} onMouseLeave={() => setShowExport(false)}>
                     {[['epub', 'EPUB (e-reader)'], ['md', 'Markdown'], ['txt', 'Plain text']].map(([fmt, label]) => (
                       <a key={fmt} href={api.exportUrl(pid, fmt)} onClick={() => setShowExport(false)} className="block rounded-btn px-3 py-2 hover:bg-[color-mix(in_oklab,var(--ink)_6%,transparent)]">{label}</a>
                     ))}
+                    <div className="my-1 border-t border-line" />
+                    <a href={api.bundleUrl(pid)} onClick={() => setShowExport(false)} className="block rounded-btn px-3 py-2 hover:bg-[color-mix(in_oklab,var(--ink)_6%,transparent)]" title="Download this whole novel as a .zip to move to another device or keep as a backup">Back up / move (.zip)</a>
                   </div>
                 )}
               </div>
@@ -318,7 +322,19 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
       <main className="mx-auto max-w-6xl px-6 py-6">
         {error && <div className="mb-4 rounded-card px-3 py-2 text-sm pill-review">{error}</div>}
 
+        {offline && (
+          <div className="mb-6 rounded-card border border-line p-4 text-sm" style={{ background: 'var(--b-queued-bg)', color: 'var(--b-queued-tx)' }}>
+            <div className="font-medium">📖 Read-only saved copy</div>
+            <div className="mt-1 opacity-90">
+              The original Google Doc isn’t reachable on this device, so this shows the copy saved on this computer.
+              You can read, copy, and export your chapters (and back them up). Translating new chapters isn’t available
+              here — open this novel on the device that has access to the document for that.
+            </div>
+          </div>
+        )}
+
         {/* Translate */}
+        {!offline && (
         <section className="card mb-6 flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <div className="font-medium">Translate</div>
@@ -331,6 +347,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
             {running ? `Queue all remaining (${remaining})` : `Translate all remaining (${remaining})`}
           </button>
         </section>
+        )}
 
         {/* Queue bar */}
         {totalQueued > 0 && (
@@ -454,8 +471,8 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
                     <tr><td colSpan={6} className="px-4 py-8 text-center text-hint">No chapters match this filter.</td></tr>
                   )}
                   {visible.map((ch) => {
-                    const selectable = isSelectable(ch)
-                    const isTranslatable = ch.language === 'korean' && ['pending', 'needs-review', 'failed'].includes(ch.status)
+                    const selectable = !offline && isSelectable(ch)
+                    const isTranslatable = !offline && ch.language === 'korean' && ['pending', 'needs-review', 'failed'].includes(ch.status)
                     const translated = ch.has_output && ch.language === 'korean'
                     const canRead = ch.has_output || ch.language === 'english'
                     const inQueue = queuedSet.has(ch.index)
@@ -470,6 +487,9 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
                         <td className="px-4 py-2 tabular-nums text-hint">{ch.index}</td>
                         <td className="px-4 py-2 font-medium">
                           <button onClick={() => openReader(ch.index)} className="text-left hover:text-accent-text hover:underline">{ch.title}</button>
+                          {ch.has_output && !readSet.has(ch.index) && (
+                            <span title="Unread" className="ml-2 inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: 'var(--accent)' }} />
+                          )}
                         </td>
                         <td className="px-4 py-2 text-xs text-muted">
                           {ch.language === 'korean' ? '🇰🇷' : ch.language === 'english' ? '🇬🇧' : '—'}
@@ -485,7 +505,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
                           ) : (
                             <>
                               {canRead && <button onClick={() => openReader(ch.index)} className="btn btn-ghost px-2.5 py-1 text-xs">Read</button>}
-                              {translated && <button onClick={() => enqueue([ch.index], true)} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs">Re-translate</button>}
+                              {translated && !offline && <button onClick={() => enqueue([ch.index], true)} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs">Re-translate</button>}
                             </>
                           )}
                         </td>

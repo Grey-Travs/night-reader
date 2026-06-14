@@ -19,6 +19,20 @@ export function setLastRead(pid, index) {
   write('nr.lastRead', m)
 }
 
+// --- per-chapter read/unread, keyed by project id (so the list shows what's new) ---
+export function getReadChapters(pid) {
+  const m = read('nr.read', {})
+  return new Set((m && m[pid]) || [])
+}
+export function markChapterRead(pid, index) {
+  const m = read('nr.read', {})
+  const arr = new Set((m && m[pid]) || [])
+  if (arr.has(index)) return
+  arr.add(index)
+  m[pid] = [...arr]
+  write('nr.read', m)
+}
+
 // --- reader typography ---
 const DEFAULT_PREFS = { fontSize: 18, width: 68, sepia: false }
 export function getReadingPrefs() {

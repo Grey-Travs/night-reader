@@ -34,6 +34,13 @@ export const api = {
   updateProject: (pid, body) => post(`/api/projects/${pid}`, body),
   deleteProject: (pid) => del(`/api/projects/${pid}`),
 
+  // Move / back up novels between devices (portable .zip bundles).
+  bundleUrl: (pid) => `/api/projects/${pid}/bundle`,
+  backupAllUrl: () => '/api/backup',
+  importBundle: (file) =>
+    req('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: file }),
+  searchAll: (q) => get(`/api/search?q=${encodeURIComponent(q)}`),
+
   chapters: (pid, refresh = false) =>
     get(`/api/projects/${pid}/chapters` + (refresh ? '?refresh=true' : '')),
   chapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}`),
@@ -47,6 +54,7 @@ export const api = {
   deleteGlossaryTerm: (pid, body) => post(`/api/projects/${pid}/glossary/term/delete`, body),
   learnGlossary: (pid) => post(`/api/projects/${pid}/glossary/learn`),
   importGlossary: (pid, body) => post(`/api/projects/${pid}/glossary/import`, body),
+  copyGlossary: (pid, body) => post(`/api/projects/${pid}/glossary/copy`, body),
   glossaryExportUrl: (pid, format) => `/api/projects/${pid}/glossary/export?format=${format}`,
 
   translate: (pid, body) => post(`/api/projects/${pid}/translate`, body),

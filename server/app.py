@@ -16,11 +16,12 @@ import io
 import json
 import re
 import uuid
+import zipfile
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -30,10 +31,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from translation_bot import state as state_mod
 from translation_bot.config import Config
-from translation_bot.docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
+from translation_bot.docs_extract import (
+    Chapter, ChapterMetrics, extract_chapters, fetch_document, hangul_fraction,
+)
 from translation_bot.epub import build_epub
 from translation_bot.glossary import VALID_TYPES, Glossary, GlossaryEntry, load_pending, save_pending
-from translation_bot.google_auth import build_docs_service, get_credentials
+from translation_bot.google_auth import build_docs_service, get_credentials, load_saved_credentials
 from translation_bot.pipeline import chapter_filename, process_chapter, write_chapter_file
 from translation_bot.state import State
 from translation_bot.text_source import split_text_into_chapters
@@ -66,6 +69,9 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 _chapter_cache: dict[str, list[Chapter]] = {}  # keyed by project id
+# Projects whose source Google Doc can't be fetched on this device (no access /
+# offline). They fall back to a read-only "saved copy" rebuilt from local files.
+_offline_projects: set[str] = set()
 _jobs: dict[str, "Job"] = {}
 _active_job_by_project: dict[str, str] = {}     # pid -> job_id of the in-flight job
 _running_tasks: set[asyncio.Task] = set()        # strong refs so tasks aren't GC'd
@@ -91,11 +97,69 @@ def project_cfg(pid: str) -> tuple[dict, Config]:
 
 
 def classify(ch: Chapter, cfg: Config) -> str:
+    # An offline-reconstructed chapter has no source text to measure, so it carries
+    # the language it was saved with.
+    saved_lang = getattr(ch, "language", None)
+    if saved_lang:
+        return saved_lang
     if not ch.paragraphs:
         return "empty"
     if hangul_fraction(ch.text) < cfg.translation.min_hangul_fraction:
         return "english"
     return "korean"
+
+
+# A saved chapter's status implies its language when the source text is gone.
+_STATUS_LANG = {
+    state_mod.STATUS_ENGLISH: "english",
+    state_mod.STATUS_EMPTY: "empty",
+}
+
+
+class LocalChapter(Chapter):
+    """A chapter rebuilt from saved ``state.json`` when the source Google Doc can't
+    be fetched (e.g. the novel was copied to a device without access to the doc).
+
+    Titles, statuses, metrics, and the translated files are all local, so the novel
+    stays fully readable. The Korean *source* text isn't recoverable offline, so it
+    reports empty source and carries the saved language/metrics directly.
+    """
+
+    def __init__(self, index: int, title: str, metrics: ChapterMetrics, language: str):
+        super().__init__(index=index, title=title, paragraphs=[])
+        self._metrics = metrics
+        self.language = language
+
+    @property
+    def text(self) -> str:
+        return ""
+
+    @property
+    def metrics(self) -> ChapterMetrics:
+        return self._metrics
+
+
+def _local_chapters(pid: str) -> list[Chapter]:
+    """Rebuild a readable chapter list from a project's saved state (no network)."""
+    state = State.load(pj.PROJECTS_DIR / pid / "state.json")
+    chapters: list[Chapter] = []
+    for key, rec in state.chapters.items():
+        try:
+            idx = int(key)
+        except (TypeError, ValueError):
+            continue
+        val = rec.get("validation") or {}
+        metrics = ChapterMetrics(
+            paragraph_count=val.get("source_paragraphs", 0) or 0,
+            dialogue_count=val.get("source_dialogue", 0) or 0,
+            char_count=rec.get("source_chars") or val.get("source_chars", 0) or 0,
+            content_hash=rec.get("source_hash", ""),
+        )
+        language = _STATUS_LANG.get(rec.get("status"), "korean")
+        title = rec.get("title") or f"Chapter {idx}"
+        chapters.append(LocalChapter(idx, title, metrics, language))
+    chapters.sort(key=lambda c: c.index)
+    return chapters
 
 
 def get_chapters(pid: str, cfg: Config, refresh: bool = False) -> list[Chapter]:
@@ -104,13 +168,65 @@ def get_chapters(pid: str, cfg: Config, refresh: bool = False) -> list[Chapter]:
         if project.get("source_type") == "text":
             # Pasted / uploaded text — read from the stored source, no network.
             _chapter_cache[pid] = pj.load_text_chapters(pid)
+            _offline_projects.discard(pid)
         else:
-            creds = get_credentials(cfg.google.credentials_file, cfg.google.token_file)
-            doc = fetch_document(build_docs_service(creds), cfg.google.source_doc_id)
-            _chapter_cache[pid] = extract_chapters(
-                doc, flatten_child_tabs=cfg.google.flatten_child_tabs
-            )
+            try:
+                # Non-interactive: never pops a browser sign-in inside the server.
+                creds = load_saved_credentials(cfg.google.token_file)
+                doc = fetch_document(build_docs_service(creds), cfg.google.source_doc_id)
+                chapters = extract_chapters(
+                    doc, flatten_child_tabs=cfg.google.flatten_child_tabs
+                )
+                # Snapshot the source so this novel is self-contained from now on
+                # (readable with its Korean source on any device, copyable, backup-able).
+                try:
+                    pj.cache_source(pid, chapters)
+                except OSError:
+                    pass  # caching is best-effort; never block reading on it
+                _chapter_cache[pid] = chapters
+                _offline_projects.discard(pid)
+            except Exception:
+                # The source doc can't be fetched here (no access under this device's
+                # Google login, revoked token, or no internet). Rather than 500, fall
+                # back to the best local copy: a cached source snapshot (full Korean
+                # source) if we have one, else a read-only list rebuilt from state.
+                # A never-translated novel with no local data still surfaces the error.
+                cached = pj.load_cached_source(pid)
+                if cached:
+                    _chapter_cache[pid] = cached
+                    _offline_projects.add(pid)
+                else:
+                    local = _local_chapters(pid)
+                    if not local:
+                        raise
+                    _chapter_cache[pid] = local
+                    _offline_projects.add(pid)
     return _chapter_cache[pid]
+
+
+def _output_total(pid: str, chapters: list[Chapter]) -> int:
+    """The chapter count whose zero-padding reproduces the chapter-NN.md files on
+    disk. Online/cached novels carry the full list, so this is just len(chapters).
+    A state-only offline rebuild can have FEWER records than the real doc, which
+    would shrink the pad width and miss the files — so recover the true width from
+    the saved chapter_count and the widest existing filename."""
+    total = len(chapters)
+    if pid in _offline_projects:
+        project = pj.get_project(pid) or {}
+        try:
+            total = max(total, int(project.get("chapter_count") or 0))
+        except (TypeError, ValueError):
+            pass
+        chdir = pj.PROJECTS_DIR / pid / "chapters"
+        if chdir.is_dir():
+            widest = 0
+            for f in chdir.glob("chapter-*.md"):
+                tail = f.stem.split("-", 1)[-1]
+                if tail.isdigit():
+                    widest = max(widest, len(tail))
+            if widest:
+                total = max(total, 10 ** (widest - 1))  # smallest int of that digit width
+    return total
 
 
 def fetch_doc_title(doc_id: str) -> str:
@@ -263,6 +379,75 @@ def list_projects() -> dict:
     return {"projects": [_safe_summary(p) for p in pj.list_projects()]}
 
 
+# ----------------------------------------------------------------------------- backup / move
+@app.get("/api/backup")
+def export_all_bundle() -> Response:
+    """Download every novel as one portable .zip (a full library backup)."""
+    pids = [p["id"] for p in pj.list_projects()]
+    if not pids:
+        raise HTTPException(400, "No novels to back up yet.")
+    data = pj.export_bundle(pids)
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="night-reader-backup.zip"'})
+
+
+@app.post("/api/import")
+async def import_projects(request: Request) -> dict:
+    """Restore novels from a bundle made by Export/Backup. The .zip is sent as the
+    raw request body (no multipart dependency needed)."""
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "No file was uploaded.")
+    try:
+        imported = pj.import_bundle(data)
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "That doesn't look like a novel backup (.zip).")
+    except Exception as exc:  # noqa: BLE001 — surface a friendly message, not a 500
+        raise HTTPException(400, f"Couldn't read that backup: {exc}")
+    if not imported:
+        raise HTTPException(400, "No novels were found in that file.")
+    for p in imported:
+        _chapter_cache.pop(p["id"], None)
+        _offline_projects.discard(p["id"])
+    return {"imported": [_safe_summary(p) for p in imported]}
+
+
+@app.get("/api/search")
+def search_all(q: str = "") -> dict:
+    """Search translated text across ALL novels. Reads the saved chapter files on
+    disk, so it needs no network and works fully offline."""
+    needle = (q or "").strip().lower()
+    if not needle:
+        return {"results": []}
+    results: list[dict] = []
+    for project in pj.list_projects():
+        pid = project["id"]
+        chdir = pj.PROJECTS_DIR / pid / "chapters"
+        if not chdir.is_dir():
+            continue
+        state = State.load(pj.PROJECTS_DIR / pid / "state.json")
+        for f in sorted(chdir.glob("chapter-*.md")):
+            try:
+                text = f.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            pos = text.lower().find(needle)
+            if pos == -1:
+                continue
+            m = re.search(r"chapter-(\d+)", f.stem)
+            idx = int(m.group(1)) if m else 0
+            rec = state.get(idx) or {}
+            start, end = max(0, pos - 40), min(len(text), pos + len(needle) + 60)
+            snippet = (("…" if start else "") + text[start:end].replace("\n", " ").strip()
+                       + ("…" if end < len(text) else ""))
+            results.append({"project_id": pid, "project_name": project.get("name", "?"),
+                            "index": idx, "title": rec.get("title") or f"Chapter {idx}",
+                            "snippet": snippet})
+            if len(results) >= 300:
+                return {"results": results, "truncated": True}
+    return {"results": results}
+
+
 @app.post("/api/projects")
 async def create_project(body: CreateProject) -> dict:
     doc_id = pj.extract_doc_id(body.url)
@@ -337,7 +522,7 @@ def search_chapters(pid: str, q: str = "") -> dict:
     if not needle:
         return {"results": []}
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)
     results = []
     for ch in chapters:
         path = cfg.paths.output_dir / chapter_filename(ch.index, total)
@@ -362,7 +547,7 @@ def _safe_name(name: str) -> str:
 def _translated_chapters(pid: str, cfg: Config) -> list[tuple[int, str, str]]:
     """(index, title, markdown) for every chapter that has a written translation."""
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)
     out = []
     for ch in chapters:
         path = cfg.paths.output_dir / chapter_filename(ch.index, total)
@@ -396,30 +581,44 @@ def export_novel(pid: str, format: str = "md") -> Response:
                     headers={"Content-Disposition": f'attachment; filename="{_safe_name(name)}.{ext}"'})
 
 
+@app.get("/api/projects/{pid}/bundle")
+def export_project_bundle(pid: str) -> Response:
+    """Download this one novel as a portable .zip (chapters, glossary, progress,
+    and the cached source) — move it to another device or keep it as a backup."""
+    project = require_project(pid)
+    data = pj.export_bundle([pid])
+    name = _safe_name(project.get("name", "novel"))
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.novel.zip"'})
+
+
 @app.get("/api/projects/{pid}/chapters")
 def list_chapters(pid: str, refresh: bool = False) -> dict:
     project, cfg = project_cfg(pid)
     chapters = get_chapters(pid, cfg, refresh=refresh)
+    offline = pid in _offline_projects
     total = len(chapters)
-    if project.get("chapter_count") != total:  # cache total on project for the library
+    file_total = _output_total(pid, chapters)  # pad chapter-NN.md to match files on disk
+    # Don't overwrite the saved chapter_count from an offline copy — it may be partial.
+    if not offline and project.get("chapter_count") != total:  # cache total for the library
         project["chapter_count"] = total
         (pj.PROJECTS_DIR / pid / "project.json").write_text(
             json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     state = State.load(cfg.paths.state_file)
-    rows = [chapter_row(ch, cfg, state, total) for ch in chapters]
+    rows = [chapter_row(ch, cfg, state, file_total) for ch in chapters]
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     return {"project": project, "total": total, "chapters": rows,
-            "counts": counts, "totals": state.totals()}
+            "counts": counts, "totals": state.totals(), "offline": offline}
 
 
 @app.get("/api/projects/{pid}/chapters/{index}")
 def chapter_detail(pid: str, index: int) -> dict:
     project, cfg = project_cfg(pid)
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
@@ -436,6 +635,7 @@ def chapter_detail(pid: str, index: int) -> dict:
         "validation": rec.get("validation"),
         "failures": rec.get("failures", []),
         "manual_edit": rec.get("manual_edit", False),
+        "offline": pid in _offline_projects,
     }
 
 
@@ -448,7 +648,7 @@ def save_chapter(pid: str, index: int, body: ChapterEdit) -> dict:
     """Save a hand-edited translation. Marks the chapter validated (user-approved)."""
     project, cfg = project_cfg(pid)
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
@@ -545,7 +745,7 @@ def _affected_chapters(pid: str, cfg: Config, koreans: set[str]) -> list[dict]:
     if not koreans:
         return []
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)
     out = []
     for ch in chapters:
         path = cfg.paths.output_dir / chapter_filename(ch.index, total)
@@ -611,6 +811,30 @@ def import_glossary(pid: str, body: GlossaryImport) -> dict:
         imported += 1
     g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
     return {**_locked_payload(g), "imported": imported}
+
+
+class GlossaryCopy(BaseModel):
+    source_pid: str
+    mode: str = "merge"  # merge | replace
+
+
+@app.post("/api/projects/{pid}/glossary/copy")
+def copy_glossary(pid: str, body: GlossaryCopy) -> dict:
+    """Copy the locked glossary from another novel into this one — keeps character
+    names/terms consistent across parts of the same series."""
+    require_project(pid)
+    if body.source_pid == pid:
+        raise HTTPException(400, "Choose a different novel to copy from.")
+    _, cfg = project_cfg(pid)
+    _, src_cfg = project_cfg(body.source_pid)  # 404s if the source novel doesn't exist
+    src_entries = Glossary.load(src_cfg.paths.glossary_json).entries()
+    g = Glossary([]) if body.mode == "replace" else Glossary.load(cfg.paths.glossary_json)
+    before = len(g.entries())
+    for e in src_entries:
+        g.add(e)
+    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return {**_locked_payload(g), "copied": len(src_entries),
+            "added": len(g.entries()) - before}
 
 
 def _sample_english(chapters: list[Chapter], budget: int = 80000) -> str:
@@ -834,6 +1058,11 @@ def _resolve_items(pid: str, cfg: Config, req: TranslateRequest) -> list[tuple[i
 @app.post("/api/projects/{pid}/translate")
 async def start_translation(pid: str, req: TranslateRequest) -> dict:
     _, cfg = project_cfg(pid)
+    get_chapters(pid, cfg)  # establish offline state up front (the indices path skips it)
+    if pid in _offline_projects:
+        raise HTTPException(409, "This novel is in read-only saved mode — its source "
+                            "document isn't available on this device, so it can't be "
+                            "translated here.")
     items = _resolve_items(pid, cfg, req)
 
     # If a worker is already running, just append — it picks the new chapters up.

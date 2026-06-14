@@ -16,6 +16,14 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
   const fileRef = useRef(null)
+  const importRef = useRef(null)
+  const [importing, setImporting] = useState(false)
+  const [importMsg, setImportMsg] = useState(null)
+  const [q, setQ] = useState('')
+  const [results, setResults] = useState(null)
+  const [searching, setSearching] = useState(false)
+  const [sortBy, setSortBy] = useState('default')
+  const [nameFilter, setNameFilter] = useState('')
 
   async function load() {
     setLoading(true)
@@ -74,6 +82,48 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
     if (!textName.trim()) setTextName(file.name.replace(/\.[^.]+$/, ''))
   }
 
+  // Import one or more novels from a .zip bundle (Export / Back up on another device).
+  async function onImportBundle(e) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    setImporting(true); setError(null); setImportMsg(null)
+    try {
+      const d = await api.importBundle(file)
+      const names = (d.imported || []).map((p) => p.name)
+      setImportMsg(`Imported ${names.length} novel${names.length === 1 ? '' : 's'}${names.length ? ': ' + names.join(', ') : ''}.`)
+      await load()
+    } catch (err) {
+      setError('Import failed: ' + String(err.message || err))
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  // Search the English translations across every novel in the library.
+  async function doGlobalSearch(e) {
+    e?.preventDefault()
+    const needle = q.trim()
+    if (!needle) { setResults(null); return }
+    setSearching(true); setError(null)
+    try {
+      setResults((await api.searchAll(needle)).results)
+    } catch (err) {
+      setError(String(err.message || err))
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  const shownProjects = (() => {
+    const nf = nameFilter.trim().toLowerCase()
+    let list = nf ? projects.filter((p) => (p.name || '').toLowerCase().includes(nf)) : projects.slice()
+    if (sortBy === 'name') list.sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+    else if (sortBy === 'progress') list.sort((a, b) => (b.translated || 0) - (a.translated || 0))
+    else if (sortBy === 'review') list.sort((a, b) => (b.needs_review || 0) - (a.needs_review || 0))
+    return list
+  })()
+
   async function remove(pid, name) {
     if (!confirm(`Remove "${name}" from your library?\n\nThis deletes its translations and glossary on this computer. Your source is untouched.`))
       return
@@ -89,9 +139,12 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
             <h1 className="font-reading text-xl font-medium">Web-Novel Translator</h1>
             <p className="text-sm text-hint">Your library · runs on your Claude plan</p>
           </div>
-          <div className="flex items-center gap-3 text-sm text-muted">
-            <span className="hidden items-center gap-1.5 sm:flex"><Dot ok={status?.google_logged_in} /> Google</span>
-            <span className="hidden items-center gap-1.5 sm:flex"><Dot ok={status?.claude_logged_in} /> Claude</span>
+          <div className="flex flex-wrap items-center justify-end gap-2 gap-y-2 text-sm text-muted sm:gap-3">
+            <span className="hidden items-center gap-1.5 lg:flex"><Dot ok={status?.google_logged_in} /> Google</span>
+            <span className="hidden items-center gap-1.5 lg:flex"><Dot ok={status?.claude_logged_in} /> Claude</span>
+            <button onClick={() => importRef.current?.click()} disabled={importing} className="btn btn-ghost px-3 py-1.5" title="Add a novel from a .zip backup made on another device">{importing ? 'Importing…' : 'Import'}</button>
+            <input ref={importRef} type="file" accept=".zip,application/zip" onChange={onImportBundle} className="hidden" />
+            {projects.length > 0 && <a href={api.backupAllUrl()} className="btn btn-ghost px-3 py-1.5" title="Download every novel as one .zip backup">Back up all</a>}
             <button onClick={onSetup} className="btn btn-quiet text-sm">Setup</button>
             <button onClick={onSettings} className="btn btn-ghost px-3 py-1.5">Settings</button>
             <ThemeToggle />
@@ -144,16 +197,64 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
           {error && <div className="mt-3 rounded-btn px-3 py-2 text-sm pill-review">{error}</div>}
         </section>
 
-        <h2 className="mb-3 text-sm font-medium text-muted">Your novels</h2>
+        {importMsg && (
+          <div className="mb-4 rounded-card border border-line px-3 py-2 text-sm" style={{ background: 'var(--b-translated-bg)', color: 'var(--b-translated-tx)' }}>{importMsg}</div>
+        )}
+
+        {/* Search across every novel's translations */}
+        {projects.length > 0 && (
+          <section className="mb-6">
+            <form onSubmit={doGlobalSearch} className="flex gap-2">
+              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search all your translations…" className="input flex-1" />
+              <button type="submit" disabled={searching} className="btn btn-ghost px-4 py-2">{searching ? 'Searching…' : 'Search'}</button>
+              {results != null && <button type="button" onClick={() => { setResults(null); setQ('') }} className="btn btn-ghost px-3 py-2">Clear</button>}
+            </form>
+            {results != null && (
+              <div className="mt-3 max-h-[50vh] overflow-auto rounded-card border border-line">
+                {results.length === 0 ? (
+                  <div className="p-6 text-center text-hint">No matches for “{q}”.</div>
+                ) : (
+                  <div className="divide-y divide-line">
+                    {results.map((r, i) => (
+                      <button key={`${r.project_id}-${r.index}-${i}`} onClick={() => onOpen(r.project_id, r.index)} className="block w-full p-3 text-left rowhover">
+                        <div className="text-sm font-medium">{r.project_name} · Ch {r.index}{r.title ? ` — ${r.title}` : ''}</div>
+                        <div className="mt-0.5 text-xs text-muted">{r.snippet}</div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-medium text-muted">Your novels</h2>
+          {projects.length > 1 && (
+            <div className="flex flex-wrap items-center gap-2">
+              <input value={nameFilter} onChange={(e) => setNameFilter(e.target.value)} placeholder="Filter…" className="input !py-1 text-xs" />
+              <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="input !py-1 text-xs" aria-label="Sort novels">
+                <option value="default">Sort: default</option>
+                <option value="name">Name (A–Z)</option>
+                <option value="progress">Most translated</option>
+                <option value="review">Needs review</option>
+              </select>
+            </div>
+          )}
+        </div>
         {loading ? (
           <div className="card p-8 text-center text-hint">Loading…</div>
         ) : projects.length === 0 ? (
           <div className="rounded-card border border-dashed border-line-strong p-10 text-center text-muted">
             No novels yet. Add one above to get started.
           </div>
+        ) : shownProjects.length === 0 ? (
+          <div className="rounded-card border border-dashed border-line-strong p-10 text-center text-muted">
+            No novels match “{nameFilter}”.
+          </div>
         ) : (
           <div className="grid gap-4 sm:grid-cols-2">
-            {projects.map((p) => {
+            {shownProjects.map((p) => {
               const total = p.chapter_count
               const cont = getLastRead(p.id)
               return (

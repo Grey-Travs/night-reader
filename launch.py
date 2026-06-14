@@ -13,6 +13,7 @@ Or just double-click start.bat on Windows.
 from __future__ import annotations
 
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -53,12 +54,32 @@ def open_browser_later() -> None:
     webbrowser.open(URL)
 
 
+def _port_in_use(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        return s.connect_ex((host, port)) == 0
+
+
 def main() -> None:
+    # Dependencies present? (A clear nudge beats a raw ImportError traceback.)
+    try:
+        import uvicorn  # noqa: F401
+    except ModuleNotFoundError:
+        print("\n  This app isn't fully installed yet.")
+        print("  Run setup first (double-click setup.bat on Windows), then start it again.\n")
+        return
+
+    # Already running? Don't crash with "address already in use" — just open it.
+    if _port_in_use(HOST, PORT):
+        print(f"\n  The app is already running at {URL} — opening it in your browser.\n")
+        webbrowser.open(URL)
+        return
+
     force_build = "--rebuild" in sys.argv
     ensure_config()
     build_frontend(force=force_build)
 
-    print(f"\n  Translation Bot is starting…")
+    print("\n  Translation Bot is starting…")
     print(f"  Open {URL} in your browser (it should open automatically).")
     print("  Leave this window open while you use the app. Close it to quit.\n")
 

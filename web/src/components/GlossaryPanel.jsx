@@ -63,6 +63,9 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
   const [affected, setAffected] = useState(null)
   const [learning, setLearning] = useState(false)
   const [learnMsg, setLearnMsg] = useState(null)
+  const [projects, setProjects] = useState([])
+  const [copyFrom, setCopyFrom] = useState('')
+  const [copyMsg, setCopyMsg] = useState(null)
   const fileRef = useRef(null)
 
   // Stable id for a locked entry: a mapped term is keyed by Korean, a canonical
@@ -81,6 +84,21 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
     setDrafts(init)
   }
   useEffect(() => { load().catch((e) => setError(String(e.message || e))) }, [pid])
+  // Other novels to copy a glossary from (e.g. part 1 → part 2 of a series).
+  useEffect(() => { api.listProjects().then((d) => setProjects(d.projects || [])).catch(() => {}) }, [])
+
+  async function copyFromNovel() {
+    if (!copyFrom) return
+    setBusy(true); setError(null); setCopyMsg(null)
+    try {
+      const d = await api.copyGlossary(pid, { source_pid: copyFrom, mode: 'merge' })
+      setData((cur) => cur && { ...cur, locked: d.locked })
+      const src = projects.find((p) => p.id === copyFrom)
+      setCopyMsg(`Copied ${d.copied} term${d.copied === 1 ? '' : 's'} from “${src?.name || 'that novel'}”.`)
+      setCopyFrom('')
+    } catch (e) { setError(String(e.message || e)) }
+    finally { setBusy(false) }
+  }
 
   function edit(key, field, value) {
     setDrafts((d) => ({ ...d, [key]: { ...d[key], [field]: value } }))
@@ -258,11 +276,22 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
             <a href={api.glossaryExportUrl(pid, 'csv')} className="btn btn-ghost px-3 py-1.5 text-xs" title="Download as CSV">Export</a>
             <button onClick={() => fileRef.current?.click()} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs">Import</button>
             <input ref={fileRef} type="file" accept=".csv,.json,text/csv,application/json" onChange={onImportFile} className="hidden" />
+            {projects.length > 1 && (
+              <span className="flex items-center gap-1">
+                <select value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)} disabled={busy} className="input !py-1 text-xs" title="Copy locked terms from another novel — keeps a series consistent">
+                  <option value="">Copy from…</option>
+                  {projects.filter((p) => p.id !== pid).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                <button onClick={copyFromNovel} disabled={!copyFrom || busy} className="btn btn-ghost px-2.5 py-1.5 text-xs">Copy</button>
+              </span>
+            )}
             <button onClick={() => { setAdding((v) => !v); setNewTerm(BLANK) }} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs">
               {adding ? 'Cancel' : '＋ Add term'}
             </button>
           </div>
         </div>
+
+        {copyMsg && <div className="mb-2 text-xs text-muted">{copyMsg}</div>}
 
         {adding && (
           <div className="mb-3 rounded-card border border-line p-3">
