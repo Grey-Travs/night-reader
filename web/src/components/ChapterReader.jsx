@@ -19,6 +19,40 @@ function SourceProse({ text, lang, style }) {
   return <article className="korean mx-auto" style={style}>{paras.map((p, i) => <p key={i} className="mb-4">{p}</p>)}</article>
 }
 
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// Inline Markdown emphasis -> HTML, so it pastes as actual italic/bold.
+function inlineHtml(s) {
+  return escapeHtml(s)
+    .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/(?<!\w)_(.+?)_(?!\w)/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '$1')
+}
+
+// Drop a leading chapter-number/title heading (e.g. "# 12") so Copy gives just the
+// prose. Only the very first block is removed, and only when it's a heading.
+function stripLeadingHeading(md) {
+  return (md || '').replace(/^﻿?\s*#{1,6}[ \t]+[^\n]*(?:\n+|$)/, '')
+}
+
+// Render the chapter Markdown to HTML so copying preserves italics, bold, and the
+// *** thematic break (as a real <hr> line) when pasted into Docs/Word/email.
+function mdToHtml(md) {
+  return (md || '').replace(/\r\n/g, '\n').trim().split(/\n\s*\n/).map((b) => {
+    b = b.trim()
+    if (!b) return ''
+    if (/^(?:[-*_] *){3,}$/.test(b)) return '<hr>'
+    const h = b.match(/^(#{1,6})\s+(.*)$/)
+    if (h) { const lv = Math.min(h[1].length, 6); return `<h${lv}>${inlineHtml(h[2].trim())}</h${lv}>` }
+    if (b.startsWith('>')) return `<blockquote><p>${inlineHtml(b.replace(/^[ \t]{0,3}>[ \t]?/gm, '')).replace(/\n/g, '<br>')}</p></blockquote>`
+    return `<p>${b.split('\n').map(inlineHtml).join('<br>')}</p>`
+  }).filter(Boolean).join('\n')
+}
+
 function downloadText(filename, text, type = 'text/markdown') {
   const url = URL.createObjectURL(new Blob([text], { type }))
   const a = document.createElement('a')
@@ -39,6 +73,37 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
   const [saving, setSaving] = useState(false)
   const [prefs, setPrefs] = useState(getReadingPrefs)
   const [showType, setShowType] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  // Copy the chapter as rich text (italics, bold and the *** scene break survive a
+  // paste into Docs/Word), keeping the raw text as the plain-text fallback.
+  async function copyChapter(rawMd) {
+    const md = stripLeadingHeading(rawMd)
+    const html = mdToHtml(md)
+    let ok = false
+    try {
+      if (navigator.clipboard?.write && window.ClipboardItem) {
+        await navigator.clipboard.write([new ClipboardItem({
+          'text/html': new Blob([html], { type: 'text/html' }),
+          'text/plain': new Blob([md], { type: 'text/plain' }),
+        })])
+        ok = true
+      }
+    } catch { /* fall through to plain copy */ }
+    if (!ok) {
+      try { await navigator.clipboard.writeText(md); ok = true } catch { /* ignore */ }
+    }
+    if (!ok) {
+      const ta = document.createElement('textarea')
+      ta.value = md
+      document.body.appendChild(ta)
+      ta.select()
+      try { document.execCommand('copy') } catch { /* ignore */ }
+      ta.remove()
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
 
   const load = useCallback(() => {
     setData(null)
@@ -54,10 +119,16 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
   const prevIndex = pos > 0 ? order[pos - 1] : null
   const nextIndex = pos >= 0 && pos < order.length - 1 ? order[pos + 1] : null
 
-  // Esc closes; ←/→ flip chapters (unless typing in a field).
+  // Esc backs out one layer at a time (popover → edit mode → close), so it never
+  // throws away an in-progress edit. ←/→ flip chapters (unless typing in a field).
   useEffect(() => {
     const h = (e) => {
-      if (e.key === 'Escape') { onClose(); return }
+      if (e.key === 'Escape') {
+        if (showType) { setShowType(false); return }
+        if (editing) { setEditing(false); return }
+        onClose()
+        return
+      }
       const t = e.target.tagName
       if (editing || t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return
       if (e.key === 'ArrowLeft' && prevIndex != null) onNavigate(prevIndex)
@@ -65,7 +136,7 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose, onNavigate, prevIndex, nextIndex, editing])
+  }, [onClose, onNavigate, prevIndex, nextIndex, editing, showType])
 
   function updatePrefs(patch) {
     const next = { ...prefs, ...patch }
@@ -91,7 +162,11 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
   const hasTranslation = !!data?.translation
   const failures = data?.failures || []
   const readStyle = { fontSize: prefs.fontSize, maxWidth: `${prefs.width}ch`, ...(prefs.sepia ? { color: SEPIA_INK } : {}) }
+  // Side-by-side columns: honour font size + sepia, but let the grid govern width.
+  const dualStyle = { fontSize: prefs.fontSize, ...(prefs.sepia ? { color: SEPIA_INK } : {}) }
   const rootStyle = { background: prefs.sepia ? SEPIA_BG : 'var(--reading)' }
+  // Raw Markdown translation (or plain source) — copyChapter renders it to rich text.
+  const copyableText = data?.translation || data?.source || ''
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto" style={rootStyle}>
@@ -144,21 +219,26 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
       </div>
 
       {/* action row */}
-      {data && (
+      {data && !editing && (
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2 px-5 pt-4 sm:px-8">
           <div className="flex items-center gap-1.5">
             <button onClick={() => prevIndex != null && onNavigate(prevIndex)} disabled={prevIndex == null} className="btn btn-ghost px-3 py-1.5 text-xs">← Prev</button>
             <button onClick={() => nextIndex != null && onNavigate(nextIndex)} disabled={nextIndex == null} className="btn btn-ghost px-3 py-1.5 text-xs">Next →</button>
           </div>
-          {hasTranslation && !editing && (
-            <div className="flex flex-wrap items-center gap-1.5">
-              <button onClick={() => { setDraft(data.translation || ''); setEditing(true); setShowSource(false) }} className="btn btn-ghost px-3 py-1.5 text-xs">Edit</button>
-              <button onClick={() => downloadText(`chapter-${index}.md`, data.translation)} className="btn btn-ghost px-3 py-1.5 text-xs">Download</button>
-              {data.language === 'korean' && onRetranslate && (
-                <button onClick={() => { onRetranslate(index); onClose() }} className="btn btn-ghost px-3 py-1.5 text-xs">Re-translate</button>
-              )}
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-1.5">
+            {copyableText && (
+              <button onClick={() => copyChapter(copyableText)} className="btn btn-ghost px-3 py-1.5 text-xs">{copied ? 'Copied ✓' : 'Copy text'}</button>
+            )}
+            {hasTranslation && (
+              <>
+                <button onClick={() => { setDraft(data.translation || ''); setEditing(true); setShowSource(false) }} className="btn btn-ghost px-3 py-1.5 text-xs">Edit</button>
+                <button onClick={() => downloadText(`chapter-${index}.md`, data.translation)} className="btn btn-ghost px-3 py-1.5 text-xs">Download</button>
+                {data.language === 'korean' && onRetranslate && (
+                  <button onClick={() => { onRetranslate(index); onClose() }} className="btn btn-ghost px-3 py-1.5 text-xs">Re-translate</button>
+                )}
+              </>
+            )}
+          </div>
         </div>
       )}
 
@@ -197,11 +277,11 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
           hasTranslation ? (
             showSource ? (
               <div className="grid gap-8 md:grid-cols-2 md:divide-x md:divide-line">
-                <article className="korean md:pr-8" style={prefs.sepia ? { color: SEPIA_INK } : undefined}>
+                <article className="korean md:pr-8" style={dualStyle}>
                   <div className="mb-3 font-ui text-xs font-medium uppercase tracking-wide text-hint">Korean</div>
                   {data.source}
                 </article>
-                <article className="reading md:pl-8" style={prefs.sepia ? { color: SEPIA_INK } : undefined}>
+                <article className="reading md:pl-8" style={dualStyle}>
                   <div className="mb-3 font-ui text-xs font-medium uppercase tracking-wide text-hint">English</div>
                   <ReactMarkdown>{data.translation}</ReactMarkdown>
                 </article>

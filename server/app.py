@@ -16,6 +16,7 @@ import io
 import json
 import re
 import uuid
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from translation_bot.google_auth import build_docs_service, get_credentials
 from translation_bot.pipeline import chapter_filename, process_chapter, write_chapter_file
 from translation_bot.state import State
 from translation_bot.text_source import split_text_into_chapters
-from translation_bot.translator import RateLimitedError, Translator
+from translation_bot.translator import RateLimitedError, Translator, TranslatorError
 
 from . import projects as pj
 
@@ -247,9 +248,19 @@ def project_summary(project: dict) -> dict:
     }
 
 
+def _safe_summary(project: dict) -> dict:
+    """project_summary, but a single broken project never breaks the whole library."""
+    try:
+        return project_summary(project)
+    except Exception as exc:  # noqa: BLE001 — defensive: keep the library loading
+        return {**project, "counts": {}, "translated": 0, "needs_review": 0,
+                "cost_usd": 0.0, "chapter_count": project.get("chapter_count"),
+                "error": f"could not load: {exc}"}
+
+
 @app.get("/api/projects")
 def list_projects() -> dict:
-    return {"projects": [project_summary(p) for p in pj.list_projects()]}
+    return {"projects": [_safe_summary(p) for p in pj.list_projects()]}
 
 
 @app.post("/api/projects")
@@ -495,17 +506,19 @@ def review_glossary(pid: str, review: GlossaryReview) -> dict:
 class TermUpsert(BaseModel):
     # Accept the wire/CSV key "register" but avoid shadowing a BaseModel attribute.
     model_config = ConfigDict(populate_by_name=True)
-    korean: str
+    korean: str = ""   # optional: an English-only canonical name has no Korean yet
     english: str
     type: str = "other"
     note: str = ""
     pronoun: str = ""   # character profile: he / she / they
     speech_register: str = Field("", alias="register")  # formal / casual / polite …
-    original_korean: str | None = None  # set when editing/renaming an existing term
+    original_korean: str | None = None    # the entry being edited, identified by Korean…
+    original_english: str | None = None   # …or by English when it's a canonical name
 
 
 class TermDelete(BaseModel):
-    korean: str
+    korean: str = ""
+    english: str = ""
 
 
 class GlossaryImport(BaseModel):
@@ -555,24 +568,30 @@ def upsert_glossary_term(pid: str, body: TermUpsert) -> dict:
     translated chapters that reference the term so the UI can offer to refresh them.
     """
     _, cfg = project_cfg(pid)
-    if not body.korean.strip() or not body.english.strip():
-        raise HTTPException(400, "Both the Korean term and its English form are required.")
+    if not body.english.strip():
+        raise HTTPException(400, "An English spelling is required.")
     g = Glossary.load(cfg.paths.glossary_json)
-    original = (body.original_korean or "").strip()
     entry = _entry_from(body)
-    if original and original != entry.korean:
-        g.remove(original)
+    # Drop the entry being edited (renamed Korean, or an English-only name being remapped).
+    original_k = (body.original_korean or "").strip()
+    original_e = (body.original_english or "").strip()
+    if original_k and original_k != entry.korean:
+        g.remove(original_k)
+    elif original_e and not original_k and (entry.korean or original_e.lower() != entry.english.lower()):
+        g.remove_english(original_e)
     g.add(entry)
     g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
     return {**_locked_payload(g),
-            "affected": _affected_chapters(pid, cfg, {entry.korean, original})}
+            "affected": _affected_chapters(pid, cfg, {entry.korean, original_k})}
 
 
 @app.post("/api/projects/{pid}/glossary/term/delete")
 def delete_glossary_term(pid: str, body: TermDelete) -> dict:
     _, cfg = project_cfg(pid)
     g = Glossary.load(cfg.paths.glossary_json)
-    if not g.remove(body.korean.strip()):
+    korean = body.korean.strip()
+    removed = g.remove(korean) if korean else g.remove_english(body.english.strip())
+    if not removed:
         raise HTTPException(404, "term not found")
     g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
     return _locked_payload(g)
@@ -586,12 +605,63 @@ def import_glossary(pid: str, body: GlossaryImport) -> dict:
     imported = 0
     for t in body.entries:
         entry = _entry_from(t)
-        if not entry.korean or not entry.english:
+        if not entry.english:  # Korean optional (canonical names), English required
             continue
         g.add(entry)
         imported += 1
     g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
     return {**_locked_payload(g), "imported": imported}
+
+
+def _sample_english(chapters: list[Chapter], budget: int = 80000) -> str:
+    """Sample the head of English chapters spread across the whole novel (not just the
+    first few) up to a char budget, so the name extractor sees the full cast/places."""
+    if not chapters:
+        return ""
+    # Pick up to ~40 chapters evenly spaced so late-introduced characters are covered.
+    cap = min(len(chapters), 40)
+    step = max(1, len(chapters) // cap)
+    picked = chapters[::step][:cap]
+    per = max(800, budget // len(picked))
+    parts = []
+    for ch in picked:
+        parts.append(f"--- {ch.title} ---\n{ch.text[:per]}")
+    return "\n\n".join(parts)
+
+
+@app.post("/api/projects/{pid}/glossary/learn")
+async def learn_glossary(pid: str) -> dict:
+    """Read the already-English chapters and seed the glossary with their established
+    names/terms, so newly translated chapters keep the same spellings."""
+    _, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    english_chs = [ch for ch in chapters if classify(ch, cfg) == "english"]
+    if not english_chs:
+        raise HTTPException(400, "No already-English chapters were found to learn from.")
+    sample = _sample_english(english_chs)
+    translator = Translator(cfg.anthropic, cfg.translation)
+    try:
+        terms = await run_in_threadpool(translator.extract_glossary, sample)
+    except RateLimitedError as exc:
+        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
+    except TranslatorError as exc:
+        raise HTTPException(502, f"Couldn't read the chapters: {exc}")
+
+    g = Glossary.load(cfg.paths.glossary_json)
+    existing_english = {e.english.lower() for e in g.entries() if e.english}
+    added = 0
+    for t in terms:
+        english = t.get("english", "").strip()
+        if not english or english.lower() in existing_english:
+            continue
+        typ = t.get("type", "name")
+        g.add(GlossaryEntry(korean="", english=english,
+                            type=typ if typ in VALID_TYPES else "name",
+                            note=t.get("note", "")))
+        existing_english.add(english.lower())
+        added += 1
+    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return {"learned": added, "from_chapters": len(english_chs), **_locked_payload(g)}
 
 
 @app.get("/api/projects/{pid}/glossary/export")
@@ -619,33 +689,79 @@ class TranslateRequest(BaseModel):
 
 
 class Job:
-    def __init__(self, job_id: str, pid: str, indices: list[int]):
+    """A per-project translation worker fed by an APPENDABLE FIFO queue. Chapters can
+    be enqueued while it runs, so the user never has to wait for one to finish before
+    queuing the next. One worker per project keeps writes to state.json serialized."""
+
+    def __init__(self, job_id: str, pid: str):
         self.id = job_id
         self.pid = pid
-        self.indices = indices
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.pending: deque[tuple[int, bool]] = deque()  # (chapter index, force)
+        self.queued: set[int] = set()        # indices pending or in-flight (for dedup)
+        self.current: int | None = None       # chapter being translated right now
+        self.history: list[dict] = []         # every event so far, replayed on (re)connect
+        self.subscribers: list[asyncio.Queue] = []  # one queue per live SSE consumer
         self.done = False
-        self.terminal: dict | None = None  # final event, replayable for late consumers
+        self.cancelled = False
+        self.terminal: dict | None = None      # final event, replayable for late consumers
+
+    def enqueue(self, items: list[tuple[int, bool]]) -> list[int]:
+        """Append (index, force) pairs, skipping ones already queued/in-flight."""
+        added = []
+        for idx, force in items:
+            if idx in self.queued:
+                continue
+            self.queued.add(idx)
+            self.pending.append((idx, force))
+            added.append(idx)
+        return added
+
+    def queue_state(self) -> dict:
+        return {"current": self.current, "pending": [i for i, _ in self.pending]}
+
+    def publish(self, ev: dict) -> None:
+        """Fan an event out to every connected stream and remember it for replay.
+
+        Non-terminal events are stamped with the live queue state; terminal
+        (paused/done) events carry their own. Multiple consumers (two tabs, a
+        reconnect, dev StrictMode) each get their own copy — no event splitting."""
+        if ev.get("type") not in ("paused", "done"):
+            ev = {**ev, **self.queue_state()}
+        else:
+            self.terminal = ev
+        self.history.append(ev)
+        if len(self.history) > 1000:
+            self.history = self.history[-1000:]
+        for q in list(self.subscribers):
+            q.put_nowait(ev)
 
 
-async def _run_job(job: Job, cfg: Config, force: bool) -> None:
+async def _run_worker(job: Job, cfg: Config) -> None:
     chapters = get_chapters(job.pid, cfg)
     total = len(chapters)
     by_index = {c.index: c for c in chapters}
     glossary = Glossary.load(cfg.paths.glossary_json)
     state = State.load(cfg.paths.state_file)
-    translator = Translator(cfg.anthropic, cfg.translation)
+    translator = Translator(cfg.anthropic, cfg.translation, canonical_names=glossary.canonical())
 
-    for idx in job.indices:
+    # Drain the queue. The only await is run_in_threadpool, so an enqueue arriving
+    # mid-flight is always observed on the next loop iteration (no lost work).
+    while job.pending and not job.cancelled:
+        idx, force = job.pending.popleft()
+        job.current = idx
         ch = by_index.get(idx)
         if ch is None:
+            job.queued.discard(idx)
+            job.current = None
             continue
         if not force and state.is_done(idx, ch.metrics.content_hash):
-            await job.queue.put({"type": "chapter", "index": idx, "status": "validated",
-                                 "title": ch.title, "skipped": True})
+            job.queued.discard(idx)
+            job.current = None
+            job.publish({"type": "chapter", "index": idx, "status": "validated",
+                         "title": ch.title, "skipped": True})
             continue
-        await job.queue.put({"type": "start", "index": idx, "title": ch.title,
-                             "chars": ch.metrics.char_count})
+        job.publish({"type": "start", "index": idx, "title": ch.title,
+                     "chars": ch.metrics.char_count})
         try:
             status_val = await run_in_threadpool(
                 process_chapter, ch, total, translator, glossary, cfg, state
@@ -653,55 +769,48 @@ async def _run_job(job: Job, cfg: Config, force: bool) -> None:
         except RateLimitedError as exc:
             state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
             state.save(cfg.paths.state_file)
-            ev = {"type": "paused", "index": idx, "message": str(exc),
-                  "resets_at": getattr(getattr(exc, "info", None), "resets_at", None)}
-            job.terminal = ev
+            # Everything not yet finished (this chapter + the rest of the queue), so
+            # the client can resume exactly what's left.
+            remaining = [idx] + [i for i, _ in job.pending]
+            job.current = None
             job.done = True
-            await job.queue.put(ev)
+            job.publish({"type": "paused", "index": idx, "message": str(exc),
+                         "resets_at": getattr(getattr(exc, "info", None), "resets_at", None),
+                         "current": None, "pending": remaining})
             return
-        except Exception as exc:  # isolation
+        except Exception as exc:  # isolation: one bad chapter never kills the queue
             state.update(idx, status=state_mod.STATUS_FAILED, title=ch.title,
                          error=f"{type(exc).__name__}: {exc}")
             state.save(cfg.paths.state_file)
-            await job.queue.put({"type": "chapter", "index": idx, "status": "failed",
-                                 "title": ch.title, "error": str(exc)})
+            job.queued.discard(idx)
+            job.current = None
+            job.publish({"type": "chapter", "index": idx, "status": "failed",
+                         "title": ch.title, "error": str(exc)})
             continue
         state.save(cfg.paths.state_file)
         rec = state.get(idx) or {}
-        await job.queue.put({"type": "chapter", "index": idx, "status": status_val,
-                             "title": ch.title, "cost_usd": state.totals()["cost_usd"],
-                             "failures": rec.get("failures", [])})
+        job.queued.discard(idx)
+        job.current = None
+        job.publish({"type": "chapter", "index": idx, "status": status_val,
+                     "title": ch.title, "cost_usd": state.totals()["cost_usd"],
+                     "failures": rec.get("failures", [])})
 
-    ev = {"type": "done", "totals": State.load(cfg.paths.state_file).totals()}
-    job.terminal = ev
     job.done = True
-    await job.queue.put(ev)
+    job.publish({"type": "done", "totals": State.load(cfg.paths.state_file).totals(),
+                 "current": None, "pending": []})
 
 
-@app.post("/api/projects/{pid}/translate")
-async def start_translation(pid: str, req: TranslateRequest) -> dict:
-    _, cfg = project_cfg(pid)
-    # One job per project: concurrent jobs would clobber the project's state.json.
-    existing_id = _active_job_by_project.get(pid)
-    if existing_id and existing_id in _jobs and not _jobs[existing_id].done:
-        return {"job_id": existing_id, "already_running": True}
-
-    chapters = get_chapters(pid, cfg)
-    if req.indices:
-        indices = req.indices
-    else:
-        state = State.load(cfg.paths.state_file)
-        indices = [
-            c.index for c in chapters
-            if classify(c, cfg) == "korean"
-            and not state.is_done(c.index, c.metrics.content_hash)
-        ]
-    job = Job(uuid.uuid4().hex, pid, indices)
+def _spawn_worker(pid: str, cfg: Config, job: Job) -> None:
+    # Bound memory: a long-lived server accrues a Job per run. Drop old finished jobs,
+    # keeping the active ones plus the few most recent for a late stream's replay.
+    if len(_jobs) > 40:
+        finished = [jid for jid, j in _jobs.items() if j.done]
+        for jid in finished[:-10]:
+            _jobs.pop(jid, None)
     _jobs[job.id] = job
     _active_job_by_project[pid] = job.id
-
-    task = asyncio.create_task(_run_job(job, cfg, req.force))
-    _running_tasks.add(task)  # keep a strong ref so it isn't garbage-collected
+    task = asyncio.create_task(_run_worker(job, cfg))
+    _running_tasks.add(task)  # strong ref so the task isn't garbage-collected
 
     def _cleanup(t: asyncio.Task) -> None:
         _running_tasks.discard(t)
@@ -709,17 +818,60 @@ async def start_translation(pid: str, req: TranslateRequest) -> dict:
             _active_job_by_project.pop(pid, None)
 
     task.add_done_callback(_cleanup)
-    return {"job_id": job.id, "indices": indices}
+
+
+def _resolve_items(pid: str, cfg: Config, req: TranslateRequest) -> list[tuple[int, bool]]:
+    if req.indices:
+        return [(i, req.force) for i in req.indices]
+    chapters = get_chapters(pid, cfg)
+    state = State.load(cfg.paths.state_file)
+    return [
+        (c.index, req.force) for c in chapters
+        if classify(c, cfg) == "korean" and not state.is_done(c.index, c.metrics.content_hash)
+    ]
+
+
+@app.post("/api/projects/{pid}/translate")
+async def start_translation(pid: str, req: TranslateRequest) -> dict:
+    _, cfg = project_cfg(pid)
+    items = _resolve_items(pid, cfg, req)
+
+    # If a worker is already running, just append — it picks the new chapters up.
+    existing_id = _active_job_by_project.get(pid)
+    if existing_id and existing_id in _jobs and not _jobs[existing_id].done:
+        job = _jobs[existing_id]
+        added = job.enqueue(items)
+        if added:
+            job.publish({"type": "queued", "added": added})
+        return {"job_id": job.id, "queued": added, "already_running": True, **job.queue_state()}
+
+    job = Job(uuid.uuid4().hex, pid)
+    added = job.enqueue(items)
+    _spawn_worker(pid, cfg, job)
+    return {"job_id": job.id, "queued": added, **job.queue_state()}
+
+
+@app.post("/api/projects/{pid}/translate/cancel")
+def cancel_queue(pid: str) -> dict:
+    """Drop the not-yet-started chapters from the queue. The in-flight one finishes."""
+    require_project(pid)
+    jid = _active_job_by_project.get(pid)
+    if jid and jid in _jobs and not _jobs[jid].done:
+        job = _jobs[jid]
+        job.pending.clear()
+        job.queued = {job.current} if job.current is not None else set()
+        return {"ok": True, "current": job.current, "pending": []}
+    return {"ok": True, "current": None, "pending": []}
 
 
 @app.get("/api/projects/{pid}/active-job")
 def active_job(pid: str) -> dict:
-    """The in-flight translation job for this project, if any — lets the UI
-    reattach its live progress stream after a reload or navigating away."""
+    """The in-flight translation job for this project, if any — lets the UI reattach
+    its live progress stream (and current queue) after a reload or navigating away."""
     require_project(pid)
     jid = _active_job_by_project.get(pid)
     if jid and jid in _jobs and not _jobs[jid].done:
-        return {"job_id": jid, "indices": _jobs[jid].indices}
+        return {"job_id": jid, **_jobs[jid].queue_state()}
     return {"job_id": None}
 
 
@@ -730,16 +882,25 @@ async def stream_job(pid: str, job_id: str) -> StreamingResponse:
         raise HTTPException(404, "job not found")
 
     async def gen():
-        # Late/reconnecting consumer: the job already finished and its queue is
-        # drained — replay the terminal event immediately instead of blocking forever.
-        if job.done and job.terminal is not None:
-            yield f"data: {json.dumps(job.terminal, ensure_ascii=False)}\n\n"
-            return
-        while True:
-            event = await job.queue.get()
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            if event.get("type") in ("done", "paused"):
-                break
+        # Register our own queue first so no event slips through between replay and
+        # live (subscribe-then-snapshot); every consumer gets its own copy of events.
+        q: asyncio.Queue = asyncio.Queue()
+        job.subscribers.append(q)
+        try:
+            # Replay history so a reconnecting consumer (reload / 2nd tab / post→connect
+            # gap) catches up; if the job already finished, history ends with terminal.
+            for ev in list(job.history):
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                if ev.get("type") in ("done", "paused"):
+                    return
+            while True:
+                event = await q.get()
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event.get("type") in ("done", "paused"):
+                    break
+        finally:
+            if q in job.subscribers:
+                job.subscribers.remove(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

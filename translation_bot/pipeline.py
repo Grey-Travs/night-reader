@@ -181,7 +181,7 @@ def run(
 
     glossary = Glossary.load(cfg.paths.glossary_json)
     state = State.load(cfg.paths.state_file)
-    translator = Translator(cfg.anthropic, cfg.translation)
+    translator = Translator(cfg.anthropic, cfg.translation, canonical_names=glossary.canonical())
 
     summary = {
         "total": total, "translated": 0, "needs_review": 0,

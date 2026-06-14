@@ -5,12 +5,14 @@ import ChapterReader from './ChapterReader'
 import GlossaryPanel from './GlossaryPanel'
 import ProjectSettingsModal from './ProjectSettingsModal'
 import ThemeToggle from './ThemeToggle'
-import { getLastRead } from '../prefs'
+import { clearPausedJob, getLastRead, getPausedJob, setPausedJob } from '../prefs'
 
-const TRANSLATABLE = ['pending', 'needs-review', 'failed']
+// Korean chapters that can be (re)translated — validated ones included, so they can
+// be bulk-selected for a re-translate. (Empty/English/in-flight excluded.)
+const SELECTABLE = ['pending', 'needs-review', 'failed', 'validated']
 const FILTER_ORDER = ['pending', 'validated', 'needs-review', 'failed', 'english-source', 'empty']
 
-const isTranslatable = (ch) => ch.language === 'korean' && TRANSLATABLE.includes(ch.status)
+const isSelectable = (ch) => ch.language === 'korean' && SELECTABLE.includes(ch.status)
 
 function ensureNotifyPermission() {
   try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission() } catch { /* ignore */ }
@@ -32,10 +34,12 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
 
   const [running, setRunning] = useState(false)
   const [log, setLog] = useState([])
-  const [paused, setPaused] = useState(null) // { message, resets_at } | null
+  const [paused, setPaused] = useState(null) // { message, resets_at, pending } | null
+  const [queue, setQueue] = useState({ current: null, pending: [] })
   const esRef = useRef(null)
+  const jobIdRef = useRef(null)     // id of the job our stream is attached to
   const resumeRef = useRef(null)
-  const startRef = useRef(null) // latest startTranslate, for stale-free auto-resume
+  const resumeJobRef = useRef(null) // latest resumeJob, for stale-free auto-resume
 
   const [selected, setSelected] = useState(() => new Set())
   const [filter, setFilter] = useState('all')
@@ -61,9 +65,13 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
   useEffect(() => {
     load(); loadPending()
     // Reattach to an in-flight job (survives a reload or leaving and returning).
-    api.activeJob(pid).then(({ job_id }) => {
-      if (job_id) { setRunning(true); attachStream(job_id) }
-    }).catch(() => {})
+    api.activeJob(pid).then((j) => {
+      if (j.job_id) {
+        setRunning(true)
+        setQueue({ current: j.current ?? null, pending: j.pending || [] })
+        attachStream(j.job_id)
+      } else restorePause()
+    }).catch(restorePause)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pid])
 
@@ -72,12 +80,21 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
   // Keep the selection in sync with what's actually selectable on reload.
   useEffect(() => {
     if (!data) return
-    const selectable = new Set(data.chapters.filter(isTranslatable).map((c) => c.index))
+    const selectable = new Set(data.chapters.filter(isSelectable).map((c) => c.index))
     setSelected((s) => {
       const next = new Set([...s].filter((i) => selectable.has(i)))
       return next.size === s.size ? s : next
     })
   }, [data])
+
+  // Rehydrate a rate-limit pause persisted before a reload: show the banner and
+  // re-arm auto-resume so the run still picks back up unattended.
+  function restorePause() {
+    const p = getPausedJob(pid)
+    if (!p) return
+    setPaused({ message: p.message || "Your plan's limit was reached.", resets_at: p.resets_at, pending: p.pending || [] })
+    scheduleResume(p.resets_at)
+  }
 
   function setRowStatus(index, statusVal) {
     setData((d) => d && {
@@ -94,28 +111,44 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
     if (!resetsAt) return
     const ms = resetsAt * 1000 - Date.now() + 3000
     if (ms <= 0 || ms > 6 * 3600 * 1000) return // ignore absent/absurd reset times
-    resumeRef.current = setTimeout(() => startRef.current?.(null), ms)
+    resumeRef.current = setTimeout(() => resumeJobRef.current?.(), ms)
   }
+  function resumeJob() {
+    const pend = (paused?.pending && paused.pending.length ? paused.pending : getPausedJob(pid)?.pending) || []
+    // Clear the pause first so enqueue() doesn't also try to fold the same backlog in.
+    clearResumeTimer()
+    clearPausedJob(pid)
+    setPaused(null)
+    if (pend.length) enqueue(pend, true, { foldBacklog: false })
+  }
+  resumeJobRef.current = resumeJob
 
   function attachStream(jobId) {
     const es = new EventSource(api.streamUrl(pid, jobId))
     esRef.current = es
+    jobIdRef.current = jobId
     es.onmessage = (ev) => {
       const e = JSON.parse(ev.data)
+      if ('pending' in e) setQueue({ current: e.current ?? null, pending: e.pending || [] })
       if (e.type === 'start') {
         setRowStatus(e.index, 'translating')
         setLog((l) => [...l, `Translating chapter ${e.index}…`])
       } else if (e.type === 'chapter') {
         setRowStatus(e.index, e.status)
         setLog((l) => [...l, `Chapter ${e.index}: ${e.skipped ? 'already done' : e.status}`])
+      } else if (e.type === 'queued') {
+        setLog((l) => [...l, `Queued ${(e.added || []).length} chapter${(e.added || []).length === 1 ? '' : 's'}`])
       } else if (e.type === 'paused') {
-        setPaused({ message: e.message, resets_at: e.resets_at })
+        const pend = e.pending || []
+        setPaused({ message: e.message, resets_at: e.resets_at, pending: pend })
         setLog((l) => [...l, `Paused: ${e.message}`])
         notify('Translation paused', e.message)
+        setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: pend })
         scheduleResume(e.resets_at)
         finish(es)
       } else if (e.type === 'done') {
         setLog((l) => [...l, 'Done.'])
+        clearPausedJob(pid)
         notify('Translation complete', `${data?.project?.name || 'Your novel'} — chapters are ready.`)
         finish(es)
       }
@@ -123,30 +156,61 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
     es.onerror = () => { if (es.readyState === EventSource.CLOSED) finish(es) }
   }
 
-  async function startTranslate(indices, force = false) {
-    if (running) return
-    clearResumeTimer()
-    setPaused(null)
-    setLog([])
-    setRunning(true)
-    ensureNotifyPermission()
+  // Enqueue chapters. Starts a worker if none is running, otherwise appends to the
+  // running one — so you never wait for the current chapter to finish.
+  async function enqueue(indices, force = false, { foldBacklog = true } = {}) {
+    const wasIdle = !esRef.current
+    // Fold any outstanding paused backlog into this run so a normal Translate click
+    // while a pause banner is showing never silently discards it. (resumeJob passes
+    // foldBacklog:false because it already enqueues the backlog itself.)
+    const backlog = wasIdle && foldBacklog
+      ? ((paused?.pending?.length ? paused.pending : getPausedJob(pid)?.pending) || [])
+      : []
+    if (wasIdle) {
+      clearResumeTimer()
+      clearPausedJob(pid)
+      setPaused(null)
+      setLog([])
+      setRunning(true)
+      ensureNotifyPermission()
+    }
     try {
-      const body = { ...(indices ? { indices } : {}), ...(force ? { force: true } : {}) }
-      const { job_id } = await api.translate(pid, body)
-      attachStream(job_id)
+      const res = await api.translate(pid, { ...(indices ? { indices } : {}), force })
+      setQueue({ current: res.current ?? null, pending: res.pending || [] })
+      // Attach to whatever job the backend actually used — covers a fresh start AND
+      // the done→finish window where the backend spawns a brand-new job.
+      if (jobIdRef.current !== res.job_id) {
+        esRef.current?.close()
+        attachStream(res.job_id)
+        setRunning(true)
+      }
+      if (backlog.length) {
+        const more = await api.translate(pid, { indices: backlog, force: true })
+        setQueue({ current: more.current ?? null, pending: more.pending || [] })
+      }
     } catch (e) {
       setError(String(e.message || e))
-      setRunning(false)
+      if (wasIdle) setRunning(false)
     }
   }
-  startRef.current = startTranslate
 
   function finish(es) {
     es?.close()
-    if (esRef.current === es) esRef.current = null
+    if (es && esRef.current !== es) return // a stale stream we already replaced
+    esRef.current = null
+    jobIdRef.current = null
     setRunning(false)
+    setQueue({ current: null, pending: [] })
     load()
     loadPending()
+  }
+
+  async function cancelQueue() {
+    try {
+      const r = await api.cancelQueue(pid)
+      setQueue({ current: r.current ?? null, pending: r.pending || [] })
+      setLog((l) => [...l, 'Queue cleared.'])
+    } catch (e) { setError(String(e.message || e)) }
   }
 
   async function doSearch(e) {
@@ -163,13 +227,8 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
     }
   }
 
-  function openReader(index) {
-    setReader(index)
-  }
-  function closeReader() {
-    setReader(null)
-    setLastReadState(getLastRead(pid))
-  }
+  function openReader(index) { setReader(index) }
+  function closeReader() { setReader(null); setLastReadState(getLastRead(pid)) }
 
   const chapters = data?.chapters || []
   const counts = {}
@@ -179,12 +238,13 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
     (counts['needs-review'] || 0) + (counts.failed || 0)
   const done = counts.validated || 0
   const remaining = counts.pending || 0
+  const queuedSet = new Set(queue.pending)
 
   const visible = filter === 'all'
     ? chapters
     : chapters.filter((c) => c.status === filter || c.status === 'translating')
-  const translatableVisible = visible.filter(isTranslatable)
-  const allVisibleSelected = translatableVisible.length > 0 && translatableVisible.every((c) => selected.has(c.index))
+  const selectableVisible = visible.filter(isSelectable)
+  const allVisibleSelected = selectableVisible.length > 0 && selectableVisible.every((c) => selected.has(c.index))
   const availableFilters = FILTER_ORDER.filter((s) => (counts[s] || 0) > 0)
 
   function toggleSelect(index) {
@@ -193,22 +253,24 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
   function toggleSelectAll() {
     setSelected((s) => {
       const n = new Set(s)
-      if (allVisibleSelected) translatableVisible.forEach((c) => n.delete(c.index))
-      else translatableVisible.forEach((c) => n.add(c.index))
+      if (allVisibleSelected) selectableVisible.forEach((c) => n.delete(c.index))
+      else selectableVisible.forEach((c) => n.add(c.index))
       return n
     })
   }
   function clearSelection() { setSelected(new Set()) }
   function translateSelected() {
-    if (!selected.size || running) return
+    if (!selected.size) return
     const indices = [...selected].sort((a, b) => a - b)
     clearSelection()
-    startTranslate(indices)
+    enqueue(indices, true) // force: re-translate validated, translate the rest
   }
 
   function onNovelSaved(updated) {
     setData((d) => d && { ...d, project: { ...d.project, ...updated } })
   }
+
+  const totalQueued = (queue.current != null ? 1 : 0) + queue.pending.length
 
   return (
     <div className="min-h-screen bg-page text-ink">
@@ -262,21 +324,34 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
             <div className="font-medium">Translate</div>
             <div className="text-sm text-muted">
               {remaining > 0 ? `${remaining} Korean chapter${remaining === 1 ? '' : 's'} still to translate` : 'All Korean chapters translated'}
-              {' · tick chapters below to translate just those'}
+              {' · tick chapters to (re)translate just those — they queue up'}
             </div>
           </div>
-          <button onClick={() => startTranslate(null)} disabled={running || remaining === 0} className="btn btn-primary px-5 py-2.5">
-            {running ? 'Translating…' : `Translate all remaining (${remaining})`}
+          <button onClick={() => enqueue(null, false)} disabled={remaining === 0} className="btn btn-primary px-5 py-2.5">
+            {running ? `Queue all remaining (${remaining})` : `Translate all remaining (${remaining})`}
           </button>
         </section>
+
+        {/* Queue bar */}
+        {totalQueued > 0 && (
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-2 rounded-card border border-line p-3 text-sm" style={{ background: 'var(--b-translating-bg)', color: 'var(--b-translating-tx)' }}>
+            <span>
+              {queue.current != null ? <>Translating <strong>chapter {queue.current}</strong></> : 'Queued'}
+              {queue.pending.length > 0 && ` · ${queue.pending.length} waiting in queue`}
+            </span>
+            {queue.pending.length > 0 && (
+              <button onClick={cancelQueue} className="btn btn-ghost shrink-0 px-3 py-1 text-xs">Clear queue</button>
+            )}
+          </div>
+        )}
 
         {paused && (
           <div className="mb-6 flex flex-col gap-2 rounded-card border border-line p-3 text-sm sm:flex-row sm:items-center sm:justify-between" style={{ background: 'var(--b-queued-bg)', color: 'var(--b-queued-tx)' }}>
             <span>
-              Your plan's limit was reached — progress is saved.
+              Your plan's limit was reached — progress is saved{paused.pending?.length ? ` (${paused.pending.length} left to do)` : ''}.
               {paused.resets_at ? ` Picks back up automatically around ${new Date(paused.resets_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.` : ' Resume when your plan resets.'}
             </span>
-            <button onClick={() => startTranslate(null)} disabled={running} className="btn btn-ghost shrink-0 px-3 py-1.5 text-xs">Resume now</button>
+            <button onClick={() => resumeJob()} disabled={running} className="btn btn-ghost shrink-0 px-3 py-1.5 text-xs">Resume now</button>
           </div>
         )}
 
@@ -329,7 +404,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
               {selected.size > 0 ? (
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-muted">{selected.size} selected</span>
-                  <button onClick={translateSelected} disabled={running} className="btn btn-primary px-3 py-1.5 text-xs">Translate selected</button>
+                  <button onClick={translateSelected} className="btn btn-primary px-3 py-1.5 text-xs">Translate selected</button>
                   <button onClick={clearSelection} className="btn btn-ghost px-2.5 py-1 text-xs">Clear</button>
                 </div>
               ) : done > 0 ? (
@@ -365,7 +440,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
                 <thead className="sticky top-0 text-left text-xs uppercase tracking-wide text-hint" style={{ background: 'var(--surface)' }}>
                   <tr>
                     <th className="w-9 px-3 py-2">
-                      <input type="checkbox" checked={allVisibleSelected} disabled={running || translatableVisible.length === 0} onChange={toggleSelectAll} aria-label="Select all translatable chapters" style={{ accentColor: 'var(--accent)' }} />
+                      <input type="checkbox" checked={allVisibleSelected} disabled={selectableVisible.length === 0} onChange={toggleSelectAll} aria-label="Select all" style={{ accentColor: 'var(--accent)' }} />
                     </th>
                     <th className="px-4 py-2 font-medium">#</th>
                     <th className="px-4 py-2 font-medium">Title</th>
@@ -379,14 +454,17 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
                     <tr><td colSpan={6} className="px-4 py-8 text-center text-hint">No chapters match this filter.</td></tr>
                   )}
                   {visible.map((ch) => {
-                    const canTranslate = isTranslatable(ch)
+                    const selectable = isSelectable(ch)
+                    const isTranslatable = ch.language === 'korean' && ['pending', 'needs-review', 'failed'].includes(ch.status)
                     const translated = ch.has_output && ch.language === 'korean'
                     const canRead = ch.has_output || ch.language === 'english'
+                    const inQueue = queuedSet.has(ch.index)
+                    const isCurrent = queue.current === ch.index
                     return (
                       <tr key={ch.index} className="rowhover border-t border-line">
                         <td className="px-3 py-2">
-                          {canTranslate ? (
-                            <input type="checkbox" checked={selected.has(ch.index)} disabled={running} onChange={() => toggleSelect(ch.index)} aria-label={`Select chapter ${ch.index}`} style={{ accentColor: 'var(--accent)' }} />
+                          {selectable ? (
+                            <input type="checkbox" checked={selected.has(ch.index)} onChange={() => toggleSelect(ch.index)} aria-label={`Select chapter ${ch.index}`} style={{ accentColor: 'var(--accent)' }} />
                           ) : null}
                         </td>
                         <td className="px-4 py-2 tabular-nums text-hint">{ch.index}</td>
@@ -398,12 +476,16 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
                         </td>
                         <td className="px-4 py-2"><Badge status={ch.status} /></td>
                         <td className="px-4 py-2 text-right whitespace-nowrap">
-                          {canTranslate ? (
-                            <button onClick={() => startTranslate([ch.index])} disabled={running} className="btn btn-ghost px-2.5 py-1 text-xs">Translate</button>
+                          {isCurrent ? (
+                            <span className="text-xs text-muted">Translating…</span>
+                          ) : inQueue ? (
+                            <span className="text-xs text-hint">Queued</span>
+                          ) : isTranslatable ? (
+                            <button onClick={() => enqueue([ch.index], false)} className="btn btn-ghost px-2.5 py-1 text-xs">Translate</button>
                           ) : (
                             <>
                               {canRead && <button onClick={() => openReader(ch.index)} className="btn btn-ghost px-2.5 py-1 text-xs">Read</button>}
-                              {translated && <button onClick={() => startTranslate([ch.index], true)} disabled={running} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs">Re-translate</button>}
+                              {translated && <button onClick={() => enqueue([ch.index], true)} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs">Re-translate</button>}
                             </>
                           )}
                         </td>
@@ -425,7 +507,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
           onClose={closeReader}
           onNavigate={setReader}
           onChanged={load}
-          onRetranslate={(i) => startTranslate([i], true)}
+          onRetranslate={(i) => enqueue([i], true)}
         />
       )}
       {showGlossary && (
@@ -433,7 +515,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
           pid={pid}
           onClose={() => setShowGlossary(false)}
           onChanged={loadPending}
-          onRetranslate={(indices) => indices.length && startTranslate(indices, true)}
+          onRetranslate={(indices) => indices.length && enqueue(indices, true)}
         />
       )}
       {showNovelSettings && (

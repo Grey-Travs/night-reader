@@ -30,11 +30,25 @@ You are an expert literary translator who adapts web novels into dynamic, natura
 {honorific_note_line}\
 **Glossary — locked reference, do not change these spellings:**
 {glossary_block}
-
+{names_section}
 **Output contract:**
 1. First, the translated chapter as clean Markdown prose only — no translator's notes, no glossary inside the prose.
 2. Then a line containing only `{delimiter}`, followed by a JSON array of names/terms newly encountered in this chapter that are not already in the glossary: `[{{"korean": "...", "english": "...", "type": "name|place|skill|term|other", "note": "..."}}]`. If none, output `[]`. Output nothing after this block.
 {web_access_line}\
+"""
+
+
+NAME_EXTRACTION_PROMPT = """\
+You build a name/term glossary for a web-novel translation so spellings stay consistent.
+You are given English prose from a novel. Extract the recurring PROPER NOUNS a translator
+must keep consistent: character names, place names, organizations, skills/abilities/
+techniques, and special in-world terms. For each, give the exact English spelling as it
+appears, a type, and a short note for characters (who they are) when clear from the text.
+Ignore common words, sentence-initial capitalization, one-off mentions, and generic nouns.
+
+Output ONLY a JSON array, nothing else:
+[{"english": "...", "type": "name|place|skill|term|other", "note": "..."}]
+If you find nothing, output [].
 """
 
 
@@ -44,6 +58,7 @@ def build_system_prompt(
     web_access: bool = False,
     honorific_note: str | None = None,
     style_note: str | None = None,
+    names_block: str | None = None,
 ) -> str:
     """Render the system prompt with the per-chapter glossary injected.
 
@@ -62,10 +77,19 @@ def build_system_prompt(
     )
     honorific_note_line = f"- {honorific_note}\n\n" if honorific_note else "\n"
     style_note_line = f"\n{style_note.strip()}\n" if style_note and style_note.strip() else ""
+    names_section = ""
+    if names_block and names_block.strip():
+        names_section = (
+            "\n**Canonical names — already established for this novel (from existing "
+            "chapters and the glossary). Use these EXACT English spellings whenever the "
+            "corresponding person, place, or term appears, even if it is not in the "
+            "glossary above:**\n" + names_block + "\n"
+        )
     return SYSTEM_PROMPT_TEMPLATE.format(
         glossary_block=glossary_block,
         delimiter=NEW_TERMS_DELIMITER,
         web_access_line=web_access_line,
         honorific_note_line=honorific_note_line,
         style_note_line=style_note_line,
+        names_section=names_section,
     )

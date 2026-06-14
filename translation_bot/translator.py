@@ -34,8 +34,8 @@ from claude_agent_sdk import (
 
 from .config import AnthropicConfig, TranslationConfig
 from .docs_extract import Chapter
-from .glossary import GlossaryEntry, format_injection
-from .prompts import NEW_TERMS_DELIMITER, build_system_prompt
+from .glossary import GlossaryEntry, format_injection, format_names
+from .prompts import NAME_EXTRACTION_PROMPT, NEW_TERMS_DELIMITER, build_system_prompt
 
 _VALID_EFFORT = {"low", "medium", "high", "xhigh", "max"}
 
@@ -179,9 +179,13 @@ def _build_user_message(
 
 
 class Translator:
-    def __init__(self, cfg: AnthropicConfig, tcfg: TranslationConfig):
+    def __init__(self, cfg: AnthropicConfig, tcfg: TranslationConfig,
+                 canonical_names: list[GlossaryEntry] | None = None):
         self.cfg = cfg
         self.tcfg = tcfg
+        # Established English spellings (incl. names learned from already-English
+        # chapters) injected into every chapter so new translations match them.
+        self.canonical_names = canonical_names or []
 
     def _options(self, system_text: str) -> ClaudeAgentOptions:
         web = self.cfg.web_access
@@ -251,6 +255,7 @@ class Translator:
             web_access=self.cfg.web_access,
             honorific_note=self.tcfg.honorific_note,
             style_note=self.tcfg.style_note,
+            names_block=format_names(self.canonical_names) if self.canonical_names else None,
         )
         reminder = (_RETRY_REMINDER if retry_reminder else "") + extra_instruction
 
@@ -292,3 +297,28 @@ class Translator:
         return TranslationResult(
             "\n\n".join(prose_parts), all_terms, usage, cost, len(chunks), warnings
         )
+
+    def extract_glossary(self, english_text: str) -> list[dict]:
+        """Have Claude pull the cast/places/terms out of already-English chapters,
+        so their established spellings can seed the glossary. Returns a list of
+        ``{english, type, note}`` dicts (best-effort; never raises on bad output)."""
+        if not english_text.strip():
+            return []
+        user_text = "Extract the glossary from this novel text:\n\n" + english_text
+        text, _u, _c = self._call(NAME_EXTRACTION_PROMPT, user_text)
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            return []
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+        out: list[dict] = []
+        for d in data if isinstance(data, list) else []:
+            if isinstance(d, dict) and str(d.get("english", "")).strip():
+                out.append({
+                    "english": str(d["english"]).strip(),
+                    "type": str(d.get("type", "name")).strip().lower(),
+                    "note": str(d.get("note", "")).strip(),
+                })
+        return out

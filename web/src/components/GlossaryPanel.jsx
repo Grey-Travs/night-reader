@@ -56,23 +56,34 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
 
   const [editing, setEditing] = useState(null)
   const [editDraft, setEditDraft] = useState(BLANK)
+  const [editOrig, setEditOrig] = useState({ korean: '', english: '' })
   const [adding, setAdding] = useState(false)
   const [newTerm, setNewTerm] = useState(BLANK)
   const [query, setQuery] = useState('')
   const [affected, setAffected] = useState(null)
+  const [learning, setLearning] = useState(false)
+  const [learnMsg, setLearnMsg] = useState(null)
   const fileRef = useRef(null)
+
+  // Stable id for a locked entry: a mapped term is keyed by Korean, a canonical
+  // English-only name by its English spelling.
+  const entryId = (e) => (e.korean ? `k:${e.korean}` : `e:${e.english}`)
+
+  // Pending rows are keyed by Korean+English: a conflict (same Korean, two English
+  // spellings) keeps both proposals independently editable instead of colliding.
+  const pkey = (p) => `${p.korean}|${p.english}`
 
   async function load() {
     const d = await api.glossary(pid)
     setData(d)
     const init = {}
-    for (const p of d.pending) init[p.korean] = { english: p.english, type: p.type || 'other', note: p.note || '' }
+    for (const p of d.pending) init[pkey(p)] = { english: p.english, type: p.type || 'other', note: p.note || '' }
     setDrafts(init)
   }
   useEffect(() => { load().catch((e) => setError(String(e.message || e))) }, [pid])
 
-  function edit(korean, field, value) {
-    setDrafts((d) => ({ ...d, [korean]: { ...d[korean], [field]: value } }))
+  function edit(key, field, value) {
+    setDrafts((d) => ({ ...d, [key]: { ...d[key], [field]: value } }))
   }
 
   // ---- pending review queue --------------------------------------------------
@@ -82,9 +93,9 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
     catch (e) { setError(String(e.message || e)) }
     finally { setBusy(false) }
   }
-  const approveOne = (p) => decide([{ korean: p.korean, ...drafts[p.korean] }], [])
+  const approveOne = (p) => decide([{ korean: p.korean, ...drafts[pkey(p)] }], [])
   const rejectOne = (p) => decide([], [p.korean])
-  const approveAll = () => decide((data?.pending || []).map((p) => ({ korean: p.korean, ...drafts[p.korean] })), [])
+  const approveAll = () => decide((data?.pending || []).map((p) => ({ korean: p.korean, ...drafts[pkey(p)] })), [])
 
   // ---- locked-term add / edit / delete / import / export ---------------------
   async function saveTerm(body) {
@@ -99,26 +110,38 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
   }
 
   async function addTerm() {
-    if (!newTerm.korean.trim() || !newTerm.english.trim()) { setError('Enter both the Korean term and its English form.'); return }
+    if (!newTerm.english.trim()) { setError('Enter at least the English spelling.'); return }
     if (await saveTerm(newTerm)) { setNewTerm(BLANK); setAdding(false) }
   }
   function startEdit(e) {
-    setEditing(e.korean)
-    setEditDraft({ korean: e.korean, english: e.english, type: e.type || 'other', note: e.note || '', pronoun: e.pronoun || '', register: e.register || '' })
+    setEditing(entryId(e))
+    setEditOrig({ korean: e.korean || '', english: e.english || '' })
+    setEditDraft({ korean: e.korean || '', english: e.english, type: e.type || 'other', note: e.note || '', pronoun: e.pronoun || '', register: e.register || '' })
   }
   async function saveEdit() {
-    if (!editDraft.korean.trim() || !editDraft.english.trim()) { setError('Enter both the Korean term and its English form.'); return }
-    if (await saveTerm({ ...editDraft, original_korean: editing })) setEditing(null)
+    if (!editDraft.english.trim()) { setError('Enter at least the English spelling.'); return }
+    if (await saveTerm({ ...editDraft, original_korean: editOrig.korean, original_english: editOrig.english })) setEditing(null)
   }
-  async function removeTerm(korean) {
-    if (!window.confirm(`Remove “${korean}” from the glossary?`)) return
+  async function removeTerm(e) {
+    if (!window.confirm(`Remove “${e.korean || e.english}” from the glossary?`)) return
     setBusy(true); setError(null)
     try {
-      const d = await api.deleteGlossaryTerm(pid, korean)
+      const d = await api.deleteGlossaryTerm(pid, { korean: e.korean || '', english: e.english || '' })
       setData((cur) => cur && { ...cur, locked: d.locked })
-      if (editing === korean) setEditing(null)
-    } catch (e) { setError(String(e.message || e)) }
+      if (editing === entryId(e)) setEditing(null)
+    } catch (err) { setError(String(err.message || err)) }
     finally { setBusy(false) }
+  }
+
+  // Read the already-English chapters and pull their established names into the glossary.
+  async function learnNames() {
+    setLearning(true); setError(null); setLearnMsg(null)
+    try {
+      const d = await api.learnGlossary(pid)
+      setData((cur) => cur && { ...cur, locked: d.locked })
+      setLearnMsg(`Found ${d.learned} new name${d.learned === 1 ? '' : 's'} from ${d.from_chapters} English chapter${d.from_chapters === 1 ? '' : 's'}.`)
+    } catch (e) { setError(String(e.message || e)) }
+    finally { setLearning(false) }
   }
 
   async function onImportFile(e) {
@@ -127,8 +150,8 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
     if (!file) return
     setBusy(true); setError(null)
     try {
-      const entries = parseGlossaryFile(file.name, await file.text()).filter((x) => x.korean && x.english)
-      if (!entries.length) { setError('No valid rows (need at least Korean + English columns).'); return }
+      const entries = parseGlossaryFile(file.name, await file.text()).filter((x) => x.english)
+      if (!entries.length) { setError('No valid rows (need at least an English column).'); return }
       const d = await api.importGlossary(pid, { entries, mode: 'merge' })
       setData((cur) => cur && { ...cur, locked: d.locked })
     } catch (e) { setError('Import failed: ' + String(e.message || e)) }
@@ -143,7 +166,7 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
 
   const fieldRow = (term, onField) => (
     <>
-      <input value={term.korean} onChange={(e) => onField('korean', e.target.value)} placeholder="Korean" className="input font-korean min-w-[6rem] flex-1 !py-1" />
+      <input value={term.korean} onChange={(e) => onField('korean', e.target.value)} placeholder="Korean (optional)" className="input font-korean min-w-[6rem] flex-1 !py-1" />
       <span className="text-hint">→</span>
       <input value={term.english} onChange={(e) => onField('english', e.target.value)} placeholder="English" className="input min-w-[7rem] flex-1 !py-1" />
       <select value={term.type} onChange={(e) => onField('type', e.target.value)} className="input !py-1">
@@ -187,12 +210,12 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
           )}
           <div className="space-y-2">
             {data?.pending.map((p) => (
-              <div key={p.korean} className="rounded-card border border-line p-3">
+              <div key={pkey(p)} className="rounded-card border border-line p-3">
                 <div className="flex flex-wrap items-center gap-2 text-sm">
                   <span className="font-korean font-medium">{p.korean}</span>
                   <span className="text-hint">→</span>
-                  <input value={drafts[p.korean]?.english ?? ''} onChange={(e) => edit(p.korean, 'english', e.target.value)} className="input min-w-[10rem] flex-1 !py-1" />
-                  <select value={drafts[p.korean]?.type ?? 'other'} onChange={(e) => edit(p.korean, 'type', e.target.value)} className="input !py-1">
+                  <input value={drafts[pkey(p)]?.english ?? ''} onChange={(e) => edit(pkey(p), 'english', e.target.value)} className="input min-w-[10rem] flex-1 !py-1" />
+                  <select value={drafts[pkey(p)]?.type ?? 'other'} onChange={(e) => edit(pkey(p), 'type', e.target.value)} className="input !py-1">
                     {TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
                   </select>
                   {p.chapter && <span className="text-xs text-hint">ch.{p.chapter}</span>}
@@ -210,6 +233,20 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
               </div>
             ))}
           </div>
+        </div>
+
+        <div className="mb-2 rounded-card border border-line p-3" style={{ background: 'var(--b-english-bg)', color: 'var(--b-english-tx)' }}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm">
+              <strong>Names from your English chapters.</strong> Pull the cast, places, and terms out of
+              the chapters already in English so new translations use the same spellings.
+            </div>
+            <button onClick={learnNames} disabled={learning || busy} className="btn btn-primary shrink-0 px-3 py-1.5 text-xs">
+              {learning ? 'Reading chapters…' : 'Learn names'}
+            </button>
+          </div>
+          {learnMsg && <div className="mt-2 text-xs">{learnMsg}</div>}
+          <div className="mt-1 text-xs opacity-80">Uses your Claude plan. Review the results below — a name with no Korean yet is a canonical English spelling to match.</div>
         </div>
 
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -246,8 +283,8 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
                 <tr><td className="px-3 py-2 text-sm text-muted">{locked.length === 0 ? 'No locked terms yet.' : 'No terms match your search.'}</td></tr>
               )}
               {shownLocked.map((e) => (
-                editing === e.korean ? (
-                  <tr key={e.korean} className="border-t border-line first:border-t-0">
+                editing === entryId(e) ? (
+                  <tr key={entryId(e)} className="border-t border-line first:border-t-0">
                     <td colSpan={4} className="px-3 py-2">
                       <div className="flex flex-wrap items-center gap-2">
                         {fieldRow(editDraft, (f, v) => setEditDraft((t) => ({ ...t, [f]: v })))}
@@ -257,8 +294,8 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
                     </td>
                   </tr>
                 ) : (
-                  <tr key={e.korean} className="rowhover border-t border-line first:border-t-0">
-                    <td className="px-3 py-1.5 font-korean font-medium">{e.korean}</td>
+                  <tr key={entryId(e)} className="rowhover border-t border-line first:border-t-0">
+                    <td className="px-3 py-1.5 font-korean font-medium">{e.korean || <span className="font-ui text-xs text-hint" title="Canonical English spelling — Korean not known yet">— EN</span>}</td>
                     <td className="px-3 py-1.5">
                       {e.english}
                       {(e.pronoun || e.register) && <span className="ml-2 text-xs text-hint">{[e.pronoun, e.register].filter(Boolean).join(' · ')}</span>}
@@ -267,7 +304,7 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
                     <td className="px-3 py-1.5 text-xs text-hint">{e.type}</td>
                     <td className="px-3 py-1.5 text-right whitespace-nowrap">
                       <button onClick={() => startEdit(e)} disabled={busy} className="btn btn-ghost px-2.5 py-1 text-xs">Edit</button>
-                      <button onClick={() => removeTerm(e.korean)} disabled={busy} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs" style={{ color: 'var(--danger)' }}>Delete</button>
+                      <button onClick={() => removeTerm(e)} disabled={busy} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs" style={{ color: 'var(--danger)' }}>Delete</button>
                     </td>
                   </tr>
                 )

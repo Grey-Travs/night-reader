@@ -27,3 +27,18 @@ export function getReadingPrefs() {
 export function setReadingPrefs(prefs) {
   write('nr.reading', { ...DEFAULT_PREFS, ...prefs })
 }
+
+// --- a rate-limit-paused job, so the resume banner + auto-resume survive a reload ---
+export function getPausedJob(pid) {
+  const m = read('nr.paused', {})
+  return (m && m[pid]) ?? null
+}
+export function setPausedJob(pid, info) {
+  const m = read('nr.paused', {})
+  m[pid] = info
+  write('nr.paused', m)
+}
+export function clearPausedJob(pid) {
+  const m = read('nr.paused', {})
+  if (m && pid in m) { delete m[pid]; write('nr.paused', m) }
+}

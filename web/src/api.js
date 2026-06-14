@@ -44,11 +44,13 @@ export const api = {
   glossary: (pid) => get(`/api/projects/${pid}/glossary`),
   reviewGlossary: (pid, body) => post(`/api/projects/${pid}/glossary/review`, body),
   saveGlossaryTerm: (pid, body) => post(`/api/projects/${pid}/glossary/term`, body),
-  deleteGlossaryTerm: (pid, korean) => post(`/api/projects/${pid}/glossary/term/delete`, { korean }),
+  deleteGlossaryTerm: (pid, body) => post(`/api/projects/${pid}/glossary/term/delete`, body),
+  learnGlossary: (pid) => post(`/api/projects/${pid}/glossary/learn`),
   importGlossary: (pid, body) => post(`/api/projects/${pid}/glossary/import`, body),
   glossaryExportUrl: (pid, format) => `/api/projects/${pid}/glossary/export?format=${format}`,
 
   translate: (pid, body) => post(`/api/projects/${pid}/translate`, body),
+  cancelQueue: (pid) => post(`/api/projects/${pid}/translate/cancel`),
   activeJob: (pid) => get(`/api/projects/${pid}/active-job`),
   streamUrl: (pid, jobId) => `/api/projects/${pid}/translate/${jobId}/stream`,
 }

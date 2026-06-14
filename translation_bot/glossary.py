@@ -41,13 +41,22 @@ class GlossaryEntry:
 
 
 class Glossary:
-    """In-memory view of ``glossary.json`` keyed by Korean term."""
+    """In-memory view of ``glossary.json``.
+
+    Holds two kinds of entry, both kept in one ordered list:
+    - *mapped* — a Korean term locked to an English spelling (``korean`` set).
+    - *canonical English name* — an English spelling established from already-English
+      chapters whose Korean isn't known yet (``korean`` empty). These are injected as
+      a "match these spellings" reference, so a freshly translated chapter stays
+      consistent with the existing English ones. When the Korean is later learned, the
+      mapped entry supersedes the English-only placeholder automatically.
+    """
 
     def __init__(self, entries: list[GlossaryEntry] | None = None):
+        self._entries: list[GlossaryEntry] = []
         self._by_korean: dict[str, GlossaryEntry] = {}
         for e in entries or []:
-            if e.korean:
-                self._by_korean[e.korean] = e
+            self.add(e)
 
     # ---- persistence -------------------------------------------------------
     @classmethod
@@ -55,8 +64,14 @@ class Glossary:
         path = Path(path)
         if not path.exists():
             return cls([])
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return cls([GlossaryEntry.from_dict(d) for d in data])
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw) if raw.strip() else []
+        except (json.JSONDecodeError, OSError, ValueError):
+            data = []  # a corrupt glossary must not break translation/library loading
+        if not isinstance(data, list):
+            data = []
+        return cls([GlossaryEntry.from_dict(d) for d in data if isinstance(d, dict)])
 
     def save(self, json_path: str | Path, md_path: str | Path | None = None) -> None:
         entries = self.entries()
@@ -69,7 +84,7 @@ class Glossary:
 
     # ---- access ------------------------------------------------------------
     def entries(self) -> list[GlossaryEntry]:
-        return sorted(self._by_korean.values(), key=lambda e: (e.type, e.korean))
+        return sorted(self._entries, key=lambda e: (e.type, e.english or e.korean))
 
     def __contains__(self, korean: str) -> bool:
         return korean in self._by_korean
@@ -78,17 +93,62 @@ class Glossary:
         return self._by_korean.get(korean)
 
     def relevant_to(self, source_text: str) -> list[GlossaryEntry]:
-        """Entries whose Korean term occurs in the chapter source."""
-        hits = [e for e in self._by_korean.values() if e.korean and e.korean in source_text]
+        """Mapped entries whose Korean term occurs in the chapter source."""
+        hits = [e for e in self._entries if e.korean and e.korean in source_text]
         return sorted(hits, key=lambda e: (e.type, e.korean))
 
+    def canonical(self) -> list[GlossaryEntry]:
+        """English-only canonical names, for the injected "match these spellings" block.
+
+        Mapped entries are deliberately excluded: they're already injected (with their
+        Korean) by ``relevant_to`` whenever they appear, so this keeps the prompt lean
+        and avoids duplicating them. The value here is names whose Korean isn't known
+        yet (e.g. learned from already-English chapters)."""
+        return sorted((e for e in self._entries if not e.korean and e.english),
+                      key=lambda e: (e.type, e.english))
+
     # ---- mutation ----------------------------------------------------------
+    def _drop_english_only(self, english: str) -> None:
+        low = english.lower()
+        self._entries = [e for e in self._entries if not (not e.korean and e.english.lower() == low)]
+
     def add(self, entry: GlossaryEntry) -> None:
-        self._by_korean[entry.korean] = entry
+        if not entry.english and not entry.korean:
+            return
+        if entry.korean:
+            old = self._by_korean.get(entry.korean)
+            if old is not None and old in self._entries:
+                self._entries.remove(old)
+            if entry.english:
+                self._drop_english_only(entry.english)  # mapped entry supersedes the placeholder
+            self._by_korean[entry.korean] = entry
+            self._entries.append(entry)
+        else:
+            # A mapped entry with the same English already covers this spelling — don't
+            # add a redundant English-only canonical name.
+            low = entry.english.lower()
+            if any(e.korean and e.english.lower() == low for e in self._entries):
+                return
+            self._drop_english_only(entry.english)  # dedup canonical names by English
+            self._entries.append(entry)
 
     def remove(self, korean: str) -> bool:
-        """Drop a term by its Korean key. Returns True if something was removed."""
-        return self._by_korean.pop(korean, None) is not None
+        """Drop a mapped term by its Korean key. Returns True if something was removed."""
+        e = self._by_korean.pop(korean, None)
+        if e is None:
+            return False
+        if e in self._entries:
+            self._entries.remove(e)
+        return True
+
+    def remove_english(self, english: str) -> bool:
+        """Drop an English-only canonical name. Returns True if something was removed."""
+        low = english.lower()
+        for e in list(self._entries):
+            if not e.korean and e.english.lower() == low:
+                self._entries.remove(e)
+                return True
+        return False
 
     # ---- rendering ---------------------------------------------------------
     def to_markdown(self) -> str:
@@ -119,12 +179,27 @@ def format_injection(entries: list[GlossaryEntry]) -> str:
     )
 
 
+def format_names(entries: list[GlossaryEntry]) -> str:
+    """Render the canonical-English-names block (spellings to match for consistency)."""
+    lines = []
+    for e in entries:
+        if not e.english:
+            continue
+        lines.append(f"- {e.english} ({e.type})" + _profile_hint(e) + (f" — {e.note}" if e.note else ""))
+    return "\n".join(lines)
+
+
 # ---- pending queue ---------------------------------------------------------
 def load_pending(path: str | Path) -> list[dict]:
     path = Path(path)
     if not path.exists():
         return []
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else []
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
 
 
 def save_pending(path: str | Path, items: list[dict]) -> None:

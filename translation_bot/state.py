@@ -9,6 +9,7 @@ never forces a full, re-billed re-run.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,13 +40,27 @@ class State:
         path = Path(path)
         if not path.exists():
             return cls()
-        return cls(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw) if raw.strip() else {}
+        except (json.JSONDecodeError, OSError, ValueError):
+            # A truncated/garbled state.json (e.g. the process was killed mid-write)
+            # must not crash the whole library — start fresh for this project instead.
+            data = {}
+        return cls(data if isinstance(data, dict) else {})
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(
+        # Atomic write: serialize to a temp file in the same dir, then os.replace — a
+        # concurrent reader (now common with enqueue-while-running) never sees a
+        # half-written file, only the old or the new one.
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(
             json.dumps({"chapters": self.chapters}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp, path)
 
     def get(self, index: int) -> dict | None:
         return self.chapters.get(str(index))
