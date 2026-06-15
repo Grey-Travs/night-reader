@@ -74,6 +74,10 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
   const [prefs, setPrefs] = useState(getReadingPrefs)
   const [showType, setShowType] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [scan, setScan] = useState(null)        // scan result {problems, auto_fixable} | null
+  const [scanning, setScanning] = useState(false)
+  const [fixing, setFixing] = useState(false)
+  const [scanClean, setScanClean] = useState(false) // transient "no issues" flash
 
   // Copy the chapter as rich text (italics, bold and the *** scene break survive a
   // paste into Docs/Word), keeping the raw text as the plain-text fallback.
@@ -159,6 +163,39 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
     }
   }
 
+  // Scan this chapter for problems (leaked AI notes, untranslated Korean, length/
+  // structure). If clean, flash a tick; otherwise open the results popup.
+  async function runScan() {
+    setScanning(true)
+    setError(null)
+    setScanClean(false)
+    try {
+      const r = await api.scanChapter(pid, index)
+      if (!r.problems.length) { setScanClean(true); setTimeout(() => setScanClean(false), 2500) }
+      else setScan(r)
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  async function autoFix() {
+    setFixing(true)
+    setError(null)
+    try {
+      const r = await api.fixChapter(pid, index)
+      onChanged?.()
+      load() // refresh the reader with the cleaned text
+      if (!r.problems.length) { setScan(null); setScanClean(true); setTimeout(() => setScanClean(false), 2500) }
+      else setScan(r) // show whatever still needs a re-translate
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setFixing(false)
+    }
+  }
+
   const hasTranslation = !!data?.translation
   const failures = data?.failures || []
   const readStyle = { fontSize: prefs.fontSize, maxWidth: `${prefs.width}ch`, ...(prefs.sepia ? { color: SEPIA_INK } : {}) }
@@ -231,6 +268,9 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
             )}
             {hasTranslation && (
               <>
+                <button onClick={runScan} disabled={scanning} className="btn btn-ghost px-3 py-1.5 text-xs">
+                  {scanning ? 'Checking…' : scanClean ? 'No issues ✓' : 'Check chapter'}
+                </button>
                 <button onClick={() => { setDraft(data.translation || ''); setEditing(true); setShowSource(false) }} className="btn btn-ghost px-3 py-1.5 text-xs">Edit</button>
                 <button onClick={() => downloadText(`chapter-${index}.md`, data.translation)} className="btn btn-ghost px-3 py-1.5 text-xs">Download</button>
                 {data.language === 'korean' && onRetranslate && !data.offline && (
@@ -307,6 +347,42 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
           )
         ) : null}
       </div>
+
+      {/* Chapter-check results popup */}
+      {scan && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" style={{ background: 'var(--scrim)' }} onClick={() => setScan(null)}>
+          <div className="w-full max-w-lg overflow-hidden rounded-card border border-line" style={{ background: 'var(--elevated)', color: 'var(--ink)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-line px-5 py-3">
+              <h3 className="font-medium">Chapter {index} — {scan.problems.length} issue{scan.problems.length === 1 ? '' : 's'} found</h3>
+              <button onClick={() => setScan(null)} className="btn btn-quiet text-lg leading-none">✕</button>
+            </div>
+            <div className="max-h-[55vh] overflow-y-auto px-5 py-4">
+              <ul className="space-y-2">
+                {scan.problems.map((p, i) => (
+                  <li key={i} className="flex items-start gap-2 rounded-card border border-line p-3 text-sm">
+                    <span className={`pill ${p.severity === 'high' ? 'pill-review' : p.severity === 'medium' ? 'pill-queued' : 'pill-muted'}`}>{p.severity}</span>
+                    <span className="flex-1">{p.message}{p.auto_fixable && <span className="ml-1 text-xs text-hint">· auto-fixable</span>}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-3 text-xs text-hint">
+                {scan.auto_fixable
+                  ? 'Auto-fix removes leaked AI notes and untranslated-source echoes in place (the original is backed up). Anything it can’t fix needs a re-translate.'
+                  : 'These need a re-translate to fix.'}
+              </p>
+            </div>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-line px-5 py-3">
+              {scan.auto_fixable && (
+                <button onClick={autoFix} disabled={fixing} className="btn btn-primary px-4 py-2 text-sm">{fixing ? 'Fixing…' : 'Fix automatically'}</button>
+              )}
+              {data?.language === 'korean' && onRetranslate && !data?.offline && (
+                <button onClick={() => { onRetranslate(index); setScan(null); onClose() }} className="btn btn-ghost px-4 py-2 text-sm">Re-translate chapter</button>
+              )}
+              <button onClick={() => setScan(null)} className="btn btn-ghost px-4 py-2 text-sm">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

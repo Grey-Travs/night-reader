@@ -38,9 +38,11 @@ from translation_bot.epub import build_epub
 from translation_bot.glossary import VALID_TYPES, Glossary, GlossaryEntry, load_pending, save_pending
 from translation_bot.google_auth import build_docs_service, get_credentials, load_saved_credentials
 from translation_bot.pipeline import chapter_filename, process_chapter, write_chapter_file
+from translation_bot.sanitize import find_leaks, korean_fraction, strip_reasoning
 from translation_bot.state import State
 from translation_bot.text_source import split_text_into_chapters
 from translation_bot.translator import RateLimitedError, Translator, TranslatorError
+from translation_bot.validate import validate_translation
 
 from . import projects as pj
 
@@ -667,6 +669,83 @@ def save_chapter(pid: str, index: int, body: ChapterEdit) -> dict:
     )
     state.save(cfg.paths.state_file)
     return {"ok": True, "status": state_mod.STATUS_VALIDATED}
+
+
+def _chapter_problems(pid: str, cfg: Config, index: int) -> dict:
+    """Scan a chapter's saved translation for problems: leaked AI reasoning,
+    untranslated Korean, and the length/structure validation checks."""
+    chapters = get_chapters(pid, cfg)
+    total = len(chapters)
+    ch = next((c for c in chapters if c.index == index), None)
+    if ch is None:
+        raise HTTPException(404, f"chapter {index} not found")
+    path = cfg.paths.output_dir / chapter_filename(index, total)
+    if not path.exists():
+        return {"index": index, "translated": False, "ok": True, "auto_fixable": False, "problems": []}
+    text = path.read_text(encoding="utf-8")
+
+    problems: list[dict] = []
+    leaks = find_leaks(text)
+    if leaks:
+        problems.append({"type": "reasoning_leak", "severity": "high", "auto_fixable": True,
+                         "message": f"AI reasoning/notes left in the text — e.g. “{leaks[0][:90]}”"})
+    kf = korean_fraction(text)
+    if kf > 0.02:
+        cleaned, _ = strip_reasoning(text)
+        problems.append({"type": "untranslated_korean",
+                         "severity": "high" if kf > 0.10 else "medium",
+                         "auto_fixable": korean_fraction(cleaned) <= 0.02,
+                         "message": f"Untranslated Korean remains (~{round(kf * 100)}% of the text)"})
+    val = validate_translation(ch, text, cfg.validation)
+    for f in val.failures:
+        if "leaked" in f or "untranslated Korean" in f:
+            continue  # already reported above with a fix path
+        problems.append({"type": "structure", "severity": "medium", "auto_fixable": False, "message": f})
+    for w in val.warnings:
+        problems.append({"type": "warning", "severity": "low", "auto_fixable": False, "message": w})
+
+    return {"index": index, "translated": True, "problems": problems,
+            "auto_fixable": any(p["auto_fixable"] for p in problems), "ok": not problems}
+
+
+@app.get("/api/projects/{pid}/chapters/{index}/scan")
+def scan_chapter(pid: str, index: int) -> dict:
+    _, cfg = project_cfg(pid)
+    return _chapter_problems(pid, cfg, index)
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/fix")
+def fix_chapter(pid: str, index: int) -> dict:
+    """Auto-resolve what's safe to fix in place: strip leaked AI reasoning / source
+    echoes. Issues that need a re-translate are reported back unchanged."""
+    _, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    total = len(chapters)
+    ch = next((c for c in chapters if c.index == index), None)
+    if ch is None:
+        raise HTTPException(404, f"chapter {index} not found")
+    path = cfg.paths.output_dir / chapter_filename(index, total)
+    if not path.exists():
+        raise HTTPException(400, "This chapter isn't translated yet.")
+
+    text = path.read_text(encoding="utf-8")
+    cleaned, removed = strip_reasoning(text)
+    fixed = bool(removed) and bool(cleaned.strip())
+    if fixed:
+        # Preserve the original once, then write the cleaned version.
+        bdir = pj.PROJECTS_DIR / pid / "chapters_preclean_backup"
+        bdir.mkdir(exist_ok=True)
+        bpath = bdir / chapter_filename(index, total)
+        if not bpath.exists():
+            bpath.write_text(text, encoding="utf-8")
+        write_chapter_file(cfg.paths.output_dir, index, total, cleaned)
+        val = validate_translation(ch, cleaned, cfg.validation)
+        state = State.load(cfg.paths.state_file)
+        state.update(index, title=ch.title,
+                     status=state_mod.STATUS_VALIDATED if val.ok else state_mod.STATUS_NEEDS_REVIEW,
+                     failures=val.failures, manual_edit=True)
+        state.save(cfg.paths.state_file)
+    return {"fixed": fixed, "removed": len(removed), **_chapter_problems(pid, cfg, index)}
 
 
 # ----------------------------------------------------------------------------- glossary

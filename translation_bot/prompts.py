@@ -34,6 +34,8 @@ You are an expert literary translator who adapts web novels into dynamic, natura
 **Output contract:**
 1. First, the translated chapter as clean Markdown prose only — no translator's notes, no glossary inside the prose.
 2. Then a line containing only `{delimiter}`, followed by a JSON array of names/terms newly encountered in this chapter that are not already in the glossary: `[{{"korean": "...", "english": "...", "type": "name|place|skill|term|other", "note": "..."}}]`. If none, output `[]`. Output nothing after this block.
+
+**CRITICAL — no thinking in the output.** Do all reasoning, name-checking, and self-correction silently (in your private thinking), never in the answer. The prose section must contain ONLY the finished translated chapter. Never write meta-commentary such as "Wait", "Let me redo", "Let me re-read", "Actually the name is…", "the narrator is…", "the glossary says…", or a first draft followed by a corrected one. If you change your mind about a name or wording, output only the final corrected text — no drafts, no notes, no "---" separating attempts.
 {web_access_line}\
 """
 

@@ -36,6 +36,7 @@ from .config import AnthropicConfig, TranslationConfig
 from .docs_extract import Chapter
 from .glossary import GlossaryEntry, format_injection, format_names
 from .prompts import NAME_EXTRACTION_PROMPT, NEW_TERMS_DELIMITER, build_system_prompt
+from .sanitize import strip_reasoning
 
 _VALID_EFFORT = {"low", "medium", "high", "xhigh", "max"}
 
@@ -118,14 +119,23 @@ def _extract_usage(result: ResultMessage) -> dict:
 
 
 def parse_response(text: str) -> tuple[str, list[dict], list[str]]:
-    """Split the model output into prose and the new-terms JSON array."""
+    """Split the model output into prose and the new-terms JSON array.
+
+    Leaked AI reasoning/meta ("Let me redo", glossary chatter, wrong-name drafts) is
+    stripped from the prose here so it can never reach a chapter file.
+    """
     warnings: list[str] = []
     if NEW_TERMS_DELIMITER not in text:
+        prose, removed = strip_reasoning(text)
+        if removed:
+            warnings.append(f"stripped {len(removed)} leaked reasoning block(s) from output")
         warnings.append("response had no ===NEW_TERMS=== block; treating all output as prose")
-        return text.strip(), [], warnings
+        return prose, [], warnings
 
     prose, _, tail = text.partition(NEW_TERMS_DELIMITER)
-    prose = prose.strip()
+    prose, removed = strip_reasoning(prose)
+    if removed:
+        warnings.append(f"stripped {len(removed)} leaked reasoning block(s) from output")
 
     start = tail.find("[")
     end = tail.rfind("]")

@@ -45,6 +45,8 @@ export const api = {
     get(`/api/projects/${pid}/chapters` + (refresh ? '?refresh=true' : '')),
   chapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}`),
   saveChapter: (pid, i, translation) => put(`/api/projects/${pid}/chapters/${i}`, { translation }),
+  scanChapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}/scan`),
+  fixChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/fix`),
   searchChapters: (pid, q) => get(`/api/projects/${pid}/search?q=${encodeURIComponent(q)}`),
   exportUrl: (pid, format) => `/api/projects/${pid}/export?format=${format}`,
 

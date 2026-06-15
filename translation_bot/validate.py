@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from .config import ValidationConfig
 from .docs_extract import Chapter, _QUOTE_RE
+from .sanitize import find_leaks, korean_fraction
 
 
 @dataclass
@@ -52,6 +53,15 @@ def validate_translation(
         "output_chars": out_chars,
         "length_ratio": round(ratio, 3),
     }
+
+    # 0. Reasoning-leak check (hard fail). The model must never leave "thinking out
+    #    loud" — meta-commentary, glossary chatter, or a redo draft — in the prose.
+    leaks = find_leaks(translation)
+    if leaks:
+        failures.append(f"AI reasoning/notes leaked into the text (e.g. “{leaks[0][:80]}”)")
+    #    …and it must not leave chunks of untranslated Korean source behind.
+    if korean_fraction(translation) > 0.10:
+        failures.append("substantial untranslated Korean remains in the output")
 
     # 1. Paragraph-count check (structural). Tolerance scales with chapter length so
     #    minor formatting merges don't flag, but a missing scene still does.
