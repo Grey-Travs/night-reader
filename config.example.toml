@@ -33,6 +33,10 @@ continuity_paragraphs = 3      # trailing source paragraphs of the previous chun
 include_prev_translation = false  # also pass the previous chunk's translation as continuity context
 romanization = "Revised Romanization (RR)"
 honorific_note = "Keep -hyung and similar relational honorifics attached to names; localize or drop the address particles -ssi, -ya, -ah, -nim into natural English."
+# AI deep-check after each translation (catches leaked reasoning the fast checks miss).
+# off = never (manual only) · flagged = only chapters that failed the fast checks (cheap)
+# · always = every chapter (max safety, ~1 extra Claude call per chapter).
+deep_check = "flagged"
 
 [validation]
 length_ratio_min = 1.6          # English/Korean char ratio lower bound (below -> likely omission)

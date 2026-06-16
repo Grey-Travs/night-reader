@@ -38,7 +38,7 @@ from translation_bot.epub import build_epub
 from translation_bot.glossary import VALID_TYPES, Glossary, GlossaryEntry, load_pending, save_pending
 from translation_bot.google_auth import build_docs_service, get_credentials, load_saved_credentials
 from translation_bot.pipeline import chapter_filename, process_chapter, write_chapter_file
-from translation_bot.sanitize import find_leaks, korean_fraction, strip_reasoning
+from translation_bot.sanitize import find_leaks, korean_fraction, remove_snippets, strip_reasoning
 from translation_bot.state import State
 from translation_bot.text_source import split_text_into_chapters
 from translation_bot.translator import RateLimitedError, Translator, TranslatorError
@@ -69,6 +69,7 @@ app.add_middleware(
 # Input validation for the settings endpoint (prevents corrupting config.toml).
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_DEEP_MODES = {"off", "flagged", "always"}
 
 _chapter_cache: dict[str, list[Chapter]] = {}  # keyed by project id
 # Projects whose source Google Doc can't be fetched on this device (no access /
@@ -279,6 +280,7 @@ def status() -> dict:
 class Settings(BaseModel):
     model: str | None = None
     effort: str | None = None
+    deep_check: str | None = None
 
 
 @app.get("/api/settings")
@@ -287,6 +289,7 @@ def get_settings() -> dict:
     return {
         "model": cfg.anthropic.model,
         "effort": cfg.anthropic.effort,
+        "deep_check": cfg.translation.deep_check,
         "chunk_threshold": cfg.translation.chunk_threshold,
         "length_ratio_min": cfg.validation.length_ratio_min,
         "length_ratio_max": cfg.validation.length_ratio_max,
@@ -302,18 +305,28 @@ def update_settings(s: Settings) -> dict:
         raise HTTPException(400, "Invalid model id.")
     if s.effort is not None and s.effort not in _EFFORTS:
         raise HTTPException(400, "Invalid effort level.")
+    if s.deep_check is not None and s.deep_check not in _DEEP_MODES:
+        raise HTTPException(400, "Invalid deep-check mode.")
     text = CONFIG_PATH.read_text(encoding="utf-8")
 
-    def setkey(t: str, key: str, value: str) -> str:
+    def setkey(t: str, key: str, value: str, section: str | None = None) -> str:
+        # Values are already restricted to safe characters above; inserted literally.
         pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*)"[^"]*"'
-        # Function replacement: value is inserted literally (no regex backreference
-        # interpretation), and it is already restricted to safe characters above.
-        return re.sub(pattern, lambda m: m.group(1) + '"' + value + '"', t) if re.search(pattern, t) else t
+        if re.search(pattern, t):
+            return re.sub(pattern, lambda m: m.group(1) + '"' + value + '"', t)
+        if section:  # key missing (older config) — insert it under its section header
+            sec = rf'(?m)^(\[{re.escape(section)}\]\s*\n)'
+            if re.search(sec, t):
+                return re.sub(sec, lambda m: m.group(1) + f'{key} = "{value}"\n', t, count=1)
+            return t.rstrip() + f'\n\n[{section}]\n{key} = "{value}"\n'
+        return t
 
     if s.model is not None:
         text = setkey(text, "model", s.model)
     if s.effort is not None:
         text = setkey(text, "effort", s.effort)
+    if s.deep_check is not None:
+        text = setkey(text, "deep_check", s.deep_check, section="translation")
     CONFIG_PATH.write_text(text, encoding="utf-8")
     return {"ok": True}
 
@@ -714,10 +727,49 @@ def scan_chapter(pid: str, index: int) -> dict:
     return _chapter_problems(pid, cfg, index)
 
 
+@app.post("/api/projects/{pid}/chapters/{index}/scan/deep")
+async def scan_chapter_deep(pid: str, index: int) -> dict:
+    """Deep check: have Claude read the whole chapter and flag any non-story text the
+    regex can't anticipate (anywhere, not just the first line). Uses your plan."""
+    _, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    total = len(chapters)
+    ch = next((c for c in chapters if c.index == index), None)
+    if ch is None:
+        raise HTTPException(404, f"chapter {index} not found")
+    path = cfg.paths.output_dir / chapter_filename(index, total)
+    if not path.exists():
+        raise HTTPException(400, "This chapter isn't translated yet.")
+    text = path.read_text(encoding="utf-8")
+    translator = Translator(cfg.anthropic, cfg.translation)
+    try:
+        snippets = await run_in_threadpool(translator.find_meta_leaks, text)
+    except RateLimitedError as exc:
+        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
+    except TranslatorError as exc:
+        raise HTTPException(502, f"Deep check failed: {exc}")
+
+    base = _chapter_problems(pid, cfg, index)  # include the fast regex findings too
+    seen = {p["message"] for p in base["problems"]}
+    for s in snippets:
+        if s and s in text and s[:120] not in seen:
+            base["problems"].append({"type": "ai_detected", "severity": "high",
+                                     "auto_fixable": True, "snippet": s, "message": s[:120]})
+    base["auto_fixable"] = any(p["auto_fixable"] for p in base["problems"])
+    base["ok"] = not base["problems"]
+    base["deep"] = True
+    return base
+
+
+class FixRequest(BaseModel):
+    remove: list[str] = []  # exact snippets to delete (from the AI deep-check)
+
+
 @app.post("/api/projects/{pid}/chapters/{index}/fix")
-def fix_chapter(pid: str, index: int) -> dict:
+def fix_chapter(pid: str, index: int, body: FixRequest = FixRequest()) -> dict:
     """Auto-resolve what's safe to fix in place: strip leaked AI reasoning / source
-    echoes. Issues that need a re-translate are reported back unchanged."""
+    echoes, plus any exact snippets the deep-check flagged. Issues that need a
+    re-translate are reported back unchanged."""
     _, cfg = project_cfg(pid)
     chapters = get_chapters(pid, cfg)
     total = len(chapters)
@@ -729,8 +781,9 @@ def fix_chapter(pid: str, index: int) -> dict:
         raise HTTPException(400, "This chapter isn't translated yet.")
 
     text = path.read_text(encoding="utf-8")
+    text, snip_removed = remove_snippets(text, body.remove)
     cleaned, removed = strip_reasoning(text)
-    fixed = bool(removed) and bool(cleaned.strip())
+    fixed = (snip_removed > 0 or bool(removed)) and bool(cleaned.strip())
     if fixed:
         # Preserve the original once, then write the cleaned version.
         bdir = pj.PROJECTS_DIR / pid / "chapters_preclean_backup"
@@ -745,7 +798,7 @@ def fix_chapter(pid: str, index: int) -> dict:
                      status=state_mod.STATUS_VALIDATED if val.ok else state_mod.STATUS_NEEDS_REVIEW,
                      failures=val.failures, manual_edit=True)
         state.save(cfg.paths.state_file)
-    return {"fixed": fixed, "removed": len(removed), **_chapter_problems(pid, cfg, index)}
+    return {"fixed": fixed, "removed": len(removed) + snip_removed, **_chapter_problems(pid, cfg, index)}
 
 
 # ----------------------------------------------------------------------------- glossary
@@ -1170,6 +1223,19 @@ def cancel_queue(pid: str) -> dict:
         job.queued = {job.current} if job.current is not None else set()
         return {"ok": True, "current": job.current, "pending": []}
     return {"ok": True, "current": None, "pending": []}
+
+
+@app.get("/api/queue")
+def queue_overview() -> dict:
+    """Live view of every project's translation queue — powers the library dashboard."""
+    jobs = []
+    for pid, jid in list(_active_job_by_project.items()):
+        job = _jobs.get(jid)
+        if job is None or job.done:
+            continue
+        project = pj.get_project(pid) or {}
+        jobs.append({"pid": pid, "name": project.get("name", "Novel"), **job.queue_state()})
+    return {"jobs": jobs}
 
 
 @app.get("/api/projects/{pid}/active-job")

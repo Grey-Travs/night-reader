@@ -40,6 +40,21 @@ You are an expert literary translator who adapts web novels into dynamic, natura
 """
 
 
+META_SCAN_PROMPT = """\
+You are reviewing the FINAL English translation of a web-novel chapter for stray text
+that is NOT part of the story — text the translator/AI accidentally left in. Flag any:
+- preambles or sign-offs to the reader ("Here is the translation", "Sure, here you go", "I hope this helps")
+- notes, commentary, or reasoning about the translation ("Let me redo", "the glossary says", "the name should be X", "wait, actually…")
+- untranslated source-language (Korean) text, or romanization notes / "X -> Y" mappings
+- any meta text that is neither narration nor character dialogue
+
+Do NOT flag normal story prose or character dialogue, even if dramatic or first-person.
+
+Return ONLY a JSON array of the exact offending substrings, copied VERBATIM (character
+for character) so they can be located and removed. If the chapter is clean, return [].
+"""
+
+
 NAME_EXTRACTION_PROMPT = """\
 You build a name/term glossary for a web-novel translation so spellings stay consistent.
 You are given English prose from a novel. Extract the recurring PROPER NOUNS a translator

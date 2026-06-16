@@ -16,6 +16,7 @@ from .config import Config
 from .docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
 from .glossary import Glossary, queue_new_terms
 from .google_auth import build_docs_service, get_credentials
+from .sanitize import remove_snippets, strip_reasoning
 from . import state as state_mod
 from .state import State
 from .translator import RateLimitedError, Translator, TranslationResult
@@ -107,6 +108,34 @@ def _translate_with_retry(
     return retry, retry_validation
 
 
+def _deep_check_and_fix(
+    translator: Translator,
+    chapter: Chapter,
+    result: TranslationResult,
+    validation: ValidationResult,
+    cfg: Config,
+) -> tuple[TranslationResult, ValidationResult]:
+    """Have Claude read the finished translation and strip any non-story text the fast
+    checks can't pattern-match. Runs as a check -> fix -> re-check loop, so a second AI
+    pass only happens when the first found (and removed) something. Never blocks the
+    pipeline: any deep-check failure leaves the chapter exactly as translated."""
+    for _ in range(2):
+        try:
+            snippets = translator.find_meta_leaks(result.prose)
+        except Exception:  # noqa: BLE001 — the deep check is a bonus layer, never fatal
+            break
+        if not snippets:
+            break
+        cleaned, n_snip = remove_snippets(result.prose, snippets)
+        cleaned, removed = strip_reasoning(cleaned)
+        if not cleaned.strip() or cleaned == result.prose:
+            break  # nothing actually removable -> stop (and don't blank the chapter)
+        result.prose = cleaned
+        result.warnings = [*result.warnings, f"deep-check removed {n_snip + len(removed)} leak block(s)"]
+        validation = validate_translation(chapter, cleaned, cfg.validation)
+    return result, validation
+
+
 def process_chapter(
     chapter: Chapter,
     total: int,
@@ -139,6 +168,12 @@ def process_chapter(
 
     metrics = chapter.metrics
     result, validation = _translate_with_retry(translator, chapter, glossary, cfg, state)
+
+    # Optional AI deep-check layer (off | flagged | always). "flagged" only spends a
+    # call on chapters the fast checks already rejected; "always" checks every chapter.
+    mode = getattr(cfg.translation, "deep_check", "flagged")
+    if mode == "always" or (mode == "flagged" and not validation.ok):
+        result, validation = _deep_check_and_fix(translator, chapter, result, validation, cfg)
 
     status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW
     write_audit(cfg.paths.audit_dir, chapter, total, result, validation, status)

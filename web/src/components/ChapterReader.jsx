@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api'
 import { Badge } from './ui'
+import Hint from './Hint'
+import { useHints } from '../hints'
 import { getReadingPrefs, markChapterRead, setLastRead, setReadingPrefs } from '../prefs'
 
 const SEPIA_BG = '#f4ecd8'
@@ -64,7 +66,9 @@ function downloadText(filename, text, type = 'text/markdown') {
   URL.revokeObjectURL(url)
 }
 
-export default function ChapterReader({ pid, index, chapters, onClose, onNavigate, onChanged, onRetranslate }) {
+export default function ChapterReader({ pid, index, chapters, onClose, onNavigate, onChanged, onRetranslate, onGuide }) {
+  const { on: hintsOn } = useHints()
+  const [showTip, setShowTip] = useState(true)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [showSource, setShowSource] = useState(false)
@@ -76,8 +80,8 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
   const [copied, setCopied] = useState(false)
   const [scan, setScan] = useState(null)        // scan result {problems, auto_fixable} | null
   const [scanning, setScanning] = useState(false)
+  const [deepScanning, setDeepScanning] = useState(false)
   const [fixing, setFixing] = useState(false)
-  const [scanClean, setScanClean] = useState(false) // transient "no issues" flash
 
   // Copy the chapter as rich text (italics, bold and the *** scene break survive a
   // paste into Docs/Word), keeping the raw text as the plain-text fallback.
@@ -163,16 +167,13 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
     }
   }
 
-  // Scan this chapter for problems (leaked AI notes, untranslated Korean, length/
-  // structure). If clean, flash a tick; otherwise open the results popup.
+  // Fast (free, instant) check — always opens the popup so the deep-check is one
+  // click away even when the quick scan finds nothing.
   async function runScan() {
     setScanning(true)
     setError(null)
-    setScanClean(false)
     try {
-      const r = await api.scanChapter(pid, index)
-      if (!r.problems.length) { setScanClean(true); setTimeout(() => setScanClean(false), 2500) }
-      else setScan(r)
+      setScan(await api.scanChapter(pid, index))
     } catch (e) {
       setError(String(e.message || e))
     } finally {
@@ -180,15 +181,29 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
     }
   }
 
+  // Deep check — Claude reads the whole chapter and flags non-story text anywhere,
+  // catching phrasings the regex can't anticipate. Merges into the popup.
+  async function runDeepScan() {
+    setDeepScanning(true)
+    setError(null)
+    try {
+      setScan(await api.deepScanChapter(pid, index))
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setDeepScanning(false)
+    }
+  }
+
   async function autoFix() {
     setFixing(true)
     setError(null)
     try {
-      const r = await api.fixChapter(pid, index)
+      const snippets = (scan?.problems || []).filter((p) => p.snippet).map((p) => p.snippet)
+      const r = await api.fixChapter(pid, index, { remove: snippets })
       onChanged?.()
       load() // refresh the reader with the cleaned text
-      if (!r.problems.length) { setScan(null); setScanClean(true); setTimeout(() => setScanClean(false), 2500) }
-      else setScan(r) // show whatever still needs a re-translate
+      setScan(r) // show whatever still needs a re-translate (empty list = all fixed)
     } catch (e) {
       setError(String(e.message || e))
     } finally {
@@ -219,6 +234,7 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
           {data && <Badge status={data.status} />}
         </div>
         <div className="flex items-center gap-1">
+          {onGuide && <button onClick={onGuide} className="btn btn-ghost px-2.5 py-1.5 text-xs" title="How to use this app" aria-label="Guide">❓</button>}
           {/* Typography */}
           <div className="relative">
             <button onClick={() => setShowType((v) => !v)} className="btn btn-ghost px-2.5 py-1.5 text-xs" title="Reading options" aria-label="Reading options">Aa</button>
@@ -264,13 +280,17 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {copyableText && (
-              <button onClick={() => copyChapter(copyableText)} className="btn btn-ghost px-3 py-1.5 text-xs">{copied ? 'Copied ✓' : 'Copy text'}</button>
+              <>
+                <button onClick={() => copyChapter(copyableText)} className="btn btn-ghost px-3 py-1.5 text-xs">{copied ? 'Copied ✓' : 'Copy text'}</button>
+                <Hint text="Copies just the chapter text, with its formatting. The tips and buttons on this page are never copied." />
+              </>
             )}
             {hasTranslation && (
               <>
                 <button onClick={runScan} disabled={scanning} className="btn btn-ghost px-3 py-1.5 text-xs">
-                  {scanning ? 'Checking…' : scanClean ? 'No issues ✓' : 'Check chapter'}
+                  {scanning ? 'Checking…' : 'Check chapter'}
                 </button>
+                <Hint text="Scans this chapter for problems — leftover AI notes, untranslated bits, or odd length — and offers to fix them." />
                 <button onClick={() => { setDraft(data.translation || ''); setEditing(true); setShowSource(false) }} className="btn btn-ghost px-3 py-1.5 text-xs">Edit</button>
                 <button onClick={() => downloadText(`chapter-${index}.md`, data.translation)} className="btn btn-ghost px-3 py-1.5 text-xs">Download</button>
                 {data.language === 'korean' && onRetranslate && !data.offline && (
@@ -278,6 +298,22 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
                 )}
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* In-chapter tip — lives in the page chrome, NOT inside the prose, so it is
+          never part of the text that "Copy text" copies. */}
+      {hintsOn && showTip && data && !editing && (
+        <div className="mx-auto mt-3 max-w-6xl px-5 sm:px-8">
+          <div className="flex items-center gap-2 rounded-card border border-line px-3 py-1.5 text-xs text-muted" style={{ background: 'var(--surface)' }}>
+            <span aria-hidden>💡</span>
+            <span className="flex-1">
+              {hasTranslation
+                ? 'Tip: “Check chapter” scans this chapter for problems. Use ← → to flip chapters. Open the Guide (❓) for a walkthrough.'
+                : 'Tip: this is the original — translate it from the chapter list to read it in English. Open the Guide (❓) for help.'}
+            </span>
+            <button onClick={() => setShowTip(false)} className="btn btn-quiet text-xs" aria-label="Dismiss tip">Dismiss</button>
           </div>
         </div>
       )}
@@ -353,25 +389,41 @@ export default function ChapterReader({ pid, index, chapters, onClose, onNavigat
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" style={{ background: 'var(--scrim)' }} onClick={() => setScan(null)}>
           <div className="w-full max-w-lg overflow-hidden rounded-card border border-line" style={{ background: 'var(--elevated)', color: 'var(--ink)' }} onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between border-b border-line px-5 py-3">
-              <h3 className="font-medium">Chapter {index} — {scan.problems.length} issue{scan.problems.length === 1 ? '' : 's'} found</h3>
+              <h3 className="font-medium">
+                Chapter {index} — {scan.problems.length ? `${scan.problems.length} issue${scan.problems.length === 1 ? '' : 's'}` : 'no issues found'}
+                {scan.deep && <span className="ml-2 text-xs text-hint">(deep AI check)</span>}
+              </h3>
               <button onClick={() => setScan(null)} className="btn btn-quiet text-lg leading-none">✕</button>
             </div>
             <div className="max-h-[55vh] overflow-y-auto px-5 py-4">
-              <ul className="space-y-2">
-                {scan.problems.map((p, i) => (
-                  <li key={i} className="flex items-start gap-2 rounded-card border border-line p-3 text-sm">
-                    <span className={`pill ${p.severity === 'high' ? 'pill-review' : p.severity === 'medium' ? 'pill-queued' : 'pill-muted'}`}>{p.severity}</span>
-                    <span className="flex-1">{p.message}{p.auto_fixable && <span className="ml-1 text-xs text-hint">· auto-fixable</span>}</span>
-                  </li>
-                ))}
-              </ul>
-              <p className="mt-3 text-xs text-hint">
-                {scan.auto_fixable
-                  ? 'Auto-fix removes leaked AI notes and untranslated-source echoes in place (the original is backed up). Anything it can’t fix needs a re-translate.'
-                  : 'These need a re-translate to fix.'}
-              </p>
+              {scan.problems.length === 0 ? (
+                <div className="sunken px-3 py-3 text-sm text-muted">
+                  {scan.deep
+                    ? 'The deep AI check found no stray text — this chapter looks clean.'
+                    : 'No obvious issues. For full confidence, run the deep AI check below — it reads the whole chapter for anything the quick check might miss.'}
+                </div>
+              ) : (
+                <ul className="space-y-2">
+                  {scan.problems.map((p, i) => (
+                    <li key={i} className="flex items-start gap-2 rounded-card border border-line p-3 text-sm">
+                      <span className={`pill ${p.severity === 'high' ? 'pill-review' : p.severity === 'medium' ? 'pill-queued' : 'pill-muted'}`}>{p.severity}</span>
+                      <span className="flex-1">{p.message}{p.auto_fixable && <span className="ml-1 text-xs text-hint">· auto-fixable</span>}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {scan.problems.length > 0 && (
+                <p className="mt-3 text-xs text-hint">
+                  {scan.auto_fixable
+                    ? 'Auto-fix removes the flagged stray text in place (the original is backed up). Anything it can’t fix needs a re-translate.'
+                    : 'These need a re-translate to fix.'}
+                </p>
+              )}
             </div>
             <div className="flex flex-wrap justify-end gap-2 border-t border-line px-5 py-3">
+              {!scan.deep && (
+                <button onClick={runDeepScan} disabled={deepScanning} className="btn btn-ghost mr-auto px-4 py-2 text-sm">{deepScanning ? 'Deep checking…' : 'Deep check with AI'}</button>
+              )}
               {scan.auto_fixable && (
                 <button onClick={autoFix} disabled={fixing} className="btn btn-primary px-4 py-2 text-sm">{fixing ? 'Fixing…' : 'Fix automatically'}</button>
               )}

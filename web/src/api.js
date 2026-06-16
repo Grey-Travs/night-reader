@@ -46,7 +46,8 @@ export const api = {
   chapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}`),
   saveChapter: (pid, i, translation) => put(`/api/projects/${pid}/chapters/${i}`, { translation }),
   scanChapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}/scan`),
-  fixChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/fix`),
+  deepScanChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/scan/deep`),
+  fixChapter: (pid, i, body) => post(`/api/projects/${pid}/chapters/${i}/fix`, body || {}),
   searchChapters: (pid, q) => get(`/api/projects/${pid}/search?q=${encodeURIComponent(q)}`),
   exportUrl: (pid, format) => `/api/projects/${pid}/export?format=${format}`,
 
@@ -61,6 +62,7 @@ export const api = {
 
   translate: (pid, body) => post(`/api/projects/${pid}/translate`, body),
   cancelQueue: (pid) => post(`/api/projects/${pid}/translate/cancel`),
+  queueOverview: () => get('/api/queue'),
   activeJob: (pid) => get(`/api/projects/${pid}/active-job`),
   streamUrl: (pid, jobId) => `/api/projects/${pid}/translate/${jobId}/stream`,
 }

@@ -19,6 +19,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -35,7 +36,7 @@ from claude_agent_sdk import (
 from .config import AnthropicConfig, TranslationConfig
 from .docs_extract import Chapter
 from .glossary import GlossaryEntry, format_injection, format_names
-from .prompts import NAME_EXTRACTION_PROMPT, NEW_TERMS_DELIMITER, build_system_prompt
+from .prompts import META_SCAN_PROMPT, NAME_EXTRACTION_PROMPT, NEW_TERMS_DELIMITER, build_system_prompt
 from .sanitize import strip_reasoning
 
 _VALID_EFFORT = {"low", "medium", "high", "xhigh", "max"}
@@ -197,7 +198,7 @@ class Translator:
         # chapters) injected into every chapter so new translations match them.
         self.canonical_names = canonical_names or []
 
-    def _options(self, system_text: str) -> ClaudeAgentOptions:
+    def _options(self, system_text: str, max_turns: int = 1) -> ClaudeAgentOptions:
         web = self.cfg.web_access
         return ClaudeAgentOptions(
             system_prompt=system_text,           # fully replaces the default agent prompt
@@ -206,18 +207,18 @@ class Translator:
                               else _BLOCKED_TOOLS),
             permission_mode="bypassPermissions",  # headless: never prompt for approval
             setting_sources=[],                    # ignore project .claude/ skills + config
-            max_turns=1,                           # single text-in/text-out turn
+            max_turns=max_turns,                   # 1 for translation; more for aux checks
             model=_agent_model(self.cfg.model),
             effort=(self.cfg.effort if self.cfg.effort in _VALID_EFFORT else "high"),
             thinking={"type": "adaptive"} if self.cfg.thinking else {"type": "disabled"},
         )
 
-    async def _aquery(self, system_text: str, user_text: str) -> tuple[str, dict, float]:
+    async def _aquery(self, system_text: str, user_text: str, max_turns: int = 1) -> tuple[str, dict, float]:
         texts: list[str] = []
         usage: dict = {}
         cost = 0.0
         rate_limited = None
-        async for msg in query(prompt=user_text, options=self._options(system_text)):
+        async for msg in query(prompt=user_text, options=self._options(system_text, max_turns)):
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, TextBlock):
@@ -230,20 +231,24 @@ class Translator:
                 cost = msg.total_cost_usd or 0.0
                 usage = _extract_usage(msg)
                 if msg.is_error:
-                    raise TranslatorError(
-                        f"agent error: {msg.api_error_status or msg.errors or msg.subtype}"
-                    )
+                    detail = msg.api_error_status or msg.errors or msg.subtype
+                    # A 429 is a rate limit — treat it like the rejected RateLimitEvent
+                    # so it pauses/resumes gracefully instead of surfacing a raw error.
+                    if str(getattr(msg, "api_error_status", "")) == "429" or "429" in str(detail) \
+                            or "rate limit" in str(detail).lower():
+                        raise RateLimitedError(SimpleNamespace(rate_limit_type="rate_limit", resets_at=None))
+                    raise TranslatorError(f"agent error: {detail}")
         if rate_limited is not None:
             raise RateLimitedError(rate_limited)
         return "".join(texts).strip(), usage, cost
 
-    def _call(self, system_text: str, user_text: str) -> tuple[str, dict, float]:
-        """One translation turn -> (text, usage dict, plan-equivalent cost)."""
+    def _call(self, system_text: str, user_text: str, max_turns: int = 1) -> tuple[str, dict, float]:
+        """One agent call -> (text, usage dict, plan-equivalent cost)."""
         last: Exception | None = None
         attempts = max(1, self.cfg.api_retry_count)
         for attempt in range(attempts):
             try:
-                return asyncio.run(self._aquery(system_text, user_text))
+                return asyncio.run(self._aquery(system_text, user_text, max_turns))
             except (RateLimitedError, TranslatorError, CLINotFoundError):
                 raise  # don't retry hard limits / config errors
             except (CLIConnectionError, ProcessError) as exc:
@@ -308,6 +313,24 @@ class Translator:
             "\n\n".join(prose_parts), all_terms, usage, cost, len(chunks), warnings
         )
 
+    def find_meta_leaks(self, text: str) -> list[str]:
+        """Deep check: have Claude read the chapter and return verbatim snippets that
+        are NOT story (preambles, notes, reasoning, untranslated source). Best-effort;
+        never raises on bad output. Catches phrasings the regex can't anticipate."""
+        if not text.strip():
+            return []
+        # Allow several turns: reviewing a long chapter with adaptive thinking can
+        # take more than one turn, and capping at 1 makes the SDK abort.
+        out, _u, _c = self._call(META_SCAN_PROMPT, "Chapter to review:\n\n" + text, max_turns=8)
+        start, end = out.find("["), out.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            return []
+        try:
+            data = json.loads(out[start: end + 1])
+        except json.JSONDecodeError:
+            return []
+        return [str(x).strip() for x in data if isinstance(x, str) and str(x).strip()]
+
     def extract_glossary(self, english_text: str) -> list[dict]:
         """Have Claude pull the cast/places/terms out of already-English chapters,
         so their established spellings can seed the glossary. Returns a list of
@@ -315,7 +338,7 @@ class Translator:
         if not english_text.strip():
             return []
         user_text = "Extract the glossary from this novel text:\n\n" + english_text
-        text, _u, _c = self._call(NAME_EXTRACTION_PROMPT, user_text)
+        text, _u, _c = self._call(NAME_EXTRACTION_PROMPT, user_text, max_turns=8)
         start, end = text.find("["), text.rfind("]")
         if start == -1 or end == -1 or end < start:
             return []

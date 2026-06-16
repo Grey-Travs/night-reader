@@ -5,6 +5,7 @@ import ChapterReader from './ChapterReader'
 import GlossaryPanel from './GlossaryPanel'
 import ProjectSettingsModal from './ProjectSettingsModal'
 import ThemeToggle from './ThemeToggle'
+import Hint from './Hint'
 import { clearPausedJob, getLastRead, getPausedJob, getReadChapters, setPausedJob } from '../prefs'
 
 // Korean chapters that can be (re)translated — validated ones included, so they can
@@ -21,7 +22,7 @@ function notify(title, body) {
   try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body }) } catch { /* ignore */ }
 }
 
-export default function ProjectView({ pid, status, initialChapter = null, onBack, onSettings }) {
+export default function ProjectView({ pid, status, initialChapter = null, onBack, onSettings, onGuide }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -312,6 +313,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
                 )}
               </div>
             )}
+            <button onClick={onGuide} className="btn btn-ghost px-3 py-1.5" title="How to use this app">❓ Guide</button>
             <button onClick={onSettings} className="btn btn-ghost px-3 py-1.5">Settings</button>
             <ThemeToggle />
             <button onClick={() => load(true)} className="btn btn-primary px-3 py-1.5">Refresh</button>
@@ -337,7 +339,9 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
         {!offline && (
         <section className="card mb-6 flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <div className="font-medium">Translate</div>
+            <div className="flex items-center gap-1.5"><span className="font-medium">Translate</span>
+              <Hint text="Turns the Korean chapters into English using your Claude plan. Translate all of them, or tick a few below and use “Translate selected”." />
+            </div>
             <div className="text-sm text-muted">
               {remaining > 0 ? `${remaining} Korean chapter${remaining === 1 ? '' : 's'} still to translate` : 'All Korean chapters translated'}
               {' · tick chapters to (re)translate just those — they queue up'}
@@ -528,6 +532,7 @@ export default function ProjectView({ pid, status, initialChapter = null, onBack
           onNavigate={setReader}
           onChanged={load}
           onRetranslate={(i) => enqueue([i], true)}
+          onGuide={onGuide}
         />
       )}
       {showGlossary && (

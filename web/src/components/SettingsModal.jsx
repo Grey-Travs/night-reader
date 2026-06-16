@@ -56,6 +56,19 @@ export default function SettingsModal({ onClose }) {
               <span className="mt-1 block text-xs text-hint">Higher effort = more careful translation, more plan usage. “high” is a good default.</span>
             </label>
 
+            <label className="block">
+              <span className="text-sm font-medium">AI deep-check after translation</span>
+              <select value={s.deep_check || 'flagged'} onChange={(e) => save({ deep_check: e.target.value })} className="input mt-1 w-full">
+                <option value="off">Off — fast checks only</option>
+                <option value="flagged">Flagged chapters only (cheaper)</option>
+                <option value="always">Every chapter (max safety)</option>
+              </select>
+              <span className="mt-1 block text-xs text-hint">
+                A second AI pass that reads each finished chapter for stray notes/leaks the fast checks can miss, and removes them automatically.
+                “Every chapter” catches the most but adds ~1 Claude call per chapter.
+              </span>
+            </label>
+
             <div className="text-xs text-hint">
               Validation thresholds and other tunables live in <code className="rounded px-1 font-mono" style={{ background: 'var(--b-muted-bg)' }}>config.toml</code>.
             </div>

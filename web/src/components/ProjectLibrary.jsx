@@ -4,7 +4,7 @@ import { Dot, ProgressBar } from './ui'
 import ThemeToggle from './ThemeToggle'
 import { getLastRead } from '../prefs'
 
-export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) {
+export default function ProjectLibrary({ status, onOpen, onSettings, onSetup, onGuide }) {
   const [projects, setProjects] = useState([])
   const [tab, setTab] = useState('gdoc') // gdoc | text
   const [url, setUrl] = useState('')
@@ -24,6 +24,7 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
   const [searching, setSearching] = useState(false)
   const [sortBy, setSortBy] = useState('default')
   const [nameFilter, setNameFilter] = useState('')
+  const [queue, setQueue] = useState([])
 
   async function load() {
     setLoading(true)
@@ -36,6 +37,17 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
     }
   }
   useEffect(() => { load() }, [])
+
+  // Live queue dashboard: poll every project's translation queue while on the library.
+  useEffect(() => {
+    let alive = true
+    const tick = async () => {
+      try { const d = await api.queueOverview(); if (alive) setQueue(d.jobs || []) } catch { /* ignore */ }
+    }
+    tick()
+    const id = setInterval(tick, 4000)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
 
   async function addNovel(e) {
     e.preventDefault()
@@ -145,6 +157,7 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
             <button onClick={() => importRef.current?.click()} disabled={importing} className="btn btn-ghost px-3 py-1.5" title="Add a novel from a .zip backup made on another device">{importing ? 'Importing…' : 'Import'}</button>
             <input ref={importRef} type="file" accept=".zip,application/zip" onChange={onImportBundle} className="hidden" />
             {projects.length > 0 && <a href={api.backupAllUrl()} className="btn btn-ghost px-3 py-1.5" title="Download every novel as one .zip backup">Back up all</a>}
+            <button onClick={onGuide} className="btn btn-primary px-3 py-1.5" title="How to use this app">❓ Guide</button>
             <button onClick={onSetup} className="btn btn-quiet text-sm">Setup</button>
             <button onClick={onSettings} className="btn btn-ghost px-3 py-1.5">Settings</button>
             <ThemeToggle />
@@ -153,6 +166,42 @@ export default function ProjectLibrary({ status, onOpen, onSettings, onSetup }) 
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-8">
+        {/* Live translation queue (across all novels) */}
+        {queue.length > 0 && (() => {
+          const totalQueued = queue.reduce((n, j) => n + (j.current != null ? 1 : 0) + j.pending.length, 0)
+          return (
+            <section className="card mb-8 p-5" style={{ background: 'var(--b-translating-bg)' }}>
+              <div className="mb-3 flex items-center gap-2">
+                <span className="inline-block h-2 w-2 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />
+                <h2 className="text-base font-medium" style={{ color: 'var(--b-translating-tx)' }}>Translation queue</h2>
+                <span className="text-xs" style={{ color: 'var(--b-translating-tx)' }}>
+                  {totalQueued} chapter{totalQueued === 1 ? '' : 's'} across {queue.length} novel{queue.length === 1 ? '' : 's'}
+                </span>
+              </div>
+              <div className="space-y-2">
+                {queue.map((j) => {
+                  const inQueue = (j.current != null ? 1 : 0) + j.pending.length
+                  const preview = j.pending.slice(0, 14).join(', ')
+                  return (
+                    <div key={j.pid} className="rounded-card border border-line p-3" style={{ background: 'var(--surface)' }}>
+                      <div className="flex items-center justify-between gap-2">
+                        <button onClick={() => onOpen(j.pid)} className="truncate text-left font-medium hover:text-accent-text hover:underline">{j.name}</button>
+                        <span className="shrink-0 text-xs text-muted">{inQueue} in queue</span>
+                      </div>
+                      <div className="mt-1 text-sm text-muted">
+                        {j.current != null ? <>Translating <strong>chapter {j.current}</strong></> : 'Queued'}
+                        {j.pending.length > 0 && (
+                          <span className="text-hint"> · waiting: {preview}{j.pending.length > 14 ? ` +${j.pending.length - 14} more` : ''}</span>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </section>
+          )
+        })()}
+
         {/* Add a novel */}
         <section className="card mb-8 p-6">
           <div className="mb-3 flex items-center gap-2">

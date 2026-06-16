@@ -55,6 +55,8 @@ class TranslationConfig(BaseModel):
         "Keep -hyung and similar relational honorifics attached to names; "
         "localize or drop the address particles -ssi, -ya, -ah, -nim into natural English."
     )
+    # Automatic AI deep-check after translation: off | flagged | always.
+    deep_check: str = "flagged"
     # The source doc mixes Korean tabs with already-translated English tabs. Skip
     # tabs that are already English (below this Hangul fraction) instead of wastefully
     # "translating" English -> English.

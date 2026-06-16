@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { Modal } from './ui'
+import Hint from './Hint'
 
 const TYPES = ['name', 'place', 'skill', 'term', 'other']
 const BLANK = { korean: '', english: '', type: 'name', note: '', pronoun: '', register: '' }
@@ -258,6 +259,7 @@ export default function GlossaryPanel({ pid, onClose, onChanged, onRetranslate }
             <div className="text-sm">
               <strong>Names from your English chapters.</strong> Pull the cast, places, and terms out of
               the chapters already in English so new translations use the same spellings.
+              <Hint text="Claude reads your already-English chapters and lists their names. New translations will then spell those names the same way. Uses your plan." className="ml-1" />
             </div>
             <button onClick={learnNames} disabled={learning || busy} className="btn btn-primary shrink-0 px-3 py-1.5 text-xs">
               {learning ? 'Reading chapters…' : 'Learn names'}

@@ -42,6 +42,12 @@ export function setReadingPrefs(prefs) {
   write('nr.reading', { ...DEFAULT_PREFS, ...prefs })
 }
 
+// --- guide / hints ---
+export function getHintsOn() { return read('nr.hints', true) !== false }
+export function setHintsOn(on) { write('nr.hints', !!on) }
+export function getGuideSeen() { return read('nr.guideSeen', false) === true }
+export function setGuideSeen() { write('nr.guideSeen', true) }
+
 // --- a rate-limit-paused job, so the resume banner + auto-resume survive a reload ---
 export function getPausedJob(pid) {
   const m = read('nr.paused', {})

@@ -37,12 +37,18 @@ _ALWAYS = re.compile(
 # leaking into prose (e.g. "고원 -> Go Won").
 _ARROW = re.compile(r"[가-힣]\s*-+>\s*[A-Za-z]")
 
-# SELF-CORRECTION — the model narrating its own translation process. Only counts when
-# the block has NO dialogue quotes, so "'Let me redo my makeup,' she said" is left alone.
+# SELF-CORRECTION / FRAMING — the model narrating its own task or addressing the
+# reader ("Here is the translation", "Let me redo", "Sure, here you go"). Only counts
+# when the block has NO dialogue quotes, so "'Let me redo my makeup,' she said" is safe.
 _SELF = re.compile(
     r"(?i)\blet'?s?\s+re-?do\b"
     r"|\blet\s+me\s+(re-?do|re-?read|re-?translate|reset|rewrite|start\s+over|"
     r"translate|produce|fix|correct|reconsider|use\b)"
+    r"|\bhere\s+(is|'?s)\s+(the\s+|your\s+|my\s+)?(translat|chapter\b)"
+    r"|\bbelow\s+is\s+the\s+translat"
+    r"|\bthe\s+translation\s+(is\s+(as\s+follows|below)|follows|begins)"
+    r"|\bi\s+(will|'?ll|'?ve|have)\s+(now\s+)?translat"
+    r"|\btranslated\s+chapter\s*:"
 )
 
 _QUOTE = re.compile(r'["“”「」『』]')
@@ -68,6 +74,21 @@ def korean_fraction(text: str) -> float:
     """Overall fraction of non-space characters that are Korean — used to flag a
     translation that left substantial untranslated source in it."""
     return _hangul_fraction(text)
+
+
+def remove_snippets(text: str, snippets: list[str]) -> tuple[str, int]:
+    """Remove exact verbatim substrings (e.g. from the AI deep-check) and tidy up the
+    blank lines left behind. Only removes snippets that appear verbatim, so the user
+    can trust that what they confirmed is exactly what goes."""
+    removed = 0
+    for snip in snippets:
+        snip = (snip or "").strip()
+        if snip and snip in text:
+            text = text.replace(snip, "")
+            removed += 1
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip(), removed
 
 
 def find_leaks(text: str) -> list[str]:
