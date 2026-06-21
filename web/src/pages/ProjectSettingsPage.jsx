@@ -1,9 +1,7 @@
 import { useEffect, useState } from 'react'
+import { useNavigate, useOutletContext } from 'react-router-dom'
 import { api } from '../api'
-import { Modal } from './ui'
 
-// Module-level so its component identity is stable across renders — defining it
-// inside the parent would remount the inputs on every keystroke (focus loss).
 function Field({ label, hint, children }) {
   return (
     <label className="block">
@@ -14,9 +12,13 @@ function Field({ label, hint, children }) {
   )
 }
 
-// Per-novel translation settings: name + the style knobs that steer the engine
-// (genre/tone framing, free-form instructions, honorific handling).
-export default function ProjectSettingsModal({ pid, project, onClose, onSaved }) {
+// Per-novel translation settings as a page: name + the style knobs that steer the
+// engine (genre/tone framing, free-form instructions, honorific handling).
+export default function ProjectSettingsPage() {
+  const { pid, data, setProjectMeta } = useOutletContext()
+  const navigate = useNavigate()
+  const project = data?.project
+
   const [form, setForm] = useState({
     name: project?.name || '',
     style_note: project?.style_note || '',
@@ -38,12 +40,11 @@ export default function ProjectSettingsModal({ pid, project, onClose, onSaved })
   function set(field, value) { setForm((f) => ({ ...f, [field]: value })) }
 
   async function save() {
-    setBusy(true)
-    setError(null)
+    setBusy(true); setError(null)
     try {
       const updated = await api.updateProject(pid, form)
-      onSaved?.(updated)
-      onClose()
+      setProjectMeta?.(updated)
+      navigate(`/novel/${pid}`)
     } catch (e) {
       setError(String(e.message || e))
     } finally {
@@ -52,12 +53,9 @@ export default function ProjectSettingsModal({ pid, project, onClose, onSaved })
   }
 
   return (
-    <Modal onClose={onClose}>
-      <div className="flex items-center justify-between border-b border-line px-6 py-4">
-        <h3 className="font-medium">Novel settings</h3>
-        <button onClick={onClose} className="btn btn-quiet text-lg leading-none">✕</button>
-      </div>
-      <div className="space-y-5 px-6 py-5">
+    <div className="page page-narrow">
+      <h1 className="mb-6 font-reading text-2xl font-medium">Novel settings</h1>
+      <section className="card space-y-5 p-6">
         {error && <div className="rounded-btn px-3 py-2 text-sm pill-review">{error}</div>}
 
         <Field label="Name">
@@ -77,11 +75,11 @@ export default function ProjectSettingsModal({ pid, project, onClose, onSaved })
         </Field>
 
         <div className="flex justify-end gap-2 border-t border-line pt-4">
-          <button onClick={onClose} disabled={busy} className="btn btn-ghost px-4 py-2 text-sm">Cancel</button>
+          <button onClick={() => navigate(`/novel/${pid}`)} disabled={busy} className="btn btn-ghost px-4 py-2 text-sm">Cancel</button>
           <button onClick={save} disabled={busy} className="btn btn-primary px-4 py-2 text-sm">{busy ? 'Saving…' : 'Save'}</button>
         </div>
         <p className="text-xs text-hint">Changes apply to chapters translated from now on. Use “Re-translate” to apply them to existing chapters.</p>
-      </div>
-    </Modal>
+      </section>
+    </div>
   )
 }

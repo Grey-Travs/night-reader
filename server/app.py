@@ -17,7 +17,7 @@ import json
 import re
 import uuid
 import zipfile
-from collections import deque
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,7 +25,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -37,8 +36,14 @@ from translation_bot.docs_extract import (
 from translation_bot.epub import build_epub
 from translation_bot.glossary import VALID_TYPES, Glossary, GlossaryEntry, load_pending, save_pending
 from translation_bot.google_auth import build_docs_service, get_credentials, load_saved_credentials
-from translation_bot.pipeline import chapter_filename, process_chapter, write_chapter_file
-from translation_bot.sanitize import find_leaks, korean_fraction, remove_snippets, strip_reasoning
+from translation_bot.pipeline import (
+    chapter_filename,
+    previous_chapter_path,
+    process_chapter,
+    repair_chapter,
+    write_chapter_file,
+)
+from translation_bot.sanitize import find_leaks, korean_fraction, remove_snippets, strip_reasoning, strip_source_header
 from translation_bot.state import State
 from translation_bot.text_source import split_text_into_chapters
 from translation_bot.translator import RateLimitedError, Translator, TranslatorError
@@ -250,6 +255,7 @@ def chapter_row(ch: Chapter, cfg: Config, state: State, total: int) -> dict:
     return {
         "index": ch.index,
         "title": ch.title,
+        "number": strip_source_header(ch.text)[1],  # real chapter number from the source header
         "language": lang,
         "paragraphs": m.paragraph_count,
         "dialogue": m.dialogue_count,
@@ -394,6 +400,94 @@ def list_projects() -> dict:
     return {"projects": [_safe_summary(p) for p in pj.list_projects()]}
 
 
+# --- turning the cryptic validation failures into human guidance + an action ------
+def diagnose(failures: list[str], metrics: dict | None = None) -> list[dict]:
+    """Map each raw validation failure to a plain-language explanation + a suggested
+    action (autofix | ai_resolve | retranslate | accept) the UI can act on."""
+    out: list[dict] = []
+    for f in failures or []:
+        fl = f.lower()
+        if "leaked" in fl:
+            out.append({"message": "The AI left some of its own notes/reasoning in the text.",
+                        "kind": "leak", "action": "autofix"})
+        elif "untranslated korean" in fl:
+            out.append({"message": "Some Korean was left untranslated.",
+                        "kind": "korean", "action": "autofix"})
+        elif "length ratio" in fl and "below" in fl:
+            out.append({"message": "The translation looks shorter than the original — a passage may have been skipped or summarized.",
+                        "kind": "omission", "action": "ai_resolve"})
+        elif "length ratio" in fl and "above" in fl:
+            out.append({"message": "The translation looks longer than the original — content may have been added or over-expanded.",
+                        "kind": "embellishment", "action": "ai_resolve"})
+        elif "paragraph count" in fl:
+            out.append({"message": "The paragraph structure drifted from the source (paragraphs merged, split, or dropped).",
+                        "kind": "structure", "action": "ai_resolve"})
+        elif "dialogue" in fl:
+            out.append({"message": "The number of dialogue lines differs from the source — usually minor.",
+                        "kind": "dialogue", "action": "accept"})
+        else:
+            out.append({"message": f, "kind": "other", "action": "ai_resolve"})
+    return out
+
+
+def _corrective_instruction(failures: list[str]) -> str:
+    """Build a failure-targeted correction to feed the AI re-translation."""
+    joined = " ".join(failures or []).lower()
+    parts: list[str] = []
+    if "length ratio" in joined and "below" in joined:
+        parts.append("The previous attempt was too SHORT — it likely omitted or summarized content. "
+                     "Translate the chapter COMPLETELY: render every sentence and detail, omit nothing, condense nothing.")
+    if "length ratio" in joined and "above" in joined:
+        parts.append("The previous attempt was too LONG — it likely added or over-expanded content. "
+                     "Translate faithfully and tightly: do not add, embellish, or pad anything not in the source.")
+    if "paragraph count" in joined:
+        parts.append("Match the source's paragraph structure exactly — keep the same paragraph breaks; do not merge or split paragraphs.")
+    if "untranslated korean" in joined:
+        parts.append("Translate ALL Korean into English — leave no Korean in the output except intentional sound effects.")
+    if "leaked" in joined:
+        parts.append("Output ONLY the finished translation — no notes, reasoning, or meta-commentary of any kind.")
+    if not parts:
+        parts.append("The previous attempt failed an automated fidelity check. Translate completely and faithfully — "
+                     "omit nothing, add nothing, and match the source structure.")
+    return "CORRECTION REQUIRED. " + " ".join(parts)
+
+
+@app.get("/api/review")
+def review_inbox() -> dict:
+    """Every chapter flagged needs-review or failed, across all novels — assembled
+    purely from saved state (no network, no source needed)."""
+    flagged = {"needs-review", "failed"}
+    items = []
+    for project in pj.list_projects():
+        try:
+            cfg = pj.project_config(load_global_config(), project)
+            state = State.load(cfg.paths.state_file)
+        except Exception:  # noqa: BLE001 — one broken project never breaks the inbox
+            continue
+        chapters = state.chapters if isinstance(state.chapters, dict) else {}
+        for idx_str, rec in chapters.items():
+            if not isinstance(rec, dict) or rec.get("status") not in flagged:
+                continue
+            try:
+                index = int(idx_str)
+            except (TypeError, ValueError):
+                continue
+            val = rec.get("validation") or {}
+            failures = rec.get("failures", [])
+            items.append({
+                "project_id": project["id"],
+                "project_name": project.get("name", "Untitled novel"),
+                "index": index,
+                "title": rec.get("title") or f"Chapter {index}",
+                "status": rec.get("status"),
+                "failures": failures,
+                "diagnosis": diagnose(failures, val),
+                "length_ratio": val.get("length_ratio"),
+            })
+    items.sort(key=lambda r: (r["project_name"].lower(), r["index"]))
+    return {"items": items}
+
+
 # ----------------------------------------------------------------------------- backup / move
 @app.get("/api/backup")
 def export_all_bundle() -> Response:
@@ -518,6 +612,7 @@ class ProjectUpdate(BaseModel):
     style_note: str | None = None
     instructions: str | None = None
     honorific_note: str | None = None
+    archived: bool | None = None
 
 
 @app.post("/api/projects/{pid}")
@@ -640,18 +735,35 @@ def chapter_detail(pid: str, index: int) -> dict:
     out_path = cfg.paths.output_dir / chapter_filename(index, total)
     translation = out_path.read_text(encoding="utf-8") if out_path.exists() else None
     rec = State.load(cfg.paths.state_file).get(index) or {}
+    clean_source, number = strip_source_header(ch.text)  # drop export header, pull chapter no.
     return {
         "index": index,
         "title": ch.title,
+        "number": number,
         "language": classify(ch, cfg),
-        "source": ch.text,
+        "source": clean_source,
         "translation": translation,
         "status": rec.get("status", "pending"),
         "validation": rec.get("validation"),
         "failures": rec.get("failures", []),
+        "diagnosis": diagnose(rec.get("failures", []), rec.get("validation")),
         "manual_edit": rec.get("manual_edit", False),
+        "has_previous": previous_chapter_path(cfg.paths.output_dir, index, total).exists(),
         "offline": pid in _offline_projects,
     }
+
+
+@app.get("/api/projects/{pid}/chapters/{index}/previous")
+def chapter_previous(pid: str, index: int) -> dict:
+    """The retained prior translation (kept when a re-translate/edit overwrites it),
+    so the reader can show old-vs-new and offer a one-click revert."""
+    project, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    total = _output_total(pid, chapters)
+    prev = previous_chapter_path(cfg.paths.output_dir, index, total)
+    if not prev.exists():
+        raise HTTPException(404, "no previous version")
+    return {"index": index, "translation": prev.read_text(encoding="utf-8")}
 
 
 class ChapterEdit(BaseModel):
@@ -799,6 +911,170 @@ def fix_chapter(pid: str, index: int, body: FixRequest = FixRequest()) -> dict:
                      failures=val.failures, manual_edit=True)
         state.save(cfg.paths.state_file)
     return {"fixed": fixed, "removed": len(removed) + snip_removed, **_chapter_problems(pid, cfg, index)}
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/resolve")
+async def resolve_chapter(pid: str, index: int) -> dict:
+    """AI resolve: re-translate a flagged chapter with a correction targeting its exact
+    failures, always writing the result (the prior version is kept in previous/ so the
+    reader can compare and revert). Uses your plan."""
+    _, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    total = _output_total(pid, chapters)
+    ch = next((c for c in chapters if c.index == index), None)
+    if ch is None:
+        raise HTTPException(404, f"chapter {index} not found")
+    if classify(ch, cfg) != "korean":
+        raise HTTPException(400, "Only Korean chapters can be re-translated.")
+    state = State.load(cfg.paths.state_file)
+    instruction = _corrective_instruction((state.get(index) or {}).get("failures", []))
+    glossary = Glossary.load(cfg.paths.glossary_json)
+    translator = Translator(cfg.anthropic, cfg.translation, canonical_names=glossary.canonical())
+    try:
+        await run_in_threadpool(
+            lambda: repair_chapter(ch, total, translator, glossary, cfg, state, instruction=instruction)
+        )
+    except RateLimitedError as exc:
+        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
+    except TranslatorError as exc:
+        raise HTTPException(502, f"AI resolve failed: {exc}")
+    state.save(cfg.paths.state_file)
+    new = state.get(index) or {}
+    return {
+        "index": index,
+        "status": new.get("status", "pending"),
+        "failures": new.get("failures", []),
+        "diagnosis": diagnose(new.get("failures", []), new.get("validation")),
+        "has_previous": previous_chapter_path(cfg.paths.output_dir, index, total).exists(),
+    }
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/accept")
+def accept_chapter(pid: str, index: int) -> dict:
+    """Mark a flagged chapter as fine (user override) — clears the failures and sets it
+    validated WITHOUT changing the translation. For false positives."""
+    _, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    ch = next((c for c in chapters if c.index == index), None)
+    if ch is None:
+        raise HTTPException(404, f"chapter {index} not found")
+    state = State.load(cfg.paths.state_file)
+    state.update(index, status=state_mod.STATUS_VALIDATED, title=ch.title,
+                 source_hash=ch.metrics.content_hash, failures=[], manual_edit=True)
+    state.save(cfg.paths.state_file)
+    return {"ok": True, "status": state_mod.STATUS_VALIDATED}
+
+
+# --------------------------------------------------------------------- name consistency
+# Proper-noun candidates: a capitalized word, or run of them ("Go Won"), not all-caps.
+_PROPER_RE = re.compile(r"\b[A-Z][a-z]+(?:[ \-][A-Z][a-z]+)*\b")
+# Common capitalized words (sentence starts, pronouns, etc.) that aren't names.
+_NAME_STOP = {
+    "The", "A", "An", "I", "He", "She", "It", "They", "We", "You", "His", "Her", "Its",
+    "Their", "Our", "Your", "My", "Me", "Him", "Them", "Us", "This", "That", "These",
+    "Those", "But", "And", "Or", "So", "Yet", "For", "Nor", "If", "Then", "When", "While",
+    "As", "At", "By", "In", "On", "Of", "To", "Up", "Out", "No", "Yes", "Not", "Now",
+    "What", "Why", "How", "Who", "Whom", "Whose", "Where", "Which", "Oh", "Ah", "Eh",
+    "Hey", "Well", "Okay", "Ok", "Maybe", "Even", "Just", "Still", "After", "Before",
+    "Because", "Since", "Though", "Although", "However", "Anyway", "Sir", "Madam",
+    "Mr", "Mrs", "Ms", "Miss", "Lord", "Lady", "God", "Chapter",
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    "January", "February", "March", "April", "May", "June", "July", "August",
+    "September", "October", "November", "December",
+}
+
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+@app.get("/api/projects/{pid}/consistency")
+def consistency_scan(pid: str) -> dict:
+    """Scan a novel's translations for proper nouns spelled inconsistently across
+    chapters, and frequent ones missing from the glossary. Lexical — no AI."""
+    _, cfg = project_cfg(pid)
+    chapters = _translated_chapters(pid, cfg)  # (index, title, markdown)
+    g = Glossary.load(cfg.paths.glossary_json)
+    gloss_norm: dict[str, str] = {}
+    for e in g.entries():
+        if e.english:
+            gloss_norm.setdefault(_norm_name(e.english), e.english)
+
+    spell_count: Counter = Counter()
+    spell_chapters: dict[str, set] = defaultdict(set)
+    for idx, _title, md in chapters:
+        for spell, c in Counter(_PROPER_RE.findall(md)).items():
+            if spell in _NAME_STOP or len(spell) < 2:
+                continue
+            spell_count[spell] += c
+            spell_chapters[spell].add(idx)
+
+    by_norm: dict[str, list] = defaultdict(list)
+    for spell in spell_count:
+        by_norm[_norm_name(spell)].append(spell)
+
+    def opt(s: str) -> dict:
+        return {"spelling": s, "count": spell_count[s], "chapters": sorted(spell_chapters[s])}
+
+    variants, missing = [], []
+    for normkey, spellings in by_norm.items():
+        distinct = sorted(set(spellings), key=lambda s: -spell_count[s])
+        canonical = gloss_norm.get(normkey)
+        if canonical:
+            if any(s != canonical for s in distinct):  # some chapter used a non-canonical spelling
+                variants.append({"canonical": canonical, "glossary_spelling": canonical,
+                                 "options": [opt(s) for s in distinct]})
+        elif len(distinct) > 1:  # spelled multiple ways, none in glossary
+            variants.append({"canonical": distinct[0], "glossary_spelling": None,
+                             "options": [opt(s) for s in distinct]})
+        elif spell_count[distinct[0]] >= 5:  # frequent single spelling, not in glossary
+            missing.append(opt(distinct[0]))
+
+    variants.sort(key=lambda v: -sum(o["count"] for o in v["options"]))
+    missing.sort(key=lambda m: -m["count"])
+    return {"scanned": len(chapters), "variants": variants[:200], "missing": missing[:200]}
+
+
+class ReplaceRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    froms: list[str] = Field(default_factory=list, alias="from")  # spellings to unify
+    to: str
+    chapters: list[int] = []
+
+
+@app.post("/api/projects/{pid}/consistency/replace")
+def consistency_replace(pid: str, body: ReplaceRequest) -> dict:
+    """Whole-word replace one or more spellings → a canonical one across the given
+    chapters' saved translations (instant, exact, free). ALL spellings are applied in a
+    single pass per chapter, so each changed chapter is snapshotted to previous/ exactly
+    once — keeping the edit cleanly revertible from the reader."""
+    _, cfg = project_cfg(pid)
+    to = (body.to or "").strip()
+    if not to:
+        raise HTTPException(400, "Replacement text is empty.")
+    # Longest first so "Go Won" wins over "Go"; drop blanks and self-replacements.
+    froms = sorted({f.strip() for f in body.froms if f and f.strip() and f.strip() != to},
+                   key=len, reverse=True)
+    if not froms:
+        return {"replaced": 0, "chapters": []}
+    chapters = get_chapters(pid, cfg)
+    total = _output_total(pid, chapters)
+    pattern = re.compile(r"\b(" + "|".join(re.escape(f) for f in froms) + r")\b")
+    targets = set(body.chapters) if body.chapters else None
+    replaced, changed = 0, []
+    for ch in chapters:
+        if targets is not None and ch.index not in targets:
+            continue
+        path = cfg.paths.output_dir / chapter_filename(ch.index, total)
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        new, n = pattern.subn(to, text)
+        if n and new != text:
+            write_chapter_file(cfg.paths.output_dir, ch.index, total, new)  # one snapshot per chapter
+            replaced += n
+            changed.append(ch.index)
+    return {"replaced": replaced, "chapters": changed}
 
 
 # ----------------------------------------------------------------------------- glossary
@@ -1281,6 +1557,24 @@ async def stream_job(pid: str, job_id: str) -> StreamingResponse:
 
 # ----------------------------------------------------------------------------- static (production)
 if DIST_DIR.exists():
-    # Serve the built React app when present (the launcher builds it). API routes
-    # above are registered first, so they take precedence over this catch-all.
-    app.mount("/", StaticFiles(directory=str(DIST_DIR), html=True), name="web")
+    # Serve the built React app when present (the launcher builds it). The frontend
+    # uses client-side routing (react-router / BrowserRouter), so an unknown path
+    # like /novel/abc must return index.html rather than 404 — otherwise a refresh or
+    # a deep link would break. Real built assets (JS/CSS/favicon) are served from disk;
+    # everything else falls through to index.html. The API routes above are registered
+    # first, so they always take precedence over this catch-all.
+    _INDEX_HTML = DIST_DIR / "index.html"
+    _DIST_RESOLVED = DIST_DIR.resolve()
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):  # noqa: D401 - simple static handler
+        # Never shadow the API: an unmatched /api/* path should 404, not return HTML.
+        if full_path == "api" or full_path.startswith("api/"):
+            return Response(status_code=404)
+        candidate = DIST_DIR / full_path
+        try:
+            if full_path and candidate.is_file() and candidate.resolve().is_relative_to(_DIST_RESOLVED):
+                return FileResponse(str(candidate))
+        except (OSError, ValueError):
+            pass
+        return FileResponse(str(_INDEX_HTML))

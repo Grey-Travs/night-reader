@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
+import { useOutletContext } from 'react-router-dom'
 import { api } from '../api'
-import { Modal } from './ui'
+import { Dot } from '../components/ui'
 
 const MODELS = [
   { id: 'claude-opus-4-8', label: 'Opus — best quality (recommended)' },
@@ -9,10 +10,12 @@ const MODELS = [
 ]
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
-export default function SettingsModal({ onClose }) {
+export default function SettingsPage() {
+  const { status, setStatus, onSetup } = useOutletContext()
   const [s, setS] = useState(null)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState(null)
+  const [connecting, setConnecting] = useState(false)
 
   useEffect(() => { api.settings().then(setS).catch((e) => setError(String(e.message || e))) }, [])
 
@@ -28,14 +31,25 @@ export default function SettingsModal({ onClose }) {
     }
   }
 
+  async function reconnectGoogle() {
+    setConnecting(true); setError(null)
+    try {
+      await api.googleLogin()
+      setStatus?.(await api.status())
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setConnecting(false)
+    }
+  }
+
   return (
-    <Modal onClose={onClose}>
-      <div className="flex items-center justify-between border-b border-line px-6 py-4">
-        <h3 className="font-medium">Settings</h3>
-        <button onClick={onClose} className="btn btn-quiet text-lg leading-none">✕</button>
-      </div>
-      <div className="space-y-5 px-6 py-5">
-        {error && <div className="rounded-btn px-3 py-2 text-sm pill-review">{error}</div>}
+    <div className="page page-narrow">
+      <h1 className="mb-6 font-reading text-2xl font-medium">Settings</h1>
+      {error && <div className="mb-4 rounded-btn px-3 py-2 text-sm pill-review">{error}</div>}
+
+      <section className="card mb-6 space-y-5 p-6">
+        <h2 className="text-base font-medium">Translation</h2>
         {!s ? (
           <div className="text-hint">Loading…</div>
         ) : (
@@ -75,7 +89,20 @@ export default function SettingsModal({ onClose }) {
             {saved && <div className="text-sm" style={{ color: 'var(--accent-text)' }}>Saved · applies to the next chapter.</div>}
           </>
         )}
-      </div>
-    </Modal>
+      </section>
+
+      <section className="card space-y-4 p-6">
+        <h2 className="text-base font-medium">Connections</h2>
+        <div className="flex flex-wrap items-center gap-4 text-sm">
+          <span className="flex items-center gap-1.5"><Dot ok={status?.google_logged_in} /> Google {status?.google_logged_in ? 'connected' : 'not connected'}</span>
+          <span className="flex items-center gap-1.5"><Dot ok={status?.claude_logged_in} /> Claude {status?.claude_logged_in ? 'connected' : 'not connected'}</span>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={reconnectGoogle} disabled={connecting} className="btn btn-ghost px-4 py-2 text-sm">{connecting ? 'Opening Google…' : 'Reconnect Google'}</button>
+          <button onClick={() => onSetup?.()} className="btn btn-ghost px-4 py-2 text-sm">Run full setup…</button>
+        </div>
+        <p className="text-xs text-hint">Google is needed only for reading Google Docs. Pasted-text novels work without it.</p>
+      </section>
+    </div>
   )
 }

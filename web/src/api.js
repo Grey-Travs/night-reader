@@ -41,15 +41,23 @@ export const api = {
     req('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: file }),
   searchAll: (q) => get(`/api/search?q=${encodeURIComponent(q)}`),
 
+  reviewInbox: () => get('/api/review'),
+
   chapters: (pid, refresh = false) =>
     get(`/api/projects/${pid}/chapters` + (refresh ? '?refresh=true' : '')),
   chapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}`),
+  previousChapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}/previous`),
   saveChapter: (pid, i, translation) => put(`/api/projects/${pid}/chapters/${i}`, { translation }),
   scanChapter: (pid, i) => get(`/api/projects/${pid}/chapters/${i}/scan`),
   deepScanChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/scan/deep`),
   fixChapter: (pid, i, body) => post(`/api/projects/${pid}/chapters/${i}/fix`, body || {}),
+  resolveChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/resolve`),
+  acceptChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/accept`),
   searchChapters: (pid, q) => get(`/api/projects/${pid}/search?q=${encodeURIComponent(q)}`),
   exportUrl: (pid, format) => `/api/projects/${pid}/export?format=${format}`,
+
+  consistencyScan: (pid) => get(`/api/projects/${pid}/consistency`),
+  consistencyReplace: (pid, body) => post(`/api/projects/${pid}/consistency/replace`, body),
 
   glossary: (pid) => get(`/api/projects/${pid}/glossary`),
   reviewGlossary: (pid, body) => post(`/api/projects/${pid}/glossary/review`, body),

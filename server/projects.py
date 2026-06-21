@@ -30,7 +30,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = PROJECT_ROOT / "projects"
 
 # Project fields a user may edit at runtime (everything else is server-managed).
-EDITABLE_FIELDS = {"name", "style_note", "instructions", "honorific_note"}
+# ``archived`` is a bool: an archived novel is hidden from the main library shelf but
+# otherwise behaves normally (still translates, reads, exports).
+EDITABLE_FIELDS = {"name", "style_note", "instructions", "honorific_note", "archived"}
 
 _DOC_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]{20,})")
 _BARE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{20,}$")

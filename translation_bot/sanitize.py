@@ -42,8 +42,9 @@ _ARROW = re.compile(r"[가-힣]\s*-+>\s*[A-Za-z]")
 # when the block has NO dialogue quotes, so "'Let me redo my makeup,' she said" is safe.
 _SELF = re.compile(
     r"(?i)\blet'?s?\s+re-?do\b"
-    r"|\blet\s+me\s+(re-?do|re-?read|re-?translate|reset|rewrite|start\s+over|"
-    r"translate|produce|fix|correct|reconsider|use\b)"
+    r"|\blet\s+me\s+(?:just\s+|now\s+|simply\s+|carefully\s+|go\s+ahead\s+and\s+)?"
+    r"(re-?do|re-?read|re-?translate|reset|rewrite|start\s+over|"
+    r"translate|produce|render|write|continue|fix|correct|reconsider|use\b)"
     r"|\bhere\s+(is|'?s)\s+(the\s+|your\s+|my\s+)?(translat|chapter\b)"
     r"|\bbelow\s+is\s+the\s+translat"
     r"|\bthe\s+translation\s+(is\s+(as\s+follows|below)|follows|begins)"
@@ -74,6 +75,54 @@ def korean_fraction(text: str) -> float:
     """Overall fraction of non-space characters that are Korean — used to flag a
     translation that left substantial untranslated source in it."""
     return _hangul_fraction(text)
+
+
+# --- source-export header cruft (ridibooks etc.): URL · title · "4-5 minutes" · "NNN화" ---
+_HDR_URL = re.compile(r"https?://|ridibooks\.com", re.I)
+_HDR_MIN = re.compile(r"^\s*\d+\s*(?:[-–]\s*\d+\s*)?min(?:ute)?s?\.?\s*$", re.I)
+# A header line ENDING in a chapter marker — "NNN화", "Chapter N", or "Title — Chapter N".
+_HDR_ENDNUM = re.compile(r"(?:chapter|ch\.?|episode|ep\.?)\s+(\d+)\s*$|(\d+)\s*화\s*$", re.I)
+
+
+def strip_source_header(text: str) -> tuple[str, str | None]:
+    """Remove the leading export-header block (URL, novel title, reading-time, and the
+    "NNN화"/"Chapter N" line) from a chapter, and return (clean_text, chapter_number).
+
+    Deliberately KEEPS a bare part marker like "33." — those are sequential in-story
+    section numbers, not junk. Stops at the first real line, so only the contiguous
+    header at the very top is touched."""
+    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    number: str | None = None
+    i = 0
+    while i < len(blocks):
+        b = blocks[i].strip()
+        if _HDR_URL.search(b):
+            i += 1
+            continue
+        if _HDR_MIN.match(b):
+            i += 1
+            continue
+        m = _HDR_ENDNUM.search(b)
+        if m and len(b) <= 80:        # "114화" / "Chapter 114" / "<Title> Chapter 114"
+            number = number or m.group(1) or m.group(2)
+            i += 1
+            continue
+        break
+    return "\n\n".join(blocks[i:]).strip(), number
+
+
+def remove_korean_echoes(text: str) -> tuple[str, int]:
+    """Remove paragraphs that are predominantly untranslated Korean — source the model
+    echoed and then translated right after, leaving a redundant Korean copy. Keeps short
+    bits (e.g. an in-line sound effect); only whole Korean sentences are dropped."""
+    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    kept, removed = [], 0
+    for b in blocks:
+        if len(_HANGUL.findall(b)) > 8 and _hangul_fraction(b) > 0.5:
+            removed += 1
+            continue
+        kept.append(b)
+    return "\n\n".join(kept).strip(), removed
 
 
 def remove_snippets(text: str, snippets: list[str]) -> tuple[str, int]:

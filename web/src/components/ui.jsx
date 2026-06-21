@@ -52,6 +52,33 @@ export function StatCard({ label, value, sub, accent }) {
   )
 }
 
+export function Skeleton({ className = '' }) {
+  return <div className={`animate-pulse rounded ${className}`} style={{ background: 'var(--b-muted-bg)' }} />
+}
+
+export function SkeletonRows({ rows = 6, className = 'h-9' }) {
+  return (
+    <div className="space-y-2 p-4">
+      {Array.from({ length: rows }).map((_, i) => <Skeleton key={i} className={`w-full ${className}`} />)}
+    </div>
+  )
+}
+
+export function SkeletonCards({ count = 4 }) {
+  return (
+    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      {Array.from({ length: count }).map((_, i) => (
+        <div key={i} className="card space-y-3 p-5">
+          <Skeleton className="h-5 w-2/3" />
+          <Skeleton className="h-3 w-1/2" />
+          <Skeleton className="h-2 w-full" />
+          <Skeleton className="h-9 w-full" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function ProgressBar({ value, total }) {
   const pct = total ? Math.round((value / total) * 100) : 0
   return (

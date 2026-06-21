@@ -37,7 +37,7 @@ from .config import AnthropicConfig, TranslationConfig
 from .docs_extract import Chapter
 from .glossary import GlossaryEntry, format_injection, format_names
 from .prompts import META_SCAN_PROMPT, NAME_EXTRACTION_PROMPT, NEW_TERMS_DELIMITER, build_system_prompt
-from .sanitize import strip_reasoning
+from .sanitize import remove_korean_echoes, strip_reasoning
 
 _VALID_EFFORT = {"low", "medium", "high", "xhigh", "max"}
 
@@ -128,15 +128,17 @@ def parse_response(text: str) -> tuple[str, list[dict], list[str]]:
     warnings: list[str] = []
     if NEW_TERMS_DELIMITER not in text:
         prose, removed = strip_reasoning(text)
-        if removed:
-            warnings.append(f"stripped {len(removed)} leaked reasoning block(s) from output")
+        prose, echoes = remove_korean_echoes(prose)
+        if removed or echoes:
+            warnings.append(f"stripped {len(removed)} reasoning + {echoes} Korean-echo block(s)")
         warnings.append("response had no ===NEW_TERMS=== block; treating all output as prose")
         return prose, [], warnings
 
     prose, _, tail = text.partition(NEW_TERMS_DELIMITER)
     prose, removed = strip_reasoning(prose)
-    if removed:
-        warnings.append(f"stripped {len(removed)} leaked reasoning block(s) from output")
+    prose, echoes = remove_korean_echoes(prose)
+    if removed or echoes:
+        warnings.append(f"stripped {len(removed)} reasoning + {echoes} Korean-echo block(s) from output")
 
     start = tail.find("[")
     end = tail.rfind("]")

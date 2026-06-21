@@ -9,6 +9,7 @@ were good — it is flagged ``needs-review`` and kept in the audit log instead.
 from __future__ import annotations
 
 import re
+import shutil
 import traceback
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from .config import Config
 from .docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
 from .glossary import Glossary, queue_new_terms
 from .google_auth import build_docs_service, get_credentials
-from .sanitize import remove_snippets, strip_reasoning
+from .sanitize import remove_snippets, strip_reasoning, strip_source_header
 from . import state as state_mod
 from .state import State
 from .translator import RateLimitedError, Translator, TranslationResult
@@ -34,9 +35,24 @@ def chapter_filename(index: int, total: int) -> str:
 def write_chapter_file(output_dir: Path, index: int, total: int, prose: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / chapter_filename(index, total)
+    # Before overwriting an existing translation, snapshot it to a sibling ``previous/``
+    # folder so the reader can show old-vs-new and offer a one-click revert. Kept OUTSIDE
+    # ``chapters/`` so it never matches the ``chapter-*.md`` globs used by scans/exports.
+    if path.exists():
+        prev_dir = output_dir.parent / "previous"
+        prev_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(path, prev_dir / chapter_filename(index, total))
+        except OSError:
+            pass  # a missing backup must never block writing the real translation
     # Preserve curly quotes — no smart-quote normalization anywhere.
     path.write_text(prose.rstrip() + "\n", encoding="utf-8")
     return path
+
+
+def previous_chapter_path(output_dir: Path, index: int, total: int) -> Path:
+    """Path of the retained prior translation (sibling ``previous/`` folder)."""
+    return output_dir.parent / "previous" / chapter_filename(index, total)
 
 
 def write_audit(
@@ -166,17 +182,26 @@ def process_chapter(
             )
             return state_mod.STATUS_ENGLISH
 
-    metrics = chapter.metrics
-    result, validation = _translate_with_retry(translator, chapter, glossary, cfg, state)
+    metrics = chapter.metrics  # ORIGINAL — keeps the resumable "done" fingerprint stable
+    # Strip the export-header cruft (URL, title, "N minutes", "NNN화") before the model
+    # sees it, so it can't leak into the translation — but keep in-story part markers
+    # ("33."). The state hash stays on the original, so existing chapters aren't redone.
+    clean_text, _num = strip_source_header(chapter.text)
+    src = chapter
+    if clean_text and clean_text != chapter.text:
+        src = Chapter(index=chapter.index, title=chapter.title,
+                      paragraphs=[p for p in re.split(r"\n\s*\n", clean_text) if p.strip()])
+
+    result, validation = _translate_with_retry(translator, src, glossary, cfg, state)
 
     # Optional AI deep-check layer (off | flagged | always). "flagged" only spends a
     # call on chapters the fast checks already rejected; "always" checks every chapter.
     mode = getattr(cfg.translation, "deep_check", "flagged")
     if mode == "always" or (mode == "flagged" and not validation.ok):
-        result, validation = _deep_check_and_fix(translator, chapter, result, validation, cfg)
+        result, validation = _deep_check_and_fix(translator, src, result, validation, cfg)
 
     status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW
-    write_audit(cfg.paths.audit_dir, chapter, total, result, validation, status)
+    write_audit(cfg.paths.audit_dir, src, total, result, validation, status)
 
     queued = 0
     if validation.ok:
@@ -185,6 +210,60 @@ def process_chapter(
             cfg.paths.glossary_pending, glossary, result.new_terms, chapter.index
         )
 
+    state.update(
+        chapter.index,
+        status=status,
+        title=chapter.title,
+        source_hash=metrics.content_hash,
+        source_chars=metrics.char_count,
+        chunks=result.n_chunks,
+        validation=validation.metrics,
+        failures=validation.failures,
+        new_terms_queued=queued,
+    )
+    return status
+
+
+def repair_chapter(
+    chapter: Chapter,
+    total: int,
+    translator: Translator,
+    glossary: Glossary,
+    cfg: Config,
+    state: State,
+    *,
+    instruction: str,
+) -> str:
+    """Re-translate one chapter with a failure-targeted corrective instruction, and
+    ALWAYS write the result (unlike :func:`process_chapter`, which discards a still-
+    imperfect attempt). This backs the user-triggered "AI resolve" on a flagged chapter:
+    the new attempt is always written — snapshotting the prior one to ``previous/`` — so
+    the reader can compare old-vs-new and revert if the fix turns out worse.
+    Returns the final status."""
+    if not chapter.paragraphs:
+        state.update(chapter.index, status=state_mod.STATUS_EMPTY, title=chapter.title)
+        return state_mod.STATUS_EMPTY
+
+    metrics = chapter.metrics  # ORIGINAL hash — keeps the resumable fingerprint stable
+    clean_text, _num = strip_source_header(chapter.text)
+    src = chapter
+    if clean_text and clean_text != chapter.text:
+        src = Chapter(index=chapter.index, title=chapter.title,
+                      paragraphs=[p for p in re.split(r"\n\s*\n", clean_text) if p.strip()])
+
+    # Layer the corrective instruction on top of any per-novel one (cfg is a per-request copy).
+    base = (cfg.translation.extra_instruction or "").strip()
+    cfg.translation.extra_instruction = f"{base}\n\n{instruction}".strip() if base else instruction
+
+    result, validation = _translate_with_retry(translator, src, glossary, cfg, state)
+    mode = getattr(cfg.translation, "deep_check", "flagged")
+    if mode == "always" or (mode == "flagged" and not validation.ok):
+        result, validation = _deep_check_and_fix(translator, src, result, validation, cfg)
+
+    status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW
+    write_audit(cfg.paths.audit_dir, src, total, result, validation, status)
+    write_chapter_file(cfg.paths.output_dir, chapter.index, total, result.prose)  # always
+    queued = queue_new_terms(cfg.paths.glossary_pending, glossary, result.new_terms, chapter.index)
     state.update(
         chapter.index,
         status=status,

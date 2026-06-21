@@ -72,7 +72,7 @@ export default function GuidePanel({ onClose, onGo }) {
                         {open === i ? 'Hide' : 'How it works'}
                       </button>
                       {s.go && onGo && (
-                        <button onClick={() => { onGo(s.go); onClose() }} className="btn btn-ghost px-3 py-1.5 text-xs">{s.goLabel || 'Take me there'} →</button>
+                        <button onClick={() => onGo(s.go)} className="btn btn-ghost px-3 py-1.5 text-xs">{s.goLabel || 'Take me there'} →</button>
                       )}
                     </div>
                     {open === i && (
