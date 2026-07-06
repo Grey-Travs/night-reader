@@ -23,7 +23,7 @@ _ALWAYS = re.compile(
     r"""(?ix)
       \bglossary\b                                       # "the glossary says…", "per glossary"
     | the\ narrator(\ here)?\ is
-    | the\ (original|source)(\ korean| \ text)?\ (say|read|is|wa|use|mean)
+    | the\ (original|source)\ korean\b                    # "the original Korean says…" (translator-speak)
     | i'?ll\ use\ the\ spelling
     | re-?reading\ the\ (chapter|source|glossary|names?|passage)
     | romaniz(e|ed|ing|ation)
@@ -39,9 +39,14 @@ _ALWAYS = re.compile(
 # get skipped, or an untranslated jamo echo slip past the leak checks.
 _HANGUL_CHARS = "가-힣ᄀ-ᇿ㄰-㆏ﾠ-ￜ"
 
-# Korean text immediately followed by an arrow to Latin — glossary-mapping notation
-# leaking into prose (e.g. "고원 -> Go Won" or "고원 → Go Won").
-_ARROW = re.compile(f"[{_HANGUL_CHARS}]" + r"\s*(?:-+>|=+>|→|⇒|➔|⟶)\s*[A-Za-z]")
+# Korean text joined to a Latin gloss by an arrow or an equals sign — source->target
+# mapping notation leaking into prose (e.g. "고원 -> Go Won", "고원 → Go Won",
+# "승연 = Seung Yeon", or a quoted target like '세레나데 → "Serenade"'). Requires Hangul
+# immediately before AND Latin after, so a decorative in-story arrow run ("→→↓↔") that has
+# no Hangul beside it is never matched.
+_ARROW = re.compile(
+    f"[{_HANGUL_CHARS}]" + r"[\s.,!?…\"'”’]*(?:-+>|=+>|=|→|⇒|➔|⟶)\s*[\"“'‘(\[]?\s*[A-Za-z]"
+)
 
 # SELF-CORRECTION / FRAMING — the model narrating its own task or addressing the
 # reader ("Here is the translation", "Let me redo"). Only counts when the block has
@@ -55,11 +60,23 @@ _SELF = re.compile(
     r"(?i)\blet'?s?\s+re-?do\b"
     r"|\blet\s+me\s+(?:just\s+|now\s+|simply\s+|carefully\s+|go\s+ahead\s+and\s+)?"
     r"(?:re-?do|re-?read|re-?translate|rewrite|start\s+over)\b"
-    # "let me / I'll translate|render|produce|provide THE chapter/translation/text" —
-    # an explicit meta object is required so ordinary narration can't trip it.
+    # "let me / I'll translate|render|… THE (full/whole) chapter/translation/text" — an
+    # explicit self-referential object (the chapter/translation itself) is required, with
+    # an optional size adjective, so ordinary narration ("let me translate their language
+    # for you") can't trip it.
     r"|\b(?:i'?ll|i\s+will|let\s+me|let'?s)\s+(?:just\s+|now\s+|simply\s+|go\s+ahead\s+and\s+)?"
     r"(?:translate|render|produce|provide|rewrite|give\s+you)\s+"
-    r"(?:the\s+|this\s+|your\s+|my\s+|a\s+)?(?:translat\w*|chapter|text|passage|version|following)\b"
+    r"(?:the\s+|this\s+|your\s+|my\s+|a\s+)?(?:full\s+|whole\s+|entire\s+|rest\s+of\s+the\s+)?"
+    r"(?:translat\w*|chapter|text|passage|version|content|section|following)\b"
+    # Bare task announcement that is essentially the WHOLE block — "Let me translate." /
+    # "I'll render." standing alone. Anchored to the block so it NEVER fires on a marker
+    # trailing real prose (e.g. "…vivid sensation. Let me translate."): deleting that block
+    # would drop the real English before it. Such MIXED leaks (Korean echo/English + a
+    # trailing marker) are caught by validation's untranslated-Korean flag instead — routed
+    # to needs-review, not silently deleted. (Losing a leak is recoverable; deleting prose
+    # is not.)
+    r"|^\s*(?:i'?ll|i\s+will|let\s+me|let'?s)\s+(?:just\s+|now\s+|simply\s+|go\s+ahead\s+and\s+)?"
+    r"(?:translate|render)\s*[.!?…]?\s*$"
     r"|\bhere(?:\s+is|'?s)\s+(?:the\s+|your\s+|my\s+)?translat"
     r"|\bbelow\s+is\s+the\s+translat"
     r"|\bthe\s+translation\s+(?:is\s+(?:as\s+follows|below)|follows|begins)"
@@ -68,7 +85,16 @@ _SELF = re.compile(
 
 _QUOTE = re.compile(r'["“”「」『』]')
 _HR = re.compile(r"^\s*(?:[-*_]\s*){3,}$")
-_HANGUL = re.compile(f"[{_HANGUL_CHARS}]")
+
+# Untranslated-Korean detection counts ONLY composed Hangul SYLLABLES (가-힣) — actual
+# words. Compatibility jamo (ㅠㅠ, ㅋㅋㅋ, ㅇㅇ, ㅜ, ㅡㅡ) are text-emoticons/laughter that
+# these web novels legitimately keep in chat/SNS scenes, so they must NEVER count as a
+# leak or be stripped. (Source-language detection in docs_extract.py is intentionally
+# broader and DOES include jamo — a jamo-heavy tab is still a Korean tab to translate.)
+_HANGUL = re.compile(r"[가-힣]")
+# A leaked untranslated Korean PHRASE: two or more Korean syllable-words separated by
+# whitespace (a lone emoticon or a single kept term/sound-effect can't match).
+_KOREAN_PHRASE = re.compile(r"[가-힣]+[.,!?…\"'”’)\]]*\s+[가-힣]")
 
 
 def _hangul_fraction(block: str) -> float:
@@ -78,8 +104,18 @@ def _hangul_fraction(block: str) -> float:
 
 def _is_korean_echo(block: str) -> bool:
     """A whole paragraph that is predominantly untranslated Korean (a source echo) —
-    not a short sound effect or an inline Korean term, which we keep."""
+    not a short sound effect, an inline Korean term, or a text-emoticon, which we keep."""
     return len(_HANGUL.findall(block)) > 8 and _hangul_fraction(block) > 0.5
+
+
+def has_korean_leak(text: str, *, min_syllables: int = 8) -> bool:
+    """Untranslated Korean beyond a single short token remains: either a multi-word Korean
+    phrase (a leaked source sentence) or a substantial run of Korean syllables. Used by
+    validation to FLAG such a chapter for review — never to delete text. Counts composed
+    syllables only, so kept text-emoticons (ㅠㅠ/ㅋㅋ) and one intentional short term or
+    sound-effect are NOT flagged."""
+    text = text or ""
+    return bool(_KOREAN_PHRASE.search(text)) or len(_HANGUL.findall(text)) >= min_syllables
 
 
 def _block_is_meta(block: str) -> bool:
@@ -92,8 +128,9 @@ def _block_is_meta(block: str) -> bool:
 
 
 def korean_fraction(text: str) -> float:
-    """Overall fraction of non-space characters that are Korean — used to flag a
-    translation that left substantial untranslated source in it."""
+    """Overall fraction of non-space characters that are untranslated Korean SYLLABLES
+    (composed 가-힣, not emoticon jamo) — used to flag a translation that left substantial
+    untranslated source in it."""
     return _hangul_fraction(text)
 
 

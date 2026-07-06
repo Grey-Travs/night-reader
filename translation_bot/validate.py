@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from .config import ValidationConfig
 from .docs_extract import Chapter, _QUOTE_RE
-from .sanitize import find_leaks, korean_fraction
+from .sanitize import find_leaks, has_korean_leak, korean_fraction
 
 
 @dataclass
@@ -59,9 +59,16 @@ def validate_translation(
     leaks = find_leaks(translation)
     if leaks:
         failures.append(f"AI reasoning/notes leaked into the text (e.g. “{leaks[0][:80]}”)")
-    #    …and it must not leave chunks of untranslated Korean source behind.
+    #    …and it must not leave untranslated Korean source behind. Two signals, both
+    #    counting composed Hangul syllables only (never emoticon jamo like ㅠㅠ/ㅋㅋ, which
+    #    these novels legitimately keep in chat scenes): (a) a large fraction of the WHOLE
+    #    chapter is Korean — wholesale untranslated; (b) a stray Korean phrase/run remains
+    #    even in an otherwise-English chapter — a leaked source sentence the whole-chapter
+    #    fraction is too coarse to notice. Either way we FLAG for review, never delete.
     if korean_fraction(translation) > 0.10:
         failures.append("substantial untranslated Korean remains in the output")
+    elif has_korean_leak(translation):
+        failures.append("stray untranslated Korean remains in the output — review before publishing")
 
     # 1. Paragraph-count check (structural). Tolerance scales with chapter length so
     #    minor formatting merges don't flag, but a missing scene still does.
