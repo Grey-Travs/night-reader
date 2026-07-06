@@ -21,12 +21,14 @@ export default function SettingsPage() {
 
   async function save(patch) {
     setError(null)
-    setS((prev) => ({ ...prev, ...patch }))
+    const prev = s  // snapshot for rollback if the save fails
+    setS((p) => ({ ...p, ...patch }))
     try {
       await api.updateSettings(patch)
       setSaved(true)
       setTimeout(() => setSaved(false), 1800)
     } catch (e) {
+      setS(prev)  // don't leave the UI showing a value that was never persisted
       setError(String(e.message || e))
     }
   }

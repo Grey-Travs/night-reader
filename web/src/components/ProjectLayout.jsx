@@ -31,6 +31,7 @@ export default function ProjectLayout() {
   const [showExport, setShowExport] = useState(false)
 
   const [running, setRunning] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
   const [log, setLog] = useState([])
   const [paused, setPaused] = useState(null) // { message, resets_at, pending } | null
   const [queue, setQueue] = useState({ current: null, pending: [] })
@@ -38,6 +39,12 @@ export default function ProjectLayout() {
   const jobIdRef = useRef(null)
   const resumeRef = useRef(null)
   const resumeJobRef = useRef(null)
+  const submittingRef = useRef(false)  // guards against double-submit races
+  const dataRef = useRef(null)         // live `data` for long-lived stream closures
+
+  // Keep a ref in sync with `data` so the SSE onmessage closure (attached once, at
+  // stream start) reads the CURRENT project, not the null it closed over at attach.
+  useEffect(() => { dataRef.current = data }, [data])
 
   async function load(refresh = false) {
     setLoading(true)
@@ -53,7 +60,7 @@ export default function ProjectLayout() {
   async function loadPending() {
     try {
       const g = await api.glossary(pid)
-      setPendingCount(g.pending.length)
+      setPendingCount((g.pending || []).length)
       setGlossary(g.locked || [])
     } catch { /* ignore */ }
   }
@@ -117,7 +124,8 @@ export default function ProjectLayout() {
     esRef.current = es
     jobIdRef.current = jobId
     es.onmessage = (ev) => {
-      const e = JSON.parse(ev.data)
+      let e
+      try { e = JSON.parse(ev.data) } catch { return }  // ignore a malformed/keep-alive frame
       if ('pending' in e) setQueue({ current: e.current ?? null, pending: e.pending || [] })
       if (e.type === 'start') {
         setRowStatus(e.index, 'translating')
@@ -138,7 +146,7 @@ export default function ProjectLayout() {
       } else if (e.type === 'done') {
         setLog((l) => [...l, 'Done.'])
         clearPausedJob(pid)
-        notify('Translation complete', `${data?.project?.name || 'Your novel'} — chapters are ready.`)
+        notify('Translation complete', `${dataRef.current?.project?.name || 'Your novel'} — chapters are ready.`)
         finish(es)
       }
     }
@@ -146,6 +154,11 @@ export default function ProjectLayout() {
   }
 
   async function enqueue(indices, force = false, { foldBacklog = true } = {}) {
+    // Re-entrancy guard: a rapid second click (or a resume firing mid-start) must not
+    // race the first request and attach a second EventSource for the same job.
+    if (submittingRef.current) return
+    submittingRef.current = true
+    setSubmitting(true)
     const wasIdle = !esRef.current
     const backlog = wasIdle && foldBacklog
       ? ((paused?.pending?.length ? paused.pending : getPausedJob(pid)?.pending) || [])
@@ -173,6 +186,9 @@ export default function ProjectLayout() {
     } catch (e) {
       setError(String(e.message || e))
       if (wasIdle) setRunning(false)
+    } finally {
+      submittingRef.current = false
+      setSubmitting(false)
     }
   }
 
@@ -188,6 +204,11 @@ export default function ProjectLayout() {
   }
 
   async function cancelQueue() {
+    // Cancelling must also cancel a pending auto-resume — otherwise the timer fires
+    // later and silently re-enqueues the backlog the user just cleared.
+    clearResumeTimer()
+    clearPausedJob(pid)
+    setPaused(null)
     try {
       const r = await api.cancelQueue(pid)
       setQueue({ current: r.current ?? null, pending: r.pending || [] })
@@ -216,7 +237,7 @@ export default function ProjectLayout() {
     pid, status, data, loading, error, reload: load, loadPending, pendingCount, glossary,
     setRowStatus, setProjectMeta,
     chapters, offline, counts, koreanTotal, done, remaining,
-    running, log, paused, queue, totalQueued, enqueue, cancelQueue, resumeJob,
+    running, submitting, log, paused, queue, totalQueued, enqueue, cancelQueue, resumeJob,
   }
 
   return (

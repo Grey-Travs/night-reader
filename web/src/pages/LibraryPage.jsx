@@ -57,7 +57,7 @@ export default function LibraryPage() {
         const d = await api.queueOverview()
         if (!alive) return
         const jobs = d.jobs || []
-        setQueued(jobs.reduce((n, j) => n + (j.current != null ? 1 : 0) + j.pending.length, 0))
+        setQueued(jobs.reduce((n, j) => n + (j.current != null ? 1 : 0) + (j.pending || []).length, 0))
         setQueueNovels(jobs.length)
       } catch { /* ignore */ }
     }
@@ -153,9 +153,11 @@ export default function LibraryPage() {
       confirmLabel: 'Remove', danger: true,
     })
     if (!ok) return
-    await api.deleteProject(pid)
-    toast('Removed from library')
-    load()
+    try {
+      await api.deleteProject(pid)
+      toast('Removed from library')
+      load()
+    } catch (e) { setError(String(e.message || e)) }
   }
 
   return (

@@ -10,10 +10,20 @@ a misclassified name or wrong romanization can't silently propagate everywhere.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 VALID_TYPES = {"name", "place", "skill", "term", "other"}
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text via a temp file + os.replace so a crash can't truncate the target
+    (a half-written glossary.json would otherwise wipe every locked term)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -75,12 +85,16 @@ class Glossary:
 
     def save(self, json_path: str | Path, md_path: str | Path | None = None) -> None:
         entries = self.entries()
-        Path(json_path).write_text(
-            json.dumps([asdict(e) for e in entries], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        # Atomic writes: a crash mid-save must never truncate glossary.json to empty
+        # (which would silently wipe every locked term) or leave the .json and .md
+        # inconsistent. Write the source-of-truth JSON last so a failure leaves the
+        # previous good JSON intact.
         if md_path is not None:
-            Path(md_path).write_text(self.to_markdown(), encoding="utf-8")
+            _atomic_write_text(Path(md_path), self.to_markdown())
+        _atomic_write_text(
+            Path(json_path),
+            json.dumps([asdict(e) for e in entries], ensure_ascii=False, indent=2),
+        )
 
     # ---- access ------------------------------------------------------------
     def entries(self) -> list[GlossaryEntry]:
@@ -203,7 +217,7 @@ def load_pending(path: str | Path) -> list[dict]:
 
 
 def save_pending(path: str | Path, items: list[dict]) -> None:
-    Path(path).write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(Path(path), json.dumps(items, ensure_ascii=False, indent=2))
 
 
 def queue_new_terms(

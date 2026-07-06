@@ -89,7 +89,12 @@ _running_tasks: set[asyncio.Task] = set()        # strong refs so tasks aren't G
 def load_global_config() -> Config:
     if not CONFIG_PATH.exists():
         raise HTTPException(400, "config.toml not found. Complete setup first.")
-    return Config.load(CONFIG_PATH)
+    try:
+        return Config.load(CONFIG_PATH)
+    except Exception as exc:
+        # Malformed/hand-edited config.toml — surface a clean 400 instead of a 500
+        # so the UI can prompt a fix rather than appearing broken.
+        raise HTTPException(400, f"config.toml is invalid: {exc}") from exc
 
 
 def require_project(pid: str) -> dict:
@@ -212,6 +217,16 @@ def get_chapters(pid: str, cfg: Config, refresh: bool = False) -> list[Chapter]:
     return _chapter_cache[pid]
 
 
+def _safe_read(path: Path) -> str | None:
+    """Read a saved chapter/translation file, returning None instead of raising on a
+    transient FS error, a file removed mid-request (a concurrent re-translate), or a
+    non-UTF-8 stray file — so a single bad file never 500s the reader/search."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def _output_total(pid: str, chapters: list[Chapter]) -> int:
     """The chapter count whose zero-padding reproduces the chapter-NN.md files on
     disk. Online/cached novels carry the full list, so this is just len(chapters).
@@ -271,11 +286,20 @@ def chapter_row(ch: Chapter, cfg: Config, state: State, total: int) -> dict:
 @app.get("/api/status")
 def status() -> dict:
     cfg_exists = CONFIG_PATH.exists()
-    cfg = Config.load(CONFIG_PATH) if cfg_exists else None
+    cfg = None
+    config_error = None
+    if cfg_exists:
+        try:
+            cfg = Config.load(CONFIG_PATH)
+        except Exception as exc:
+            # A broken config must not 500 the very first call the UI makes, or the
+            # whole app (including the setup screen meant to fix it) appears dead.
+            config_error = str(exc)
     creds_file = cfg.google.credentials_file if cfg else Path("client_secret.json")
     token_file = cfg.google.token_file if cfg else Path("token.json")
     return {
         "config_present": cfg_exists,
+        "config_error": config_error,
         "google_client_secret_present": Path(creds_file).exists(),
         "google_logged_in": Path(token_file).exists(),
         "claude_logged_in": CLAUDE_CREDENTIALS.exists(),
@@ -328,9 +352,9 @@ def update_settings(s: Settings) -> dict:
         return t
 
     if s.model is not None:
-        text = setkey(text, "model", s.model)
+        text = setkey(text, "model", s.model, section="anthropic")
     if s.effort is not None:
-        text = setkey(text, "effort", s.effort)
+        text = setkey(text, "effort", s.effort, section="anthropic")
     if s.deep_check is not None:
         text = setkey(text, "deep_check", s.deep_check, section="translation")
     CONFIG_PATH.write_text(text, encoding="utf-8")
@@ -570,8 +594,23 @@ async def create_project(body: CreateProject) -> dict:
     if not name:
         try:
             name = await run_in_threadpool(fetch_doc_title, doc_id)
+        except FileNotFoundError as exc:
+            # Missing OAuth client secret — point at setup.
+            raise HTTPException(400, str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(400, f"Couldn't open that document: {exc}")
+            msg = str(exc)
+            if "invalid_grant" in msg or "RefreshError" in type(exc).__name__ or "renewing" in msg:
+                raise HTTPException(
+                    400,
+                    "Your Google sign-in has expired or was revoked. Click "
+                    "“Connect Google” / Login to reconnect, then try the link again.",
+                ) from exc
+            # Don't leak raw internals; give a friendly, actionable message.
+            raise HTTPException(
+                400,
+                "Couldn't open that document. Check the link is a Google Doc you can "
+                "access, then make sure Google is connected in setup.",
+            ) from exc
     project = pj.create_project(name or "Untitled novel", doc_id)
     return project
 
@@ -636,9 +675,9 @@ def search_chapters(pid: str, q: str = "") -> dict:
     results = []
     for ch in chapters:
         path = cfg.paths.output_dir / chapter_filename(ch.index, total)
-        if not path.exists():
+        text = _safe_read(path)
+        if text is None:
             continue
-        text = path.read_text(encoding="utf-8")
         pos = text.lower().find(needle)
         if pos == -1:
             continue
@@ -661,8 +700,9 @@ def _translated_chapters(pid: str, cfg: Config) -> list[tuple[int, str, str]]:
     out = []
     for ch in chapters:
         path = cfg.paths.output_dir / chapter_filename(ch.index, total)
-        if path.exists():
-            out.append((ch.index, ch.title, path.read_text(encoding="utf-8")))
+        text = _safe_read(path)
+        if text is not None:
+            out.append((ch.index, ch.title, text))
     return out
 
 
@@ -712,9 +752,9 @@ def list_chapters(pid: str, refresh: bool = False) -> dict:
     # Don't overwrite the saved chapter_count from an offline copy — it may be partial.
     if not offline and project.get("chapter_count") != total:  # cache total for the library
         project["chapter_count"] = total
-        (pj.PROJECTS_DIR / pid / "project.json").write_text(
-            json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        # Atomic write so a concurrent reader / crash can't truncate project.json
+        # (a corrupt project.json would otherwise hide the whole novel).
+        pj._atomic_write_json(pj.PROJECTS_DIR / pid / "project.json", project)
     state = State.load(cfg.paths.state_file)
     rows = [chapter_row(ch, cfg, state, file_total) for ch in chapters]
     counts: dict[str, int] = {}
@@ -733,7 +773,7 @@ def chapter_detail(pid: str, index: int) -> dict:
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
     out_path = cfg.paths.output_dir / chapter_filename(index, total)
-    translation = out_path.read_text(encoding="utf-8") if out_path.exists() else None
+    translation = _safe_read(out_path) if out_path.exists() else None
     rec = State.load(cfg.paths.state_file).get(index) or {}
     clean_source, number = strip_source_header(ch.text)  # drop export header, pull chapter no.
     return {
@@ -800,7 +840,7 @@ def _chapter_problems(pid: str, cfg: Config, index: int) -> dict:
     """Scan a chapter's saved translation for problems: leaked AI reasoning,
     untranslated Korean, and the length/structure validation checks."""
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)  # match the on-disk chapter-NN.md pad width
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
@@ -845,7 +885,7 @@ async def scan_chapter_deep(pid: str, index: int) -> dict:
     regex can't anticipate (anywhere, not just the first line). Uses your plan."""
     _, cfg = project_cfg(pid)
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)  # match the on-disk chapter-NN.md pad width
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
@@ -884,7 +924,7 @@ def fix_chapter(pid: str, index: int, body: FixRequest = FixRequest()) -> dict:
     re-translate are reported back unchanged."""
     _, cfg = project_cfg(pid)
     chapters = get_chapters(pid, cfg)
-    total = len(chapters)
+    total = _output_total(pid, chapters)  # match the on-disk chapter-NN.md pad width
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
@@ -1057,6 +1097,9 @@ def consistency_replace(pid: str, body: ReplaceRequest) -> dict:
                    key=len, reverse=True)
     if not froms:
         return {"replaced": 0, "chapters": []}
+    # Bound the alternation so a huge/garbled request can't build a pathological regex.
+    if len(froms) > 200 or any(len(f) > 200 for f in froms):
+        raise HTTPException(400, "Too many or too-long spellings to replace at once.")
     chapters = get_chapters(pid, cfg)
     total = _output_total(pid, chapters)
     pattern = re.compile(r"\b(" + "|".join(re.escape(f) for f in froms) + r")\b")
@@ -1066,9 +1109,9 @@ def consistency_replace(pid: str, body: ReplaceRequest) -> dict:
         if targets is not None and ch.index not in targets:
             continue
         path = cfg.paths.output_dir / chapter_filename(ch.index, total)
-        if not path.exists():
+        text = _safe_read(path)
+        if text is None:
             continue
-        text = path.read_text(encoding="utf-8")
         new, n = pattern.subn(to, text)
         if n and new != text:
             write_chapter_file(cfg.paths.output_dir, ch.index, total, new)  # one snapshot per chapter
@@ -1368,9 +1411,25 @@ class Job:
             q.put_nowait(ev)
 
 
+def _persist_chapter_state(state: State, path: Path, idx: int) -> State:
+    """Persist ONLY chapter ``idx``'s record without clobbering concurrent edits.
+
+    The worker holds one in-memory ``state`` for the whole job, but the user can
+    edit/accept/resolve OTHER chapters while it runs (each via its own load→save).
+    Saving the worker's stale whole-state would discard those edits. So reload the
+    on-disk state, overlay just this chapter, save atomically, and hand the merged
+    state back for the worker to keep using (so later is_done/cost reads are current)."""
+    rec = state.chapters.get(str(idx))
+    fresh = State.load(path)
+    if rec is not None:
+        fresh.chapters[str(idx)] = rec
+    fresh.save(path)
+    return fresh
+
+
 async def _run_worker(job: Job, cfg: Config) -> None:
     chapters = get_chapters(job.pid, cfg)
-    total = len(chapters)
+    total = _output_total(job.pid, chapters)  # match the on-disk chapter-NN.md pad width
     by_index = {c.index: c for c in chapters}
     glossary = Glossary.load(cfg.paths.glossary_json)
     state = State.load(cfg.paths.state_file)
@@ -1386,7 +1445,11 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             job.queued.discard(idx)
             job.current = None
             continue
-        if not force and state.is_done(idx, ch.metrics.content_hash):
+        # Whether this chapter was ALREADY validated on disk before this attempt. Used
+        # both to skip non-forced re-runs and to protect a good translation from being
+        # clobbered if a forced re-translate is interrupted by a rate limit below.
+        already_done = state.is_done(idx, ch.metrics.content_hash)
+        if not force and already_done:
             job.queued.discard(idx)
             job.current = None
             job.publish({"type": "chapter", "index": idx, "status": "validated",
@@ -1399,8 +1462,14 @@ async def _run_worker(job: Job, cfg: Config) -> None:
                 process_chapter, ch, total, translator, glossary, cfg, state
             )
         except RateLimitedError as exc:
-            state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
-            state.save(cfg.paths.state_file)
+            # A rate limit mid-flight must NOT downgrade a chapter that was already
+            # validated on disk (e.g. an interrupted force-retranslate): that would
+            # revert it to "pending"/"Queued" even though its finished English file
+            # is still on disk. Only mark genuinely-unfinished chapters pending so
+            # they resume; a done chapter keeps its validated status.
+            if not already_done:
+                state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
+                state = _persist_chapter_state(state, cfg.paths.state_file, idx)
             # Everything not yet finished (this chapter + the rest of the queue), so
             # the client can resume exactly what's left.
             remaining = [idx] + [i for i, _ in job.pending]
@@ -1413,13 +1482,13 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         except Exception as exc:  # isolation: one bad chapter never kills the queue
             state.update(idx, status=state_mod.STATUS_FAILED, title=ch.title,
                          error=f"{type(exc).__name__}: {exc}")
-            state.save(cfg.paths.state_file)
+            state = _persist_chapter_state(state, cfg.paths.state_file, idx)
             job.queued.discard(idx)
             job.current = None
             job.publish({"type": "chapter", "index": idx, "status": "failed",
                          "title": ch.title, "error": str(exc)})
             continue
-        state.save(cfg.paths.state_file)
+        state = _persist_chapter_state(state, cfg.paths.state_file, idx)
         rec = state.get(idx) or {}
         job.queued.discard(idx)
         job.current = None
@@ -1526,7 +1595,7 @@ def active_job(pid: str) -> dict:
 
 
 @app.get("/api/projects/{pid}/translate/{job_id}/stream")
-async def stream_job(pid: str, job_id: str) -> StreamingResponse:
+async def stream_job(pid: str, job_id: str, request: Request) -> StreamingResponse:
     job = _jobs.get(job_id)
     if job is None or job.pid != pid:
         raise HTTPException(404, "job not found")
@@ -1544,7 +1613,17 @@ async def stream_job(pid: str, job_id: str) -> StreamingResponse:
                 if ev.get("type") in ("done", "paused"):
                     return
             while True:
-                event = await q.get()
+                # Wake periodically even with no events so a client that navigated away
+                # or closed the tab is detected and its subscriber queue is released —
+                # otherwise this coroutine blocks forever and publish() grows it without
+                # bound. The comment line doubles as a keep-alive through proxies.
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    yield ": keep-alive\n\n"
+                    continue
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 if event.get("type") in ("done", "paused"):
                     break

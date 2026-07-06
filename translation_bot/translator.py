@@ -220,6 +220,7 @@ class Translator:
         usage: dict = {}
         cost = 0.0
         rate_limited = None
+        got_result = False
         async for msg in query(prompt=user_text, options=self._options(system_text, max_turns)):
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
@@ -230,6 +231,7 @@ class Translator:
                 if getattr(info, "status", None) == "rejected":
                     rate_limited = info
             elif isinstance(msg, ResultMessage):
+                got_result = True
                 cost = msg.total_cost_usd or 0.0
                 usage = _extract_usage(msg)
                 if msg.is_error:
@@ -242,6 +244,11 @@ class Translator:
                     raise TranslatorError(f"agent error: {detail}")
         if rate_limited is not None:
             raise RateLimitedError(rate_limited)
+        # A stream that ends with no ResultMessage was cut off (process died / connection
+        # dropped mid-output). Don't return the partial text as if it were a finished
+        # chapter — raise so it's retried/failed, never silently written as truncated.
+        if not got_result:
+            raise TranslatorError("incomplete response: the model run ended before finishing")
         return "".join(texts).strip(), usage, cost
 
     def _call(self, system_text: str, user_text: str, max_turns: int = 1) -> tuple[str, dict, float]:

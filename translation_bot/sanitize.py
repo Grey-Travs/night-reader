@@ -33,33 +33,53 @@ _ALWAYS = re.compile(
     """
 )
 
+# Hangul characters. Plain [가-힣] only covers composed syllables and misses
+# isolated/compatibility jamo (ㅋㅋㅋ, ㅎㅎ, ㅏ), conjoining jamo, and half-width
+# Hangul — which would let a jamo-heavy Korean chapter look "already English" and
+# get skipped, or an untranslated jamo echo slip past the leak checks.
+_HANGUL_CHARS = "가-힣ᄀ-ᇿ㄰-㆏ﾠ-ￜ"
+
 # Korean text immediately followed by an arrow to Latin — glossary-mapping notation
-# leaking into prose (e.g. "고원 -> Go Won").
-_ARROW = re.compile(r"[가-힣]\s*-+>\s*[A-Za-z]")
+# leaking into prose (e.g. "고원 -> Go Won" or "고원 → Go Won").
+_ARROW = re.compile(f"[{_HANGUL_CHARS}]" + r"\s*(?:-+>|=+>|→|⇒|➔|⟶)\s*[A-Za-z]")
 
 # SELF-CORRECTION / FRAMING — the model narrating its own task or addressing the
-# reader ("Here is the translation", "Let me redo", "Sure, here you go"). Only counts
-# when the block has NO dialogue quotes, so "'Let me redo my makeup,' she said" is safe.
+# reader ("Here is the translation", "Let me redo"). Only counts when the block has
+# NO dialogue quotes, so "'Let me redo my makeup,' she said" is safe. Verbs after
+# "let me" are restricted to unambiguous translation-meta (redo/re-read/rewrite/…);
+# broad story verbs (write/continue/fix/translate-without-an-object) are deliberately
+# NOT matched, so real narration like "Let me write you a letter, she decided" or
+# "I will translate the runes" is never deleted. Object-less meta leaks are caught by
+# the AI deep-check instead — losing a leak is recoverable, deleting prose is not.
 _SELF = re.compile(
     r"(?i)\blet'?s?\s+re-?do\b"
     r"|\blet\s+me\s+(?:just\s+|now\s+|simply\s+|carefully\s+|go\s+ahead\s+and\s+)?"
-    r"(re-?do|re-?read|re-?translate|reset|rewrite|start\s+over|"
-    r"translate|produce|render|write|continue|fix|correct|reconsider|use\b)"
-    r"|\bhere\s+(is|'?s)\s+(the\s+|your\s+|my\s+)?(translat|chapter\b)"
+    r"(?:re-?do|re-?read|re-?translate|rewrite|start\s+over)\b"
+    # "let me / I'll translate|render|produce|provide THE chapter/translation/text" —
+    # an explicit meta object is required so ordinary narration can't trip it.
+    r"|\b(?:i'?ll|i\s+will|let\s+me|let'?s)\s+(?:just\s+|now\s+|simply\s+|go\s+ahead\s+and\s+)?"
+    r"(?:translate|render|produce|provide|rewrite|give\s+you)\s+"
+    r"(?:the\s+|this\s+|your\s+|my\s+|a\s+)?(?:translat\w*|chapter|text|passage|version|following)\b"
+    r"|\bhere(?:\s+is|'?s)\s+(?:the\s+|your\s+|my\s+)?translat"
     r"|\bbelow\s+is\s+the\s+translat"
-    r"|\bthe\s+translation\s+(is\s+(as\s+follows|below)|follows|begins)"
-    r"|\bi\s+(will|'?ll|'?ve|have)\s+(now\s+)?translat"
+    r"|\bthe\s+translation\s+(?:is\s+(?:as\s+follows|below)|follows|begins)"
     r"|\btranslated\s+chapter\s*:"
 )
 
 _QUOTE = re.compile(r'["“”「」『』]')
 _HR = re.compile(r"^\s*(?:[-*_]\s*){3,}$")
-_HANGUL = re.compile(r"[가-힣]")
+_HANGUL = re.compile(f"[{_HANGUL_CHARS}]")
 
 
 def _hangul_fraction(block: str) -> float:
     body = re.sub(r"\s", "", block)
     return len(_HANGUL.findall(block)) / len(body) if body else 0.0
+
+
+def _is_korean_echo(block: str) -> bool:
+    """A whole paragraph that is predominantly untranslated Korean (a source echo) —
+    not a short sound effect or an inline Korean term, which we keep."""
+    return len(_HANGUL.findall(block)) > 8 and _hangul_fraction(block) > 0.5
 
 
 def _block_is_meta(block: str) -> bool:
@@ -118,7 +138,7 @@ def remove_korean_echoes(text: str) -> tuple[str, int]:
     blocks = re.split(r"\n\s*\n", (text or "").strip())
     kept, removed = [], 0
     for b in blocks:
-        if len(_HANGUL.findall(b)) > 8 and _hangul_fraction(b) > 0.5:
+        if _is_korean_echo(b):
             removed += 1
             continue
         kept.append(b)
@@ -184,7 +204,10 @@ def strip_reasoning(text: str) -> tuple[str, list[str]]:
     #    the first clean English block (handles source-echo preambles without a ---).
     if any(flags[:3]):
         i = 0
-        while i < len(blocks) and (flags[i] or _HR.match(blocks[i].strip()) or _HANGUL.search(blocks[i])):
+        # Only walk past meta blocks, horizontal rules, and WHOLE-paragraph Korean
+        # echoes — never a real prose block that merely contains some Hangul (a sound
+        # effect or kept term), which would silently delete translated content.
+        while i < len(blocks) and (flags[i] or _HR.match(blocks[i].strip()) or _is_korean_echo(blocks[i])):
             i += 1
         if 0 < i < len(blocks):
             removed = blocks[:i]

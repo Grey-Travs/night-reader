@@ -45,9 +45,11 @@ export default function ArchivePage() {
       confirmLabel: 'Remove', danger: true,
     })
     if (!ok) return
-    await api.deleteProject(pid)
-    toast('Removed from library')
-    load()
+    try {
+      await api.deleteProject(pid)
+      toast('Removed from library')
+      load()
+    } catch (e) { setError(String(e.message || e)) }
   }
 
   const archived = projects.filter((p) => p.archived)

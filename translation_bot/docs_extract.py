@@ -19,8 +19,10 @@ from dataclasses import dataclass, field
 _QUOTE_CHARS = "\"“”「」『』"
 _QUOTE_RE = re.compile(f"[{re.escape(_QUOTE_CHARS)}]")
 
-# Hangul syllables — used to tell a Korean source tab from an already-English one.
-_HANGUL_RE = re.compile(r"[가-힣]")
+# Hangul — used to tell a Korean source tab from an already-English one. Includes
+# compatibility/conjoining jamo and half-width forms (not just composed 가-힣 syllables)
+# so a jamo-heavy chapter (ㅋㅋㅋ, ㅎㅎ) isn't misread as already-English and skipped.
+_HANGUL_RE = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏ﾠ-ￜ]")
 
 
 def hangul_fraction(text: str) -> float:

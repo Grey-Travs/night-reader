@@ -1,4 +1,4 @@
-import { useNavigate, useOutletContext, useParams } from 'react-router-dom'
+import { Navigate, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import ChapterReader from '../components/ChapterReader'
 
 // The reader as a deep-linkable route (/novel/:pid/chapter/:idx). It renders full
@@ -9,6 +9,10 @@ export default function ReaderPage() {
   const { idx } = useParams()
   const navigate = useNavigate()
   const index = Number(idx)
+
+  // A non-numeric / junk URL (stale bookmark, typo) would otherwise become NaN and
+  // poison localStorage (last-read, read-set) and the chapter fetch. Bounce home.
+  if (!Number.isInteger(index) || index < 1) return <Navigate to={`/novel/${pid}`} replace />
 
   return (
     <ChapterReader

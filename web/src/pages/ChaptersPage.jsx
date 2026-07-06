@@ -12,7 +12,7 @@ const isSelectable = (ch) => ch.language === 'korean' && SELECTABLE.includes(ch.
 export default function ChaptersPage() {
   const {
     pid, data, loading, chapters, offline, counts, done, remaining,
-    running, queue, totalQueued, enqueue, cancelQueue,
+    running, submitting, queue, totalQueued, enqueue, cancelQueue,
   } = useOutletContext()
   const navigate = useNavigate()
   const openReader = (index) => navigate(`/novel/${pid}/chapter/${index}`)
@@ -142,7 +142,7 @@ export default function ChaptersPage() {
               {' · tick chapters to (re)translate just those'}
             </div>
           </div>
-          <button onClick={() => enqueue(null, false)} disabled={remaining === 0} className="btn btn-primary px-5 py-2.5">
+          <button onClick={() => enqueue(null, false)} disabled={remaining === 0 || submitting} className="btn btn-primary px-5 py-2.5">
             {running ? `Queue all remaining (${remaining})` : `Translate all remaining (${remaining})`}
           </button>
         </section>
@@ -184,7 +184,7 @@ export default function ChaptersPage() {
             {selected.size > 0 ? (
               <div className="flex items-center gap-2">
                 <span className="text-xs text-muted">{selected.size} selected</span>
-                <button onClick={translateSelected} className="btn btn-primary px-3 py-1.5 text-xs">Translate selected</button>
+                <button onClick={translateSelected} disabled={submitting} className="btn btn-primary px-3 py-1.5 text-xs">Translate selected</button>
                 <button onClick={clearSelection} className="btn btn-ghost px-2.5 py-1 text-xs">Clear</button>
               </div>
             ) : (
@@ -274,11 +274,11 @@ export default function ChaptersPage() {
                         ) : inQueue ? (
                           <span className="text-xs text-hint">Queued</span>
                         ) : isTranslatable ? (
-                          <button onClick={() => enqueue([ch.index], false)} className="btn btn-ghost px-2.5 py-1 text-xs">Translate</button>
+                          <button onClick={() => enqueue([ch.index], false)} disabled={submitting} className="btn btn-ghost px-2.5 py-1 text-xs">Translate</button>
                         ) : (
                           <>
                             {canRead && <button onClick={() => openReader(ch.index)} className="btn btn-ghost px-2.5 py-1 text-xs">Read</button>}
-                            {translated && !offline && <button onClick={() => enqueue([ch.index], true)} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs">Re-translate</button>}
+                            {translated && !offline && <button onClick={() => enqueue([ch.index], true)} disabled={submitting} className="btn btn-ghost ml-1.5 px-2.5 py-1 text-xs">Re-translate</button>}
                           </>
                         )}
                       </td>

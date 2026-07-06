@@ -54,6 +54,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON via a temp file + os.replace so a crash or a concurrent reader can
+    never observe a half-written/truncated file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def list_projects() -> list[dict]:
     if not PROJECTS_DIR.exists():
         return []
@@ -73,7 +82,12 @@ def get_project(pid: str) -> dict | None:
     pj = PROJECTS_DIR / pid / "project.json"
     if not pj.exists():
         return None
-    return json.loads(pj.read_text(encoding="utf-8"))
+    try:
+        return json.loads(pj.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        # A truncated/half-written project.json must not turn every request for this
+        # project into a 500 — treat it as missing (the library list does the same).
+        return None
 
 
 def find_project_by_doc(doc_id: str) -> dict | None:
@@ -96,16 +110,12 @@ def create_project(name: str, doc_id: str, *, pid: str | None = None) -> dict:
         "source_doc_id": doc_id,
         "created_at": _now(),
     }
-    (pdir / "project.json").write_text(
-        json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _atomic_write_json(pdir / "project.json", project)
     return project
 
 
 def _write_project(project: dict) -> dict:
-    (PROJECTS_DIR / project["id"] / "project.json").write_text(
-        json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _atomic_write_json(PROJECTS_DIR / project["id"] / "project.json", project)
     return project
 
 

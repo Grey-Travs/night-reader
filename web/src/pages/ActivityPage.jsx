@@ -11,7 +11,11 @@ export default function ActivityPage() {
   useEffect(() => {
     let alive = true
     const tick = async () => {
-      try { const d = await api.queueOverview(); if (alive) setJobs(d.jobs || []) } catch { /* ignore */ }
+      try {
+        const d = await api.queueOverview()
+        // Normalize shape so every downstream `j.pending` access is safe.
+        if (alive) setJobs((d.jobs || []).map((j) => ({ ...j, pending: j.pending || [] })))
+      } catch { /* ignore */ }
     }
     tick()
     const id = setInterval(tick, 4000)

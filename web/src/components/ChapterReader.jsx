@@ -301,13 +301,17 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     }
   }
 
+  // Normalize a scan response so `problems` is always an array — a missing/odd shape
+  // from the API must never crash the popup render.
+  const normScan = (r) => ({ ...(r || {}), problems: (r && r.problems) || [] })
+
   // Fast (free, instant) check — always opens the popup so the deep-check is one
   // click away even when the quick scan finds nothing.
   async function runScan() {
     setScanning(true)
     setError(null)
     try {
-      setScan(await api.scanChapter(pid, index))
+      setScan(normScan(await api.scanChapter(pid, index)))
     } catch (e) {
       setError(String(e.message || e))
     } finally {
@@ -321,7 +325,7 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     setDeepScanning(true)
     setError(null)
     try {
-      setScan(await api.deepScanChapter(pid, index))
+      setScan(normScan(await api.deepScanChapter(pid, index)))
     } catch (e) {
       setError(String(e.message || e))
     } finally {
@@ -337,7 +341,7 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
       const r = await api.fixChapter(pid, index, { remove: snippets })
       onChanged?.()
       load() // refresh the reader with the cleaned text
-      setScan(r) // show whatever still needs a re-translate (empty list = all fixed)
+      setScan(normScan(r)) // show whatever still needs a re-translate (empty list = all fixed)
     } catch (e) {
       setError(String(e.message || e))
     } finally {

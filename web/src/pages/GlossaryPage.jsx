@@ -81,6 +81,8 @@ export default function GlossaryPage() {
 
   async function load() {
     const d = await api.glossary(pid)
+    d.pending = d.pending || []
+    d.locked = d.locked || []
     setData(d)
     const init = {}
     for (const p of d.pending) init[pkey(p)] = { english: p.english, type: p.type || 'other', note: p.note || '' }

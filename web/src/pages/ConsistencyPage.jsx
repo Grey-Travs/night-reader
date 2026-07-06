@@ -21,6 +21,9 @@ export default function ConsistencyPage() {
     setScanning(true); setError(null)
     try {
       const r = await api.consistencyScan(pid)
+      // Drop any malformed variant with no options so the render/accessors can't crash.
+      r.variants = (r.variants || []).filter((v) => v.options && v.options.length)
+      r.missing = r.missing || []
       setReport(r)
       const c = {}
       r.variants.forEach((v, i) => { c[i] = v.glossary_spelling || v.options[0].spelling })
