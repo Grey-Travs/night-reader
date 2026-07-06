@@ -959,7 +959,10 @@ async def resolve_chapter(pid: str, index: int) -> dict:
     failures, always writing the result (the prior version is kept in previous/ so the
     reader can compare and revert). Uses your plan."""
     _, cfg = project_cfg(pid)
-    chapters = get_chapters(pid, cfg)
+    # AI-resolve re-translates, so it must also see the CURRENT source: re-fetch the live
+    # doc (same reason as start_translation) so resolving an edited chapter uses the edited
+    # Korean, not the stale cached snapshot. Falls back to the local copy if unfetchable.
+    chapters = await run_in_threadpool(get_chapters, pid, cfg, True)
     total = _output_total(pid, chapters)
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
@@ -1535,7 +1538,17 @@ def _resolve_items(pid: str, cfg: Config, req: TranslateRequest) -> list[tuple[i
 @app.post("/api/projects/{pid}/translate")
 async def start_translation(pid: str, req: TranslateRequest) -> dict:
     _, cfg = project_cfg(pid)
-    get_chapters(pid, cfg)  # establish offline state up front (the indices path skips it)
+    # Re-fetch the live source at the moment a translation is requested, so an edited
+    # Google Doc is translated AS EDITED instead of a stale cached/snapshot copy. Without
+    # this, get_chapters returns the in-memory _chapter_cache captured when the project
+    # was first opened, so fixing the Korean in the doc and re-translating produced the
+    # SAME OLD English (the source the model saw never changed, and its content_hash never
+    # moved, so the done-guard also kept skipping it). Refreshing here updates the cache
+    # AND the on-disk snapshot before BOTH _resolve_items (the done-guard) and the worker
+    # read it, so a changed chapter re-translates and an unchanged one still short-circuits.
+    # Run off the event loop: the fetch is blocking network I/O. Falls back to the local
+    # snapshot + offline flag (below) if the doc genuinely can't be fetched here.
+    await run_in_threadpool(get_chapters, pid, cfg, True)
     if pid in _offline_projects:
         raise HTTPException(409, "This novel is in read-only saved mode — its source "
                             "document isn't available on this device, so it can't be "
