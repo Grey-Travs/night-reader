@@ -227,6 +227,26 @@ def _safe_read(path: Path) -> str | None:
         return None
 
 
+# The audit copy embeds the translated prose under this fixed heading (see
+# pipeline.write_audit). It's the only place a needs-review chapter's translation is
+# saved, so it's how the app recovers that prose for display and for Accept.
+_AUDIT_TRANSLATION_MARK = "## Translation (English)"
+
+
+def read_audit_translation(audit_dir: Path, index: int, total: int) -> str | None:
+    """Recover a chapter's translated prose from its audit copy.
+
+    A needs-review chapter is written ONLY to audit/ (never chapters/), so without this
+    its finished translation is invisible in the app and un-acceptable. The audit is a
+    fixed-format doc — source, then the translation under a known heading — so the prose is
+    everything after that heading."""
+    text = _safe_read(audit_dir / chapter_filename(index, total))
+    if not text or _AUDIT_TRANSLATION_MARK not in text:
+        return None
+    prose = text.rsplit(_AUDIT_TRANSLATION_MARK, 1)[-1].strip()
+    return prose or None
+
+
 def _output_total(pid: str, chapters: list[Chapter]) -> int:
     """The chapter count whose zero-padding reproduces the chapter-NN.md files on
     disk. Online/cached novels carry the full list, so this is just len(chapters).
@@ -774,6 +794,10 @@ def chapter_detail(pid: str, index: int) -> dict:
         raise HTTPException(404, f"chapter {index} not found")
     out_path = cfg.paths.output_dir / chapter_filename(index, total)
     translation = _safe_read(out_path) if out_path.exists() else None
+    if translation is None:
+        # A needs-review chapter's translation lives only in audit/ — surface it so the
+        # chapter is readable and reviewable instead of appearing untranslated.
+        translation = read_audit_translation(cfg.paths.audit_dir, index, total)
     rec = State.load(cfg.paths.state_file).get(index) or {}
     clean_source, number = strip_source_header(ch.text)  # drop export header, pull chapter no.
     return {
@@ -995,12 +1019,23 @@ async def resolve_chapter(pid: str, index: int) -> dict:
 @app.post("/api/projects/{pid}/chapters/{index}/accept")
 def accept_chapter(pid: str, index: int) -> dict:
     """Mark a flagged chapter as fine (user override) — clears the failures and sets it
-    validated WITHOUT changing the translation. For false positives."""
+    validated, keeping the existing translation. For false positives (e.g. the
+    paragraph-count check tripping on chat/SNS-format chapters)."""
     _, cfg = project_cfg(pid)
     chapters = get_chapters(pid, cfg)
+    total = _output_total(pid, chapters)
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
+    out_path = cfg.paths.output_dir / chapter_filename(index, total)
+    if not out_path.exists():
+        # An original needs-review chapter was written ONLY to audit/, never chapters/.
+        # Accepting must MATERIALIZE its translation into chapters/, or it would become a
+        # validated-but-empty chapter (the reader/search/export would still show nothing).
+        prose = read_audit_translation(cfg.paths.audit_dir, index, total)
+        if not prose:
+            raise HTTPException(409, "No saved translation to accept — re-translate this chapter first.")
+        write_chapter_file(cfg.paths.output_dir, index, total, prose)
     state = State.load(cfg.paths.state_file)
     state.update(index, status=state_mod.STATUS_VALIDATED, title=ch.title,
                  source_hash=ch.metrics.content_hash, failures=[], manual_edit=True)
