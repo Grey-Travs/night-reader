@@ -1,5 +1,20 @@
+import { useEffect, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { ProgressBar, StatCard } from '../components/ui'
+
+// Live countdown to a target epoch-seconds timestamp, e.g. "in 42:10".
+function Countdown({ until }) {
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
+  const left = Math.max(0, Math.floor(until * 1000 - now) / 1000)
+  if (left <= 0) return <>any moment now…</>
+  const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), s = Math.floor(left % 60)
+  const pad = (n) => String(n).padStart(2, '0')
+  return <>in {h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`}</>
+}
 
 // Per-novel monitoring: the live translation console, progress, pause/auto-resume
 // state and the headline stats. The job state itself lives in ProjectLayout, so this
@@ -7,7 +22,7 @@ import { ProgressBar, StatCard } from '../components/ui'
 export default function ProjectActivityPage() {
   const {
     data, counts, koreanTotal, done,
-    running, log, paused, queue, totalQueued, cancelQueue, resumeJob,
+    running, submitting, log, paused, waiting, queue, totalQueued, cancelQueue, resumeJob,
   } = useOutletContext()
 
   return (
@@ -17,7 +32,7 @@ export default function ProjectActivityPage() {
         <div className="mb-5 flex flex-wrap items-center justify-between gap-2 rounded-card border border-line p-3 text-sm" style={{ background: 'var(--b-translating-bg)', color: 'var(--b-translating-tx)' }}>
           <span className="flex items-center gap-2">
             <span className="inline-block h-2 w-2 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />
-            {queue.current != null ? <>Translating <strong>chapter {queue.current}</strong></> : 'Queued'}
+            {waiting ? 'Waiting for Claude to refresh' : queue.current != null ? <>Translating <strong>chapter {queue.current}</strong></> : 'Queued'}
             {queue.pending.length > 0 && ` · ${queue.pending.length} waiting in queue`}
           </span>
           {queue.pending.length > 0 && (
@@ -27,6 +42,20 @@ export default function ProjectActivityPage() {
       ) : !running && (
         <div className="mb-5 rounded-card border border-line p-4 text-sm text-muted" style={{ background: 'var(--surface)' }}>
           Nothing translating right now. Start a translation from the <strong>Chapters</strong> tab and progress shows here live.
+        </div>
+      )}
+
+      {waiting && (
+        <div className="mb-5 flex flex-col gap-2 rounded-card border border-line p-3 text-sm sm:flex-row sm:items-center sm:justify-between" style={{ background: 'var(--b-queued-bg)', color: 'var(--b-queued-tx)' }}>
+          <span className="flex items-center gap-2">
+            <span className="inline-block h-2 w-2 shrink-0 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />
+            <span>
+              Waiting for Claude to refresh — resuming automatically{' '}
+              {waiting.resume_at ? <>around <strong>{new Date(waiting.resume_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong> (<Countdown until={waiting.resume_at} />)</> : 'soon'}
+              . Progress is saved — you can close this tab.
+            </span>
+          </span>
+          <button onClick={() => resumeJob()} disabled={submitting} className="btn btn-ghost shrink-0 px-3 py-1.5 text-xs">Resume now</button>
         </div>
       )}
 

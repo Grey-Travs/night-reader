@@ -70,6 +70,23 @@ If you find nothing, output [].
 """
 
 
+TERM_CLASSIFY_PROMPT = """\
+You maintain a glossary for a web-novel translation. You are given a list of English
+words/phrases from the novel, one per line, in no particular order. Classify EACH one:
+- "name"  — a person/character (or being treated like one)
+- "place" — a location: city, kingdom, dungeon, building, region, world
+- "skill" — an ability, technique, spell, or class
+- "term"  — other in-world terminology: items, ranks, factions, systems, races
+- "other" — anything that fits none of the above
+
+Web-novel context matters: single capitalized fantasy words are usually character names;
+"X Citadel"/"X Forest" style phrases are places; lowercase phrases are usually terms.
+
+Output ONLY a JSON array with one object per input line, spelling kept EXACTLY as given:
+[{"english": "...", "type": "name|place|skill|term|other"}]
+"""
+
+
 def build_system_prompt(
     glossary_block: str,
     *,

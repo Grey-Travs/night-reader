@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import re
+import time
 import uuid
 import zipfile
 from collections import Counter, defaultdict, deque
@@ -1377,6 +1378,50 @@ async def learn_glossary(pid: str) -> dict:
     return {"learned": added, "from_chapters": len(english_chs), **_locked_payload(g)}
 
 
+class GlossaryBulkAdd(BaseModel):
+    text: str = ""  # comma/newline-separated English subjects, in any order
+
+
+@app.post("/api/projects/{pid}/glossary/bulk-add")
+async def bulk_add_glossary(pid: str, body: GlossaryBulkAdd) -> dict:
+    """Add a pasted list of English names/places/terms, auto-classifying each one.
+    Entries land as English-only canonical spellings (like "Learn names"), so new
+    translations keep them consistent; types stay editable in the table."""
+    _, cfg = project_cfg(pid)
+    seen: set[str] = set()
+    items: list[str] = []
+    for raw in re.split(r"[,\n;]", body.text):
+        term = raw.strip()
+        if term and term.lower() not in seen:
+            seen.add(term.lower())
+            items.append(term)
+    if not items:
+        raise HTTPException(400, "Nothing to add — paste terms separated by commas.")
+
+    g = Glossary.load(cfg.paths.glossary_json)
+    existing = {e.english.lower() for e in g.entries() if e.english}
+    new_items = [t for t in items if t.lower() not in existing]
+    skipped = [t for t in items if t.lower() in existing]
+    if not new_items:
+        return {**_locked_payload(g), "added": [], "skipped": skipped}
+
+    translator = Translator(cfg.anthropic, cfg.translation)
+    try:
+        types = await run_in_threadpool(translator.classify_terms, new_items)
+    except RateLimitedError as exc:
+        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
+    except TranslatorError as exc:
+        raise HTTPException(502, f"Couldn't classify the terms: {exc}")
+
+    added = []
+    for term in new_items:
+        typ = types.get(term.lower(), "other")
+        g.add(GlossaryEntry(korean="", english=term, type=typ))
+        added.append({"english": term, "type": typ})
+    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return {**_locked_payload(g), "added": added, "skipped": skipped}
+
+
 @app.get("/api/projects/{pid}/glossary/export")
 def export_glossary(pid: str, format: str = "csv") -> Response:
     project, cfg = project_cfg(pid)
@@ -1417,6 +1462,10 @@ class Job:
         self.done = False
         self.cancelled = False
         self.terminal: dict | None = None      # final event, replayable for late consumers
+        # Set while the worker sleeps out a rate limit, waiting for the plan's usage
+        # window to refresh: {resume_at, resets_at, message, since}. None otherwise.
+        self.waiting: dict | None = None
+        self.wake = asyncio.Event()            # cancel/resume-now interrupts the sleep
 
     def enqueue(self, items: list[tuple[int, bool]]) -> list[int]:
         """Append (index, force) pairs, skipping ones already queued/in-flight."""
@@ -1430,7 +1479,8 @@ class Job:
         return added
 
     def queue_state(self) -> dict:
-        return {"current": self.current, "pending": [i for i, _ in self.pending]}
+        return {"current": self.current, "pending": [i for i, _ in self.pending],
+                "waiting": self.waiting}
 
     def publish(self, ev: dict) -> None:
         """Fan an event out to every connected stream and remember it for replay.
@@ -1465,6 +1515,27 @@ def _persist_chapter_state(state: State, path: Path, idx: int) -> State:
     return fresh
 
 
+# Rate-limit waiting policy: how the worker rides out an exhausted usage window.
+_RATE_LIMIT_BUFFER = 60          # sec past resets_at before retrying (clock skew slack)
+_FALLBACK_WAIT = 5 * 60          # first retry when the SDK gave no resets_at
+_FALLBACK_WAIT_MAX = 60 * 60     # backoff cap for unknown reset times
+_MAX_WAIT = 12 * 3600            # sanity cap: distrust reset times further out than this
+_MAX_STRIKES = 6                 # consecutive rate-limited retries before giving up
+
+
+async def _sleep_until(job: Job, when: float) -> None:
+    """Sleep until ``when`` (epoch sec), waking early if the job is cancelled,
+    resume-now is clicked (job.wake), or the queue empties. Chunked so a laptop
+    sleeping through the deadline or a cleared queue is noticed within a minute."""
+    job.wake.clear()
+    while time.time() < when and job.pending and not job.cancelled:
+        try:
+            await asyncio.wait_for(job.wake.wait(), timeout=min(when - time.time(), 60))
+            return  # woken explicitly
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _run_worker(job: Job, cfg: Config) -> None:
     chapters = get_chapters(job.pid, cfg)
     total = _output_total(job.pid, chapters)  # match the on-disk chapter-NN.md pad width
@@ -1473,8 +1544,10 @@ async def _run_worker(job: Job, cfg: Config) -> None:
     state = State.load(cfg.paths.state_file)
     translator = Translator(cfg.anthropic, cfg.translation, canonical_names=glossary.canonical())
 
-    # Drain the queue. The only await is run_in_threadpool, so an enqueue arriving
-    # mid-flight is always observed on the next loop iteration (no lost work).
+    # Drain the queue. The awaits are run_in_threadpool and the rate-limit sleep, so
+    # an enqueue arriving mid-flight is always observed on a later iteration (no lost
+    # work — start_translation keeps appending to this job while it waits).
+    strikes = 0  # consecutive rate-limit hits; any completed chapter resets it
     while job.pending and not job.cancelled:
         idx, force = job.pending.popleft()
         job.current = idx
@@ -1508,16 +1581,39 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             if not already_done:
                 state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
                 state = _persist_chapter_state(state, cfg.paths.state_file, idx)
-            # Everything not yet finished (this chapter + the rest of the queue), so
-            # the client can resume exactly what's left.
-            remaining = [idx] + [i for i, _ in job.pending]
+            # Put the interrupted chapter back at the head (it stays in job.queued)
+            # and ride out the limit HERE — the worker stays alive and resumes by
+            # itself when the plan's window refreshes, no browser needed.
+            job.pending.appendleft((idx, force))
             job.current = None
-            job.done = True
-            job.publish({"type": "paused", "index": idx, "message": str(exc),
-                         "resets_at": getattr(getattr(exc, "info", None), "resets_at", None),
-                         "current": None, "pending": remaining})
-            return
+            strikes += 1
+            resets_at = getattr(getattr(exc, "info", None), "resets_at", None)
+            if strikes >= _MAX_STRIKES:
+                # Something is off (limit hit right back N times in a row) — stop
+                # burning retries and hand resumption to the user/client instead.
+                remaining = [i for i, _ in job.pending]
+                job.done = True
+                job.publish({"type": "paused", "index": idx, "message": str(exc),
+                             "resets_at": resets_at,
+                             "current": None, "pending": remaining})
+                return
+            now = time.time()
+            if resets_at and now < resets_at <= now + _MAX_WAIT:
+                resume_at = resets_at + _RATE_LIMIT_BUFFER
+            else:  # no/stale reset time (e.g. bare 429): retry on a backoff instead
+                resume_at = now + min(_FALLBACK_WAIT * (2 ** (strikes - 1)), _FALLBACK_WAIT_MAX)
+            job.waiting = {"resume_at": resume_at, "resets_at": resets_at,
+                           "message": str(exc), "since": now}
+            job.publish({"type": "waiting", "index": idx, "message": str(exc),
+                         "resets_at": resets_at, "resume_at": resume_at})
+            await _sleep_until(job, resume_at)
+            job.waiting = None
+            if job.cancelled or not job.pending:
+                break  # cancelled/cleared during the wait → normal terminal 'done'
+            job.publish({"type": "resumed"})
+            continue
         except Exception as exc:  # isolation: one bad chapter never kills the queue
+            strikes = 0  # Claude answered (badly) — the rate limit isn't the problem
             state.update(idx, status=state_mod.STATUS_FAILED, title=ch.title,
                          error=f"{type(exc).__name__}: {exc}")
             state = _persist_chapter_state(state, cfg.paths.state_file, idx)
@@ -1526,6 +1622,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             job.publish({"type": "chapter", "index": idx, "status": "failed",
                          "title": ch.title, "error": str(exc)})
             continue
+        strikes = 0
         state = _persist_chapter_state(state, cfg.paths.state_file, idx)
         rec = state.get(idx) or {}
         job.queued.discard(idx)
@@ -1614,8 +1711,20 @@ def cancel_queue(pid: str) -> dict:
         job = _jobs[jid]
         job.pending.clear()
         job.queued = {job.current} if job.current is not None else set()
+        job.wake.set()  # a worker waiting out a rate limit exits promptly
         return {"ok": True, "current": job.current, "pending": []}
     return {"ok": True, "current": None, "pending": []}
+
+
+@app.post("/api/projects/{pid}/translate/resume")
+def resume_translation(pid: str) -> dict:
+    """Wake a worker that is waiting out a rate limit and retry immediately."""
+    require_project(pid)
+    jid = _active_job_by_project.get(pid)
+    if jid and jid in _jobs and not _jobs[jid].done and _jobs[jid].waiting:
+        _jobs[jid].wake.set()
+        return {"ok": True, "resumed": True, **_jobs[jid].queue_state()}
+    return {"ok": True, "resumed": False}
 
 
 @app.get("/api/queue")

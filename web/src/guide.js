@@ -44,7 +44,7 @@ export const STEPS = [
       'Click a novel to open it, then click the big “Translate all remaining” button.',
       'Or tick the boxes next to a few chapters and click “Translate selected”.',
       'A “queue” shows what’s translating now and what’s waiting. You can keep adding more while it runs.',
-      'This uses your Claude plan. If the plan hits its limit it pauses and picks back up later.',
+      'This uses your Claude plan. If the plan hits its limit, the queue waits for Claude to refresh and continues by itself — even if you close the browser.',
     ],
   },
   {
@@ -55,6 +55,7 @@ export const STEPS = [
       'Open a novel and click “Glossary” at the top.',
       'New names the app finds appear under “New terms to review” — approve or fix them.',
       'If some chapters are already in English, click “Learn names” to copy those spellings in automatically.',
+      'Already know the names? Click “Bulk add” and paste them separated by commas — the app works out which are people, places, or terms.',
       'A name showing “— EN” is an English spelling to match (its Korean isn’t known yet — that fills in as you translate).',
     ],
   },
@@ -115,8 +116,8 @@ export const TERMS = [
 export const FAQ = [
   ['It says “method not allowed”, or a new button doesn’t work',
    'Close the app window and run start.bat again, then refresh the page (Ctrl+Shift+R). New features need the app restarted.'],
-  ['Translation “paused”',
-   'Your Claude plan reached its limit for now. Your progress is saved — it resumes automatically later, or click “Resume now”.'],
+  ['Translation is “waiting for Claude to refresh”',
+   'Your Claude plan reached its limit for now. The app keeps the queue and continues automatically the moment the plan resets — you can close the tab. Or click “Resume now” to try right away.'],
   ['A “Google not connected” message',
    'Click “Setup” at the top and connect Google (read-only access to your own documents).'],
   ['I see odd AI notes inside a chapter',
@@ -124,4 +125,4 @@ export const FAQ = [
 ]
 
 export const COST_NOTE =
-  'These use your Claude plan: Translate, Learn names, and Deep check. Reading, copying, searching, and exporting are free.'
+  'These use your Claude plan: Translate, Learn names, Bulk add, and Deep check. Reading, copying, searching, and exporting are free.'

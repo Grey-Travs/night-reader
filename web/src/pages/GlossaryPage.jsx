@@ -67,6 +67,10 @@ export default function GlossaryPage() {
   const [editOrig, setEditOrig] = useState({ korean: '', english: '' })
   const [adding, setAdding] = useState(false)
   const [newTerm, setNewTerm] = useState(BLANK)
+  const [bulkOpen, setBulkOpen] = useState(false)
+  const [bulkText, setBulkText] = useState('')
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const [bulkMsg, setBulkMsg] = useState(null)
   const [query, setQuery] = useState('')
   const [affected, setAffected] = useState(null)
   const [learning, setLearning] = useState(false)
@@ -161,6 +165,23 @@ export default function GlossaryPage() {
       setLearnMsg(`Found ${d.learned} new name${d.learned === 1 ? '' : 's'} from ${d.from_chapters} English chapter${d.from_chapters === 1 ? '' : 's'}.`)
     } catch (e) { setError(String(e.message || e)) }
     finally { setLearning(false) }
+  }
+
+  async function bulkAdd() {
+    if (!bulkText.trim()) return
+    setBulkBusy(true); setError(null); setBulkMsg(null)
+    try {
+      const d = await api.bulkAddGlossary(pid, bulkText)
+      setData((cur) => cur && { ...cur, locked: d.locked })
+      const byType = {}
+      for (const a of d.added || []) byType[a.type] = (byType[a.type] || 0) + 1
+      const parts = Object.entries(byType).map(([t, n]) => `${n} ${t}${n === 1 ? '' : 's'}`)
+      setBulkMsg(`Added ${(d.added || []).length}${parts.length ? ` (${parts.join(', ')})` : ''}` +
+        `${d.skipped?.length ? ` · ${d.skipped.length} already in glossary` : ''}.`)
+      setBulkText('')
+      setBulkOpen(false)
+    } catch (e) { setError(String(e.message || e)) }
+    finally { setBulkBusy(false) }
   }
 
   async function onImportFile(e) {
@@ -282,6 +303,9 @@ export default function GlossaryPage() {
               <button onClick={copyFromNovel} disabled={!copyFrom || busy} className="btn btn-ghost px-2.5 py-1.5 text-xs">Copy</button>
             </span>
           )}
+          <button onClick={() => { setBulkOpen((v) => !v); setBulkMsg(null) }} disabled={busy || bulkBusy} className="btn btn-ghost px-3 py-1.5 text-xs" title="Paste a comma-separated list of English names/places/terms — types are detected automatically">
+            {bulkOpen ? 'Cancel' : 'Bulk add'}
+          </button>
           <button onClick={() => { setAdding((v) => !v); setNewTerm(BLANK) }} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs">
             {adding ? 'Cancel' : '＋ Add term'}
           </button>
@@ -289,6 +313,30 @@ export default function GlossaryPage() {
       </div>
 
       {copyMsg && <div className="mb-2 text-xs text-muted">{copyMsg}</div>}
+      {bulkMsg && <div className="mb-2 text-xs text-muted">{bulkMsg}</div>}
+
+      {bulkOpen && (
+        <div className="mb-3 rounded-card border border-line p-3">
+          <div className="mb-2 text-sm text-muted">
+            Paste English names, places, and terms separated by commas — in any order. The type of each
+            one is detected automatically (and stays editable in the table below). Uses your Claude plan.
+          </div>
+          <textarea
+            value={bulkText}
+            onChange={(e) => setBulkText(e.target.value)}
+            placeholder="Kael, Ironhold Citadel, mana core, Sera, …"
+            rows={3}
+            className="input w-full !py-1.5"
+            disabled={bulkBusy}
+          />
+          <div className="mt-2 flex gap-2">
+            <button onClick={bulkAdd} disabled={bulkBusy || !bulkText.trim()} className="btn btn-primary px-3 py-1 text-xs">
+              {bulkBusy ? 'Detecting types…' : 'Add all'}
+            </button>
+            <button onClick={() => { setBulkOpen(false); setBulkText('') }} disabled={bulkBusy} className="btn btn-ghost px-3 py-1 text-xs">Cancel</button>
+          </div>
+        </div>
+      )}
 
       {adding && (
         <div className="mb-3 rounded-card border border-line p-3">

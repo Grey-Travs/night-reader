@@ -35,8 +35,14 @@ from claude_agent_sdk import (
 
 from .config import AnthropicConfig, TranslationConfig
 from .docs_extract import Chapter
-from .glossary import GlossaryEntry, format_injection, format_names
-from .prompts import META_SCAN_PROMPT, NAME_EXTRACTION_PROMPT, NEW_TERMS_DELIMITER, build_system_prompt
+from .glossary import VALID_TYPES, GlossaryEntry, format_injection, format_names
+from .prompts import (
+    META_SCAN_PROMPT,
+    NAME_EXTRACTION_PROMPT,
+    NEW_TERMS_DELIMITER,
+    TERM_CLASSIFY_PROMPT,
+    build_system_prompt,
+)
 from .sanitize import remove_korean_echoes, strip_reasoning
 
 _VALID_EFFORT = {"low", "medium", "high", "xhigh", "max"}
@@ -220,6 +226,7 @@ class Translator:
         usage: dict = {}
         cost = 0.0
         rate_limited = None
+        last_info = None  # latest rate-limit info seen, even non-rejected warnings
         got_result = False
         async for msg in query(prompt=user_text, options=self._options(system_text, max_turns)):
             if isinstance(msg, AssistantMessage):
@@ -228,6 +235,7 @@ class Translator:
                         texts.append(block.text)
             elif isinstance(msg, RateLimitEvent):
                 info = msg.rate_limit_info
+                last_info = info
                 if getattr(info, "status", None) == "rejected":
                     rate_limited = info
             elif isinstance(msg, ResultMessage):
@@ -238,9 +246,13 @@ class Translator:
                     detail = msg.api_error_status or msg.errors or msg.subtype
                     # A 429 is a rate limit — treat it like the rejected RateLimitEvent
                     # so it pauses/resumes gracefully instead of surfacing a raw error.
+                    # The SDK often emits a warning RateLimitEvent (with resets_at)
+                    # before the hard 429, so reuse its reset time when we have one.
                     if str(getattr(msg, "api_error_status", "")) == "429" or "429" in str(detail) \
                             or "rate limit" in str(detail).lower():
-                        raise RateLimitedError(SimpleNamespace(rate_limit_type="rate_limit", resets_at=None))
+                        raise RateLimitedError(SimpleNamespace(
+                            rate_limit_type="rate_limit",
+                            resets_at=getattr(last_info, "resets_at", None)))
                     raise TranslatorError(f"agent error: {detail}")
         if rate_limited is not None:
             raise RateLimitedError(rate_limited)
@@ -363,4 +375,26 @@ class Translator:
                     "type": str(d.get("type", "name")).strip().lower(),
                     "note": str(d.get("note", "")).strip(),
                 })
+        return out
+
+    def classify_terms(self, terms: list[str]) -> dict[str, str]:
+        """Classify user-supplied English subjects as name/place/skill/term/other.
+        Returns ``{english_lowercased: type}``; items the model omits or mislabels
+        simply won't appear (callers default those to "other")."""
+        items = [t.strip() for t in terms if t.strip()]
+        if not items:
+            return {}
+        text, _u, _c = self._call(TERM_CLASSIFY_PROMPT, "Classify these:\n\n" + "\n".join(items), max_turns=8)
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            return {}
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+        out: dict[str, str] = {}
+        for d in data if isinstance(data, list) else []:
+            if isinstance(d, dict) and str(d.get("english", "")).strip():
+                typ = str(d.get("type", "")).strip().lower()
+                out[str(d["english"]).strip().lower()] = typ if typ in VALID_TYPES else "other"
         return out

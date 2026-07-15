@@ -34,6 +34,8 @@ export default function ProjectLayout() {
   const [submitting, setSubmitting] = useState(false)
   const [log, setLog] = useState([])
   const [paused, setPaused] = useState(null) // { message, resets_at, pending } | null
+  // Server-side wait: the worker is riding out a rate limit and resumes by itself.
+  const [waiting, setWaiting] = useState(null) // { resume_at, resets_at, message, since } | null
   const [queue, setQueue] = useState({ current: null, pending: [] })
   const esRef = useRef(null)
   const jobIdRef = useRef(null)
@@ -72,13 +74,14 @@ export default function ProjectLayout() {
   // restore its pause banner into the novel now being viewed.
   useEffect(() => {
     let alive = true
-    setData(null); setLog([]); setPaused(null); setQueue({ current: null, pending: [] }); setRunning(false); setGlossary([])
+    setData(null); setLog([]); setPaused(null); setWaiting(null); setQueue({ current: null, pending: [] }); setRunning(false); setGlossary([])
     load(); loadPending()
     api.activeJob(pid).then((j) => {
       if (!alive) return
       if (j.job_id) {
         setRunning(true)
         setQueue({ current: j.current ?? null, pending: j.pending || [] })
+        setWaiting(j.waiting ?? null)
         attachStream(j.job_id)
       } else restorePause()
     }).catch(() => { if (alive) restorePause() })
@@ -110,7 +113,13 @@ export default function ProjectLayout() {
     if (ms <= 0 || ms > 6 * 3600 * 1000) return
     resumeRef.current = setTimeout(() => resumeJobRef.current?.(), ms)
   }
-  function resumeJob() {
+  async function resumeJob() {
+    // A live worker waiting out a rate limit just needs a wake-up; the queue is
+    // still intact server-side. The re-enqueue path below is only for the case
+    // where no job survives (e.g. the server restarted mid-pause).
+    if (waiting && jobIdRef.current) {
+      try { await api.resumeNow(pid); return } catch { /* fall through to re-enqueue */ }
+    }
     const pend = (paused?.pending && paused.pending.length ? paused.pending : getPausedJob(pid)?.pending) || []
     clearResumeTimer()
     clearPausedJob(pid)
@@ -127,6 +136,7 @@ export default function ProjectLayout() {
       let e
       try { e = JSON.parse(ev.data) } catch { return }  // ignore a malformed/keep-alive frame
       if ('pending' in e) setQueue({ current: e.current ?? null, pending: e.pending || [] })
+      if ('waiting' in e) setWaiting(e.waiting ?? null)
       if (e.type === 'start') {
         setRowStatus(e.index, 'translating')
         setLog((l) => [...l, `Translating chapter ${e.index}…`])
@@ -135,6 +145,17 @@ export default function ProjectLayout() {
         setLog((l) => [...l, `Chapter ${e.index}: ${e.skipped ? 'already done' : e.status}`])
       } else if (e.type === 'queued') {
         setLog((l) => [...l, `Queued ${(e.added || []).length} chapter${(e.added || []).length === 1 ? '' : 's'}`])
+      } else if (e.type === 'waiting') {
+        // The SERVER is riding this out and will resume by itself — keep the
+        // stream open and `running` true; no client timer. localStorage is kept
+        // in sync only as a fallback for a server restart mid-wait.
+        const when = e.resume_at ? new Date(e.resume_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'soon'
+        setLog((l) => [...l, `Rate limit reached — waiting for Claude to refresh (resumes ~${when})`])
+        notify('Waiting for Claude to refresh', 'Translation will resume automatically.')
+        setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: e.pending || [] })
+      } else if (e.type === 'resumed') {
+        setLog((l) => [...l, 'Claude refreshed — resuming…'])
+        clearPausedJob(pid)
       } else if (e.type === 'paused') {
         const pend = e.pending || []
         setPaused({ message: e.message, resets_at: e.resets_at, pending: pend })
@@ -198,6 +219,7 @@ export default function ProjectLayout() {
     esRef.current = null
     jobIdRef.current = null
     setRunning(false)
+    setWaiting(null)
     setQueue({ current: null, pending: [] })
     load()
     loadPending()
@@ -209,6 +231,7 @@ export default function ProjectLayout() {
     clearResumeTimer()
     clearPausedJob(pid)
     setPaused(null)
+    setWaiting(null)
     try {
       const r = await api.cancelQueue(pid)
       setQueue({ current: r.current ?? null, pending: r.pending || [] })
@@ -237,7 +260,7 @@ export default function ProjectLayout() {
     pid, status, data, loading, error, reload: load, loadPending, pendingCount, glossary,
     setRowStatus, setProjectMeta,
     chapters, offline, counts, koreanTotal, done, remaining,
-    running, submitting, log, paused, queue, totalQueued, enqueue, cancelQueue, resumeJob,
+    running, submitting, log, paused, waiting, queue, totalQueued, enqueue, cancelQueue, resumeJob,
   }
 
   return (

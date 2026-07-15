@@ -12,7 +12,7 @@ const isSelectable = (ch) => ch.language === 'korean' && SELECTABLE.includes(ch.
 export default function ChaptersPage() {
   const {
     pid, data, loading, chapters, offline, counts, done, remaining,
-    running, submitting, queue, totalQueued, enqueue, cancelQueue,
+    running, submitting, waiting, queue, totalQueued, enqueue, cancelQueue,
   } = useOutletContext()
   const navigate = useNavigate()
   const openReader = (index) => navigate(`/novel/${pid}/chapter/${index}`)
@@ -153,7 +153,7 @@ export default function ChaptersPage() {
         <div className="mb-5 flex flex-wrap items-center justify-between gap-2 rounded-card border border-line p-3 text-sm" style={{ background: 'var(--b-translating-bg)', color: 'var(--b-translating-tx)' }}>
           <span className="flex items-center gap-2">
             <span className="inline-block h-2 w-2 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />
-            {queue.current != null ? <>Translating <strong>chapter {queue.current}</strong></> : 'Queued'}
+            {waiting ? 'Waiting for Claude to refresh' : queue.current != null ? <>Translating <strong>chapter {queue.current}</strong></> : 'Queued'}
             {queue.pending.length > 0 && ` · ${queue.pending.length} waiting`}
           </span>
           <span className="flex items-center gap-2">

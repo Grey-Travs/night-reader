@@ -54,7 +54,12 @@ export default function ActivityPage() {
               </div>
               <div className="mt-1 flex items-center gap-2 text-sm text-muted">
                 <span className="inline-block h-2 w-2 shrink-0 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />
-                {j.current != null ? <span>Translating <strong>chapter {j.current}</strong></span> : <span>Queued</span>}
+                {j.waiting ? (
+                  <span>
+                    Waiting for Claude to refresh
+                    {j.waiting.resume_at ? <> · resumes ~{new Date(j.waiting.resume_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</> : ''}
+                  </span>
+                ) : j.current != null ? <span>Translating <strong>chapter {j.current}</strong></span> : <span>Queued</span>}
               </div>
               {j.pending.length > 0 && (
                 <div className="mt-1 text-xs text-hint">waiting: {preview}{j.pending.length > 16 ? ` +${j.pending.length - 16} more` : ''}</div>
