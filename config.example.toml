@@ -2,12 +2,12 @@
 # Copy to config.toml and fill in source_doc_id.
 
 [anthropic]
-model = "claude-opus-4-8"      # API model id. Configurable.
+model = "claude-opus-5"        # API model id: claude-opus-5 (recommended) | claude-sonnet-5 | claude-haiku-4-5
 effort = "high"                # low | medium | high | xhigh | max  (drives consistency/fidelity)
-thinking = true                # adaptive thinking on/off
-# temperature: Opus 4.8/4.7 REMOVED temperature (sending it -> 400). Leave unset for those
-# models. Only set a value if you switch `model` to one that still accepts it (e.g. an
-# older Sonnet/Opus). Uncomment to use:
+thinking = true                # adaptive thinking on/off (Fable 5 ignores "off" — its thinking is always on)
+# temperature: current models (Opus 5, Sonnet 5, Opus 4.8/4.7, Fable 5) REJECT temperature
+# (sending it -> 400). Only set a value if you switch `model` to an older one that still
+# accepts it. Uncomment to use:
 # temperature = 0.3
 max_output_tokens = 32000      # streamed; raise for very long chapters (Opus supports up to 128000)
 web_access = false             # if true, give the model the web_search tool to look up canonical spellings

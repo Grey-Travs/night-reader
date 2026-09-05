@@ -17,7 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from translation_bot.config import ValidationConfig  # noqa: E402
 from translation_bot.docs_extract import Chapter  # noqa: E402
-from translation_bot.validate import validate_translation  # noqa: E402
+from translation_bot.glossary import GlossaryEntry  # noqa: E402
+from translation_bot.validate import (  # noqa: E402
+    _pronoun_conflicts,
+    validate_translation,
+)
 
 CFG = ValidationConfig()
 
@@ -89,6 +93,49 @@ def test_emoticons_do_not_flag_a_chat_chapter():
     res = validate_translation(SOURCE, chat, CFG)
     assert not _korean_failure(res.failures), res.failures
     assert not _meta_failure(res.failures), res.failures
+
+
+# ---- character-gender check -------------------------------------------------
+#
+# Korean omits pronouns, so a chapter translated before a character's pronoun
+# was pinned in the glossary can render them the wrong gender for pages at a
+# time. Nothing else in this module can see that.
+
+_GLOSSARY = [
+    GlossaryEntry(korean="", english="Ollia", type="name", pronoun="he"),
+    GlossaryEntry(korean="", english="Heilon", type="name", pronoun="she"),
+    GlossaryEntry(korean="", english="Cassian", type="name", pronoun="he"),
+]
+
+
+def test_wrong_pronoun_for_male_character_is_flagged():
+    text = ("Racing into a dim alley, Ollia let out everything she had been "
+            "holding down.\n\nOllia scrunched up her face.")
+    assert _pronoun_conflicts(text, _GLOSSARY)
+
+
+def test_correct_pronouns_do_not_flag():
+    text = ("Racing into a dim alley, Ollia let out everything he had been "
+            "holding down.\n\nOllia scrunched up his face.")
+    assert not _pronoun_conflicts(text, _GLOSSARY)
+
+
+def test_female_character_keeps_her_pronouns():
+    text = "Heilon narrowed her brow.\n\nOllia lowered his gaze."
+    assert not _pronoun_conflicts(text, _GLOSSARY)
+
+
+def test_shared_paragraph_is_not_counted():
+    # "her" here belongs to Heilon, not Ollia — a paragraph naming two
+    # characters proves nothing either way.
+    text = "Ollia bowed as Heilon raised her wounded arm."
+    assert not _pronoun_conflicts(text, _GLOSSARY)
+
+
+def test_untagged_glossary_is_a_no_op():
+    assert not _pronoun_conflicts("Ollia scrunched up her face.", None)
+    plain = [GlossaryEntry(korean="", english="Ollia", type="name")]
+    assert not _pronoun_conflicts("Ollia scrunched up her face.", plain)
 
 
 def _run_standalone():

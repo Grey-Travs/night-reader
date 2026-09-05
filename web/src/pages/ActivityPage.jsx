@@ -2,8 +2,12 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 
-// Global translation activity — every novel with a running/queued job, live. Each
-// row links to that novel's own Activity tab (the chapter-by-chapter console).
+// What the worker is doing. Translations, AI resolves and pronoun fixes all share one
+// queue per novel, so each row has to name its operation. Mirrors TASK_LABEL in app.py.
+const TASK_LABEL = { translate: 'Translating', resolve: 'AI resolve on', pronouns: 'Fixing pronouns in' }
+
+// Global activity — every novel with a running/queued job, live. Each row links to that
+// novel's own Activity tab (the chapter-by-chapter console).
 export default function ActivityPage() {
   const navigate = useNavigate()
   const [jobs, setJobs] = useState(null)
@@ -30,14 +34,14 @@ export default function ActivityPage() {
         <h1 className="font-reading text-2xl font-medium">Activity</h1>
         <p className="text-sm text-hint">
           {jobs == null ? 'Loading…'
-            : jobs.length === 0 ? 'Nothing translating right now.'
+            : jobs.length === 0 ? 'Nothing running right now.'
             : `${totalQueued} chapter${totalQueued === 1 ? '' : 's'} across ${jobs.length} novel${jobs.length === 1 ? '' : 's'}.`}
         </p>
       </div>
 
       {jobs != null && jobs.length === 0 && (
         <div className="rounded-card border border-dashed border-line-strong p-10 text-center text-muted">
-          No translations are running. Open a novel and translate some chapters — progress will appear here and on the novel's Activity tab.
+          Nothing is running. Open a novel and translate some chapters, or repair a flagged one — progress appears here and on the novel's Activity tab.
           <div className="mt-4"><Link to="/" className="btn btn-primary px-4 py-2">Go to library</Link></div>
         </div>
       )}
@@ -59,7 +63,9 @@ export default function ActivityPage() {
                     Waiting for Claude to refresh
                     {j.waiting.resume_at ? <> · resumes ~{new Date(j.waiting.resume_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</> : ''}
                   </span>
-                ) : j.current != null ? <span>Translating <strong>chapter {j.current}</strong></span> : <span>Queued</span>}
+                ) : j.current != null
+                  ? <span>{TASK_LABEL[j.kind] || TASK_LABEL.translate} <strong>chapter {j.current}</strong></span>
+                  : <span>Queued</span>}
               </div>
               {j.pending.length > 0 && (
                 <div className="mt-1 text-xs text-hint">waiting: {preview}{j.pending.length > 16 ? ` +${j.pending.length - 16} more` : ''}</div>

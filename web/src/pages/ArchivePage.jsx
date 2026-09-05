@@ -17,6 +17,7 @@ export default function ArchivePage() {
   const [projects, setProjects] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [nameFilter, setNameFilter] = useState('')
 
   async function load() {
     setLoading(true)
@@ -53,6 +54,8 @@ export default function ArchivePage() {
   }
 
   const archived = projects.filter((p) => p.archived)
+  const nf = nameFilter.trim().toLowerCase()
+  const shown = nf ? archived.filter((p) => (p.name || '').toLowerCase().includes(nf)) : archived
 
   return (
     <div className="page">
@@ -68,11 +71,31 @@ export default function ArchivePage() {
           Nothing archived yet. On the <Link to="/" className="text-accent-text hover:underline">library</Link>, use a novel's “📦 Archive” button to move finished novels here.
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {archived.map((p) => (
-            <NovelCard key={p.id} p={p} archived onOpen={open} onToggleArchive={toggleArchive} onRemove={remove} />
-          ))}
-        </div>
+        <>
+          {archived.length > 1 && (
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-sm font-medium text-muted">{archived.length} archived novel{archived.length === 1 ? '' : 's'}</h2>
+              <input
+                value={nameFilter}
+                onChange={(e) => setNameFilter(e.target.value)}
+                placeholder="Search the archive…"
+                aria-label="Search archived novels by name"
+                className="input !py-1 text-xs"
+              />
+            </div>
+          )}
+          {shown.length === 0 ? (
+            <div className="rounded-card border border-dashed border-line-strong p-10 text-center text-muted">
+              No archived novels match “{nameFilter}”.
+            </div>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              {shown.map((p) => (
+                <NovelCard key={p.id} p={p} archived onOpen={open} onToggleArchive={toggleArchive} onRemove={remove} />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   )

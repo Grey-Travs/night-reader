@@ -17,6 +17,8 @@ import ConsistencyPage from './pages/ConsistencyPage'
 import ProjectSettingsPage from './pages/ProjectSettingsPage'
 import ReaderPage from './pages/ReaderPage'
 import ErrorBoundary from './components/ErrorBoundary'
+import { ErrorProvider } from './components/ErrorDialog'
+import UpkeepPage from './pages/UpkeepPage'
 import { HintsContext } from './hints'
 import { ToastProvider } from './toast'
 import { ConfirmProvider } from './confirm'
@@ -64,6 +66,7 @@ export default function App() {
           <Route index element={<LibraryPage />} />
           <Route path="activity" element={<ActivityPage />} />
           <Route path="review" element={<ReviewPage />} />
+          <Route path="upkeep" element={<UpkeepPage />} />
           <Route path="archive" element={<ArchivePage />} />
           <Route path="guide" element={<GuidePage />} />
           <Route path="settings" element={<SettingsPage />} />
@@ -85,7 +88,9 @@ export default function App() {
     <HintsContext.Provider value={hints}>
       <ToastProvider>
         <ConfirmProvider>
-          {body}
+          <ErrorProvider>
+            {body}
+          </ErrorProvider>
         </ConfirmProvider>
       </ToastProvider>
     </HintsContext.Provider>

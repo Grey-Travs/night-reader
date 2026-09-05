@@ -16,6 +16,9 @@ glossary_pending.json
 state.json
 full-novel.md
 
+# Error tracebacks written by the server (breadcrumbs for diagnosing, not source)
+logs/
+
 # Python
 __pycache__/
 *.pyc

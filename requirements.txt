@@ -6,3 +6,6 @@ google-auth-httplib2>=0.2
 pydantic>=2.6
 fastapi>=0.110
 uvicorn[standard]>=0.29
+# Already present transitively via uvicorn/click; declared explicitly because the live
+# translation console uses it to enable ANSI colour in the Windows terminal.
+colorama>=0.4.6

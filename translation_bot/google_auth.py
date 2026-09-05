@@ -7,7 +7,6 @@ is cached to disk and refreshed automatically.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from google.auth.exceptions import GoogleAuthError, RefreshError
@@ -15,6 +14,8 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+from .atomic import atomic_write_text
 
 # Read-only access to Google Docs is all we need — the doc is opened by ID, so no
 # broad Drive permission is required. (Re-add drive.readonly only if you later want
@@ -41,9 +42,7 @@ def _load_token(token_file: Path) -> Credentials | None:
 def _save_token(token_file: Path, creds: Credentials) -> None:
     """Persist credentials atomically (temp file + replace) so a crash mid-write
     can't leave a truncated token that fails to parse next launch."""
-    tmp = token_file.with_suffix(token_file.suffix + ".tmp")
-    tmp.write_text(creds.to_json(), encoding="utf-8")
-    os.replace(tmp, token_file)
+    atomic_write_text(token_file, creds.to_json())
 
 
 def get_credentials(credentials_file: Path, token_file: Path) -> Credentials:

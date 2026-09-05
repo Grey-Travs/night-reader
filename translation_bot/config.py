@@ -13,11 +13,12 @@ from pydantic import BaseModel, Field
 
 
 class AnthropicConfig(BaseModel):
-    model: str = "claude-opus-4-8"
+    model: str = "claude-opus-5"
     effort: str = "high"
     thinking: bool = True
-    # Opus 4.8/4.7 reject `temperature`. Keep it optional; the translator only
-    # forwards it when set AND the model is known to accept it.
+    # Current models (Opus 5, Sonnet 5, Opus 4.8/4.7, Fable 5) reject `temperature`
+    # (400). Keep it optional; the translator only forwards it when set AND the
+    # model is known to accept it.
     temperature: float | None = None
     max_output_tokens: int = 32000
     web_access: bool = False

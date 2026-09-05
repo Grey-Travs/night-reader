@@ -10,20 +10,22 @@ a misclassified name or wrong romanization can't silently propagate everywhere.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .atomic import atomic_write_text
+
 VALID_TYPES = {"name", "place", "skill", "term", "other"}
 
+VALID_PRONOUNS = {"he", "she", "they"}
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text via a temp file + os.replace so a crash can't truncate the target
-    (a half-written glossary.json would otherwise wipe every locked term)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+
+def normalize_pronoun(value: object) -> str:
+    """Reduce a model-proposed pronoun to "he"/"she"/"they", or "" for anything
+    else ("unknown", junk, empty). Only model output goes through this — values a
+    human typed are stored as-is elsewhere."""
+    p = str(value or "").strip().lower()
+    return p if p in VALID_PRONOUNS else ""
 
 
 @dataclass
@@ -90,8 +92,8 @@ class Glossary:
         # inconsistent. Write the source-of-truth JSON last so a failure leaves the
         # previous good JSON intact.
         if md_path is not None:
-            _atomic_write_text(Path(md_path), self.to_markdown())
-        _atomic_write_text(
+            atomic_write_text(Path(md_path), self.to_markdown())
+        atomic_write_text(
             Path(json_path),
             json.dumps([asdict(e) for e in entries], ensure_ascii=False, indent=2),
         )
@@ -217,7 +219,7 @@ def load_pending(path: str | Path) -> list[dict]:
 
 
 def save_pending(path: str | Path, items: list[dict]) -> None:
-    _atomic_write_text(Path(path), json.dumps(items, ensure_ascii=False, indent=2))
+    atomic_write_text(Path(path), json.dumps(items, ensure_ascii=False, indent=2))
 
 
 def queue_new_terms(
@@ -238,6 +240,7 @@ def queue_new_terms(
 
     for raw in new_terms:
         entry = GlossaryEntry.from_dict(raw)
+        entry.pronoun = normalize_pronoun(entry.pronoun)  # model output: drop "unknown"/junk
         if not entry.korean or not entry.english:
             continue
 

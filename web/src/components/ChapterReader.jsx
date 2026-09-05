@@ -17,6 +17,13 @@ const THEME = {
 }
 const FONT = { serif: 'var(--font-reading)', sans: 'var(--font-ui)' }
 
+// Shown in the flagged banner while a repair for this chapter is queued or running.
+const TASK_RUNNING_NOTE = {
+  translate: 'Re-translating this chapter',
+  resolve: 'AI resolve is running on this chapter',
+  pronouns: 'Fixing the pronouns in this chapter',
+}
+
 // --- inline glossary tooltips ------------------------------------------------
 function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
 
@@ -116,7 +123,9 @@ function downloadText(filename, text, type = 'text/markdown') {
   URL.revokeObjectURL(url)
 }
 
-export default function ChapterReader({ pid, index, chapters, glossary = [], onClose, onNavigate, onChanged, onRetranslate, onGuide }) {
+export default function ChapterReader({ pid, index, chapters, glossary = [], onClose, onNavigate,
+                                       onChanged, onRetranslate, onResolve, onFixPronouns,
+                                       taskRunning = false, taskKind = 'translate', onGuide }) {
   const { on: hintsOn } = useHints()
   const [showTip, setShowTip] = useState(true)
   const [data, setData] = useState(null)
@@ -137,6 +146,7 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
   const [prevText, setPrevText] = useState(null)
   const [reverting, setReverting] = useState(false)
   const [resolving, setResolving] = useState(false)
+  const [fixingPronouns, setFixingPronouns] = useState(false)
   const [accepting, setAccepting] = useState(false)
   const scrollerRef = useRef(null)              // the outer scroll container
   const lastSave = useRef(0)                    // throttle scroll-position writes
@@ -200,21 +210,36 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     finally { setReverting(false) }
   }
 
-  // AI resolve: re-translate targeting the chapter's specific failures, then show the
-  // before/after so the user can keep it or revert.
+  // Both repairs are QUEUED on the novel's worker rather than awaited here, so they
+  // show up in Activity, keep streaming if this view is closed, and ride out a rate
+  // limit. `taskRunning` (below) is what tells us the result has landed.
   async function runResolve() {
     setResolving(true); setError(null)
-    try {
-      const r = await api.resolveChapter(pid, index)
-      onChanged?.()
-      load()
-      if (r.has_previous) {
-        try { setPrevText((await api.previousChapter(pid, index)).translation || '') } catch { /* ignore */ }
-        setShowCompare(true)
-      }
-    } catch (e) { setError(String(e.message || e)) }
-    finally { setResolving(false) }
+    try { await onResolve?.(index) } finally { setResolving(false) }
   }
+  async function runFixPronouns() {
+    setFixingPronouns(true); setError(null)
+    try { await onFixPronouns?.(index) } finally { setFixingPronouns(false) }
+  }
+
+  // When the queued repair finishes, reload the chapter and — if a prior version was
+  // kept — drop straight into the before/after so the change can be judged or reverted.
+  // The ref holds WHICH chapter was busy, so navigating away mid-repair doesn't make
+  // the next chapter you open pop into compare view.
+  const wasBusy = useRef(null)
+  useEffect(() => {
+    if (taskRunning) { wasBusy.current = index; return }
+    if (wasBusy.current !== index) return
+    wasBusy.current = null
+    onChanged?.()
+    api.chapter(pid, index).then(async (d) => {
+      setData(d)
+      if (!d.has_previous) return
+      try { setPrevText((await api.previousChapter(pid, index)).translation || '') } catch { /* ignore */ }
+      setShowCompare(true)
+    }).catch(() => load())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskRunning, pid, index])
   async function runAccept() {
     setAccepting(true); setError(null)
     try { await api.acceptChapter(pid, index); onChanged?.(); load() }
@@ -351,6 +376,12 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
 
   const hasTranslation = !!data?.translation
   const failures = data?.failures || []
+  // A mis-gendered character is flagged separately from every other kind of problem,
+  // because it is the one with a cheap targeted repair rather than a re-translation.
+  const hasPronounIssue = (data?.flags || []).includes('pronoun')
+  // Any repair queued for THIS chapter locks the buttons — a second one would just
+  // queue behind the first and act on text the first is about to replace.
+  const busyHere = taskRunning || resolving || fixingPronouns
   const th = THEME[prefs.theme] || THEME.default
   const fontFam = FONT[prefs.font] || FONT.serif
   // Glossary-name highlighting for the rendered translation (toggleable).
@@ -513,7 +544,7 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
         {/* review reasons */}
         {data && data.status === 'needs-review' && !editing && (failures.length > 0 || data.diagnosis?.length > 0) && (
           <div className="mx-auto mb-6 rounded-card border border-line px-4 py-3 text-sm" style={{ maxWidth: '68ch', background: 'var(--b-review-bg)', color: 'var(--b-review-tx)' }}>
-            <div className="font-medium">Flagged for review</div>
+            <div className="font-medium">{hasPronounIssue ? 'Wrong gender' : 'Flagged for review'}</div>
             {data.diagnosis?.length > 0 ? (
               <ul className="mt-1 space-y-1">{data.diagnosis.map((d, i) => <li key={i}>• {d.message}</li>)}</ul>
             ) : (
@@ -525,12 +556,29 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
               </div>
             )}
             <div className="mt-3 flex flex-wrap gap-2">
-              {data.language === 'korean' && !data.offline && (
-                <button onClick={runResolve} disabled={resolving} className="btn btn-primary px-3 py-1.5 text-xs" title="Re-translate this chapter with a correction aimed at the problem, then compare">{resolving ? 'Resolving with AI…' : '✨ AI resolve'}</button>
+              {/* A wrong pronoun has its own repair: the glossary already knows the right
+                  one, so rewriting just the pronouns beats re-translating the chapter and
+                  re-rolling every other decision. When that's the problem it leads. */}
+              {hasPronounIssue && !data.offline && (
+                <button onClick={runFixPronouns} disabled={busyHere} className="btn btn-primary px-3 py-1.5 text-xs"
+                  title="Rewrite only the pronouns of the mis-gendered characters, keeping the rest of the chapter exactly as it is">
+                  {fixingPronouns ? 'Starting…' : '⚥ Fix pronouns'}
+                </button>
               )}
-              <button onClick={runScan} disabled={scanning} className="btn btn-ghost px-3 py-1.5 text-xs" title="Scan for stray text / Korean and auto-fix what's safe">{scanning ? 'Checking…' : 'Scan & fix'}</button>
-              <button onClick={runAccept} disabled={accepting} className="btn btn-ghost px-3 py-1.5 text-xs" title="It's actually fine — clear the flag">{accepting ? '…' : 'Mark as fine'}</button>
+              {data.language === 'korean' && !data.offline && (
+                <button onClick={runResolve} disabled={busyHere} className={`btn ${hasPronounIssue ? 'btn-ghost' : 'btn-primary'} px-3 py-1.5 text-xs`} title="Re-translate this chapter with a correction aimed at the problem, then compare">{resolving ? 'Starting…' : '✨ AI resolve'}</button>
+              )}
+              <button onClick={runScan} disabled={scanning || busyHere} className="btn btn-ghost px-3 py-1.5 text-xs" title="Scan for stray text / Korean and auto-fix what's safe">{scanning ? 'Checking…' : 'Scan & fix'}</button>
+              <button onClick={runAccept} disabled={accepting || busyHere} className="btn btn-ghost px-3 py-1.5 text-xs" title="It's actually fine — clear the flag">{accepting ? '…' : 'Mark as fine'}</button>
             </div>
+            {taskRunning ? (
+              <div className="mt-2 flex items-center gap-2 text-xs">
+                <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full animate-pulse" style={{ background: 'currentColor' }} />
+                {TASK_RUNNING_NOTE[taskKind] || TASK_RUNNING_NOTE.translate} — follow it on the novel's Activity tab. You can close this.
+              </div>
+            ) : (
+              <div className="mt-2 text-xs opacity-80">Fixing uses your Claude plan. The version before the fix is kept, so you can compare and revert.</div>
+            )}
           </div>
         )}
 

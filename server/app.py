@@ -15,17 +15,21 @@ import csv
 import io
 import json
 import re
+import threading
 import time
 import uuid
 import zipfile
 from collections import Counter, defaultdict, deque
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -35,22 +39,45 @@ from translation_bot.docs_extract import (
     Chapter, ChapterMetrics, extract_chapters, fetch_document, hangul_fraction,
 )
 from translation_bot.epub import build_epub
-from translation_bot.glossary import VALID_TYPES, Glossary, GlossaryEntry, load_pending, save_pending
+from translation_bot.glossary import (
+    VALID_TYPES,
+    Glossary,
+    GlossaryEntry,
+    load_pending,
+    normalize_pronoun,
+    save_pending,
+)
 from translation_bot.google_auth import build_docs_service, get_credentials, load_saved_credentials
 from translation_bot.pipeline import (
     chapter_filename,
+    current_translation,
+    fix_pronouns_chapter,
     previous_chapter_path,
     process_chapter,
+    read_audit_translation,
     repair_chapter,
+    stripped_chapter,
     write_chapter_file,
 )
-from translation_bot.sanitize import find_leaks, korean_fraction, remove_snippets, strip_reasoning, strip_source_header
+from translation_bot.sanitize import (
+    find_leaks, korean_fraction, remove_snippets, strip_export_footer, strip_reasoning,
+    strip_source_header,
+)
 from translation_bot.state import State
 from translation_bot.text_source import split_text_into_chapters
-from translation_bot.translator import RateLimitedError, Translator, TranslatorError
+from translation_bot.translator import (
+    RateLimitedError,
+    StreamHooks,
+    TranslationAborted,
+    Translator,
+    TranslatorError,
+)
 from translation_bot.validate import validate_translation
 
+from . import console
+from . import errors
 from . import projects as pj
+from .bulk import MAX_ROWS, MAX_UNTYPED, prepare_bulk_rows, split_flat
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.toml"
@@ -72,6 +99,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Every error leaves through one of these two handlers, so the frontend always receives
+# `detail` as the SAME object shape (see server/errors.Explained) and the terminal gets
+# one compact line instead of an uncaught-500 traceback dump.
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    e = errors.from_http_detail(exc.detail, exc.status_code)
+    return JSONResponse(status_code=exc.status_code, content={"detail": errors.as_dict(e)},
+                        headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    e = errors.explain(exc)
+    errors.log_error(e, where=request.url.path)
+    return JSONResponse(status_code=e.status, content={"detail": errors.as_dict(e)})
+
+
 # Input validation for the settings endpoint (prevents corrupting config.toml).
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _EFFORTS = {"low", "medium", "high", "xhigh", "max"}
@@ -84,6 +129,40 @@ _offline_projects: set[str] = set()
 _jobs: dict[str, "Job"] = {}
 _active_job_by_project: dict[str, str] = {}     # pid -> job_id of the in-flight job
 _running_tasks: set[asyncio.Task] = set()        # strong refs so tasks aren't GC'd
+
+# One lock per state.json. Every writer runs on a THREAD — sync endpoints and
+# run_in_threadpool alike — never on the event loop, so threading.Lock is the right
+# primitive. Keyed by resolved path so the same file always maps to the same lock.
+_state_locks: dict[str, threading.Lock] = {}
+_state_locks_guard = threading.Lock()
+
+
+def _state_lock(path: str | Path) -> threading.Lock:
+    key = str(Path(path).resolve())
+    with _state_locks_guard:
+        return _state_locks.setdefault(key, threading.Lock())
+
+
+@contextmanager
+def mutate_state(path: str | Path):
+    """Load → mutate → save state.json with no other thread interleaving.
+
+    An unguarded load/mutate/save is a read-modify-write race: two threads each read the
+    file, each apply their own change to their own copy, and whichever saves last silently
+    discards the other's work — a chapter the worker just finished, erased because the
+    user pressed Accept on a different one at the same moment. The atomic write alone
+    can't prevent that; it makes each save all-or-nothing, not the pair of them ordered.
+
+    Yields a FRESHLY LOADED State: anything read before the lock was taken is already
+    stale by definition, so mutate what is yielded here, not an older copy.
+
+    Keep the body short — it holds off the translation worker. Do any validating or
+    fetching before entering, not inside.
+    """
+    with _state_lock(path):
+        state = State.load(path)
+        yield state
+        state.save(path)
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -215,7 +294,43 @@ def get_chapters(pid: str, cfg: Config, refresh: bool = False) -> list[Chapter]:
                         raise
                     _chapter_cache[pid] = local
                     _offline_projects.add(pid)
+        _normalize_chapter_padding(pid, len(_chapter_cache[pid]))
     return _chapter_cache[pid]
+
+
+def _normalize_chapter_padding(pid: str, total: int) -> None:
+    """Keep chapter-NN.md filenames at the width the current chapter count implies.
+
+    The pad width is derived from the total (``max(2, len(str(total)))``), so a
+    source doc that grows past a digit boundary — 96 tabs to 100 — silently
+    orphans every existing translation: the app starts looking for
+    ``chapter-001.md`` while the files on disk are still ``chapter-01.md``, and
+    a fully translated novel reads as untranslated over its Korean source.
+    Re-pad on load so the library heals itself instead. Idempotent, and it
+    never overwrites a name that is already taken."""
+    if total <= 0:
+        return
+    width = max(2, len(str(total)))
+    base = pj.PROJECTS_DIR / pid
+    for sub in ("chapters", "previous", "audit"):
+        d = base / sub
+        if not d.is_dir():
+            continue
+        try:
+            stale = list(d.glob("chapter-*.md"))
+        except OSError:
+            continue
+        for f in stale:
+            tail = f.stem.split("-", 1)[-1]
+            if not tail.isdigit() or len(tail) == width:
+                continue
+            dest = d / f"chapter-{int(tail):0{width}d}.md"
+            if dest.exists():
+                continue  # a newer translation already owns the canonical name
+            try:
+                f.rename(dest)
+            except OSError:
+                pass  # never block reading a novel on a rename
 
 
 def _safe_read(path: Path) -> str | None:
@@ -226,26 +341,6 @@ def _safe_read(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-
-
-# The audit copy embeds the translated prose under this fixed heading (see
-# pipeline.write_audit). It's the only place a needs-review chapter's translation is
-# saved, so it's how the app recovers that prose for display and for Accept.
-_AUDIT_TRANSLATION_MARK = "## Translation (English)"
-
-
-def read_audit_translation(audit_dir: Path, index: int, total: int) -> str | None:
-    """Recover a chapter's translated prose from its audit copy.
-
-    A needs-review chapter is written ONLY to audit/ (never chapters/), so without this
-    its finished translation is invisible in the app and un-acceptable. The audit is a
-    fixed-format doc — source, then the translation under a known heading — so the prose is
-    everything after that heading."""
-    text = _safe_read(audit_dir / chapter_filename(index, total))
-    if not text or _AUDIT_TRANSLATION_MARK not in text:
-        return None
-    prose = text.rsplit(_AUDIT_TRANSLATION_MARK, 1)[-1].strip()
-    return prose or None
 
 
 def _output_total(pid: str, chapters: list[Chapter]) -> int:
@@ -298,7 +393,12 @@ def chapter_row(ch: Chapter, cfg: Config, state: State, total: int) -> dict:
         "chars": m.char_count,
         "status": status_val,
         "cost_usd": rec.get("cost_usd", 0.0),
+        # Recorded per chapter by State.add_usage since forever; surfaced in the UI now.
+        "usage": rec.get("usage", {}),
         "failures": rec.get("failures", []),
+        # The KINDS of problem flagged (e.g. ["pronoun"]), so lists can badge and filter
+        # by what is actually wrong instead of re-parsing failure sentences client-side.
+        "flags": failure_flags(rec.get("failures", [])),
         "has_output": (cfg.paths.output_dir / chapter_filename(ch.index, total)).exists(),
     }
 
@@ -420,6 +520,7 @@ def project_summary(project: dict) -> dict:
         "translated": counts.get("validated", 0),
         "needs_review": counts.get("needs-review", 0),
         "cost_usd": state.totals().get("cost_usd", 0.0),
+        "tokens": state.totals().get("tokens", {}),
         "chapter_count": project.get("chapter_count"),
         "source_type": project.get("source_type", "gdoc"),
         # Effective per-novel style (project override, else global default) so the
@@ -446,13 +547,65 @@ def list_projects() -> dict:
 
 
 # --- turning the cryptic validation failures into human guidance + an action ------
+
+# A pronoun failure as validate.py writes it. Chapters validated before the conflict
+# was stored structurally only have this sentence, so parsing it back is what lets the
+# repair work on records already on disk — no state.json migration needed.
+_PRONOUN_FAILURE_RE = re.compile(
+    r"^(?P<name>.+?) is tagged '(?P<expected>he|she|they)' in the glossary "
+    r"but the chapter uses the opposite pronoun (?P<hits>\d+)x$")
+
+# What the chapter wrongly called them, for the plain-English explanation.
+_OPPOSITE_OF = {"he": "she/her", "she": "he/him", "they": "he/him or she/her"}
+
+
+def pronoun_conflicts(rec: dict | None) -> list[dict]:
+    """The mis-gendered characters in a chapter record, as ``{name, expected, hits}``.
+
+    Prefers the structured list written by the validator; falls back to parsing the
+    failure sentences so chapters flagged before that existed are still repairable.
+    """
+    rec = rec or {}
+    stored = rec.get("pronoun_conflicts")
+    if isinstance(stored, list) and stored:
+        return [c for c in stored if isinstance(c, dict) and c.get("name")]
+    out: list[dict] = []
+    for f in rec.get("failures") or []:
+        m = _PRONOUN_FAILURE_RE.match(str(f).strip())
+        if m:
+            out.append({"name": m["name"], "expected": m["expected"],
+                        "hits": int(m["hits"])})
+    return out
+
+
+def glossary_for(cfg: Config, chapter: Chapter) -> list:
+    """The glossary entries the validator should judge this chapter against.
+
+    Matches what the pipeline passes during translation (``relevant_to``), so the
+    scan path reaches the same verdict rather than a stricter or looser one."""
+    try:
+        return Glossary.load(cfg.paths.glossary_json).relevant_to(chapter.text)
+    except Exception:  # noqa: BLE001 — a broken glossary must never 500 a scan
+        return []
+
+
 def diagnose(failures: list[str], metrics: dict | None = None) -> list[dict]:
     """Map each raw validation failure to a plain-language explanation + a suggested
-    action (autofix | ai_resolve | retranslate | accept) the UI can act on."""
+    action (autofix | ai_resolve | fix_pronouns | retranslate | accept) the UI can act on."""
     out: list[dict] = []
     for f in failures or []:
         fl = f.lower()
-        if "leaked" in fl:
+        pron = _PRONOUN_FAILURE_RE.match(str(f).strip())
+        if pron:
+            # Mis-gendering is its own problem with its own repair: the glossary already
+            # knows the right pronoun, so rewriting them beats re-translating the chapter.
+            wrong = _OPPOSITE_OF.get(pron["expected"], "the opposite pronoun")
+            times = int(pron["hits"])
+            out.append({"message": f"{pron['name']} is {pron['expected']} in your glossary, "
+                                   f"but this chapter refers to them as {wrong} "
+                                   f"{times} time{'' if times == 1 else 's'}.",
+                        "kind": "pronoun", "action": "fix_pronouns"})
+        elif "leaked" in fl:
             out.append({"message": "The AI left some of its own notes/reasoning in the text.",
                         "kind": "leak", "action": "autofix"})
         elif "untranslated korean" in fl:
@@ -475,10 +628,31 @@ def diagnose(failures: list[str], metrics: dict | None = None) -> list[dict]:
     return out
 
 
-def _corrective_instruction(failures: list[str]) -> str:
+def failure_flags(failures: list[str]) -> list[str]:
+    """The distinct problem kinds in a failure list, in first-seen order."""
+    seen: list[str] = []
+    for d in diagnose(failures):
+        if d["kind"] not in seen:
+            seen.append(d["kind"])
+    return seen
+
+
+def _corrective_instruction(failures: list[str], conflicts: list[dict] | None = None) -> str:
     """Build a failure-targeted correction to feed the AI re-translation."""
     joined = " ".join(failures or []).lower()
     parts: list[str] = []
+    # Gender first: it is the most common flag, and the one the model cannot recover
+    # from on its own — Korean drops the subject, so without being told outright it
+    # just re-guesses and reproduces the same mistake.
+    for c in conflicts or []:
+        forms = Translator._PRONOUN_FORMS.get(c.get("expected", ""))
+        if not forms or not c.get("name"):
+            continue
+        parts.append(
+            f"GENDER: {c['name']} is {c['expected']}. Use {forms} for EVERY reference to "
+            f"{c['name']}, in narration and in dialogue, for the whole chapter. The "
+            f"previous attempt used the opposite pronoun {c.get('hits', 0)} time(s). "
+            f"Never contradict this.")
     if "length ratio" in joined and "below" in joined:
         parts.append("The previous attempt was too SHORT — it likely omitted or summarized content. "
                      "Translate the chapter COMPLETELY: render every sentence and detail, omit nothing, condense nothing.")
@@ -527,6 +701,7 @@ def review_inbox() -> dict:
                 "status": rec.get("status"),
                 "failures": failures,
                 "diagnosis": diagnose(failures, val),
+                "flags": failure_flags(failures),
                 "length_ratio": val.get("length_ratio"),
             })
     items.sort(key=lambda r: (r["project_name"].lower(), r["index"]))
@@ -727,6 +902,42 @@ def _translated_chapters(pid: str, cfg: Config) -> list[tuple[int, str, str]]:
     return out
 
 
+_CHAPTER_FILE_RE = re.compile(r"^chapter-(\d+)\.md$")
+
+
+def _translated_chapters_local(cfg: Config) -> list[tuple[int, str, str]]:
+    """Same as ``_translated_chapters`` but from DISK ONLY — no source document fetch.
+
+    ``_translated_chapters`` goes through ``get_chapters``, which on a cold cache fetches
+    the live Google Doc (``includeTabsContent=True``) purely to enumerate indices and
+    titles. That's a multi-second network round trip per novel, so a library-wide sweep
+    across dozens of novels took minutes and hammered the Docs API for data it then threw
+    away — the text being scanned is the English output, which is already on disk.
+
+    Titles come from ``state.json`` (recorded there when each chapter was written), so
+    this needs no network and works offline.
+    """
+    out_dir = cfg.paths.output_dir
+    try:
+        names = sorted(p.name for p in out_dir.iterdir() if p.is_file())
+    except OSError:
+        return []
+    state = State.load(cfg.paths.state_file)
+    out: list[tuple[int, str, str]] = []
+    for name in names:
+        m = _CHAPTER_FILE_RE.match(name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        text = _safe_read(out_dir / name)
+        if text is None:
+            continue
+        title = (state.get(idx) or {}).get("title") or f"Chapter {idx}"
+        out.append((idx, title, text))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
 @app.get("/api/projects/{pid}/export")
 def export_novel(pid: str, format: str = "md") -> Response:
     """Download the finished translation as Markdown, plain text, or EPUB."""
@@ -800,7 +1011,10 @@ def chapter_detail(pid: str, index: int) -> dict:
         # chapter is readable and reviewable instead of appearing untranslated.
         translation = read_audit_translation(cfg.paths.audit_dir, index, total)
     rec = State.load(cfg.paths.state_file).get(index) or {}
-    clean_source, number = strip_source_header(ch.text)  # drop export header, pull chapter no.
+    # Show the Korean AS THE MODEL SAW IT — export header (incl. the repeated chapter
+    # number) and closing copyright notice removed — so the side-by-side view lines up.
+    clean_source, number = strip_source_header(ch.text)
+    clean_source = strip_export_footer(clean_source)
     return {
         "index": index,
         "title": ch.title,
@@ -812,6 +1026,7 @@ def chapter_detail(pid: str, index: int) -> dict:
         "validation": rec.get("validation"),
         "failures": rec.get("failures", []),
         "diagnosis": diagnose(rec.get("failures", []), rec.get("validation")),
+        "flags": failure_flags(rec.get("failures", [])),
         "manual_edit": rec.get("manual_edit", False),
         "has_previous": previous_chapter_path(cfg.paths.output_dir, index, total).exists(),
         "offline": pid in _offline_projects,
@@ -848,16 +1063,15 @@ def save_chapter(pid: str, index: int, body: ChapterEdit) -> dict:
     if not text:
         raise HTTPException(400, "The translation is empty.")
     write_chapter_file(cfg.paths.output_dir, index, total, text)
-    state = State.load(cfg.paths.state_file)
-    state.update(
-        index,
-        status=state_mod.STATUS_VALIDATED,
-        title=ch.title,
-        source_hash=ch.metrics.content_hash,
-        failures=[],
-        manual_edit=True,
-    )
-    state.save(cfg.paths.state_file)
+    with mutate_state(cfg.paths.state_file) as state:
+        state.update(
+            index,
+            status=state_mod.STATUS_VALIDATED,
+            title=ch.title,
+            source_hash=ch.metrics.content_hash,
+            failures=[],
+            manual_edit=True,
+        )
     return {"ok": True, "status": state_mod.STATUS_VALIDATED}
 
 
@@ -886,10 +1100,20 @@ def _chapter_problems(pid: str, cfg: Config, index: int) -> dict:
                          "severity": "high" if kf > 0.10 else "medium",
                          "auto_fixable": korean_fraction(cleaned) <= 0.02,
                          "message": f"Untranslated Korean remains (~{round(kf * 100)}% of the text)"})
-    val = validate_translation(ch, text, cfg.validation)
+    # Pass the glossary: without it the pronoun check is skipped entirely, so "Check
+    # chapter" reported a mis-gendered chapter as clean — and Fix automatically could
+    # re-mark it validated, silently clearing the flag.
+    # Measure against the source WITHOUT the export header/footer — the same text the
+    # pipeline validated against, so "Check chapter" can't disagree with the run that
+    # produced the chapter (see pipeline.stripped_chapter).
+    val = validate_translation(stripped_chapter(ch), text, cfg.validation, glossary_for(cfg, ch))
     for f in val.failures:
         if "leaked" in f or "untranslated Korean" in f:
             continue  # already reported above with a fix path
+        if _PRONOUN_FAILURE_RE.match(f.strip()):
+            problems.append({"type": "pronoun", "severity": "high", "auto_fixable": False,
+                             "message": diagnose([f])[0]["message"]})
+            continue
         problems.append({"type": "structure", "severity": "medium", "auto_fixable": False, "message": f})
     for w in val.warnings:
         problems.append({"type": "warning", "severity": "low", "auto_fixable": False, "message": w})
@@ -969,12 +1193,11 @@ def fix_chapter(pid: str, index: int, body: FixRequest = FixRequest()) -> dict:
         if not bpath.exists():
             bpath.write_text(text, encoding="utf-8")
         write_chapter_file(cfg.paths.output_dir, index, total, cleaned)
-        val = validate_translation(ch, cleaned, cfg.validation)
-        state = State.load(cfg.paths.state_file)
-        state.update(index, title=ch.title,
-                     status=state_mod.STATUS_VALIDATED if val.ok else state_mod.STATUS_NEEDS_REVIEW,
-                     failures=val.failures, manual_edit=True)
-        state.save(cfg.paths.state_file)
+        val = validate_translation(stripped_chapter(ch), cleaned, cfg.validation, glossary_for(cfg, ch))
+        with mutate_state(cfg.paths.state_file) as state:
+            state.update(index, title=ch.title,
+                         status=state_mod.STATUS_VALIDATED if val.ok else state_mod.STATUS_NEEDS_REVIEW,
+                         failures=val.failures, manual_edit=True)
     return {"fixed": fixed, "removed": len(removed) + snip_removed, **_chapter_problems(pid, cfg, index)}
 
 
@@ -982,39 +1205,133 @@ def fix_chapter(pid: str, index: int, body: FixRequest = FixRequest()) -> dict:
 async def resolve_chapter(pid: str, index: int) -> dict:
     """AI resolve: re-translate a flagged chapter with a correction targeting its exact
     failures, always writing the result (the prior version is kept in previous/ so the
-    reader can compare and revert). Uses your plan."""
+    reader can compare and revert). Uses your plan.
+
+    Queued on the novel's worker rather than run inline, so it streams into the Activity
+    view, survives the browser closing, and rides out a rate limit like any other work.
+    """
     _, cfg = project_cfg(pid)
     # AI-resolve re-translates, so it must also see the CURRENT source: re-fetch the live
     # doc (same reason as start_translation) so resolving an edited chapter uses the edited
     # Korean, not the stale cached snapshot. Falls back to the local copy if unfetchable.
     chapters = await run_in_threadpool(get_chapters, pid, cfg, True)
-    total = _output_total(pid, chapters)
     ch = next((c for c in chapters if c.index == index), None)
     if ch is None:
         raise HTTPException(404, f"chapter {index} not found")
     if classify(ch, cfg) != "korean":
         raise HTTPException(400, "Only Korean chapters can be re-translated.")
+    return _enqueue_task(pid, cfg, [(index, True, TASK_RESOLVE)])
+
+
+def _recheck_saved(pid: str, cfg: Config, indices: list[int]) -> dict[int, list[dict]]:
+    """Re-run validation on chapters' SAVED English and persist the verdict.
+
+    Free — no model call and no source re-fetch — because the text being judged is
+    already on disk. A flag stored in state.json is only ever a snapshot of what the
+    checks said at translation time; the glossary has usually moved on since (pronouns
+    filled in, a name's spelling fixed), and the checks themselves improve. Re-running
+    them first means the repair is asked for only where a problem still exists, rather
+    than spending a model call to "fix" a chapter that already reads correctly.
+
+    Returns the pronoun conflicts that survive, keyed by chapter index.
+    """
+    chapters = get_chapters(pid, cfg)
+    total = _output_total(pid, chapters)
+    by_index = {c.index: c for c in chapters}
     state = State.load(cfg.paths.state_file)
-    instruction = _corrective_instruction((state.get(index) or {}).get("failures", []))
-    glossary = Glossary.load(cfg.paths.glossary_json)
-    translator = Translator(cfg.anthropic, cfg.translation, canonical_names=glossary.canonical())
-    try:
-        await run_in_threadpool(
-            lambda: repair_chapter(ch, total, translator, glossary, cfg, state, instruction=instruction)
-        )
-    except RateLimitedError as exc:
-        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
-    except TranslatorError as exc:
-        raise HTTPException(502, f"AI resolve failed: {exc}")
-    state.save(cfg.paths.state_file)
-    new = state.get(index) or {}
-    return {
-        "index": index,
-        "status": new.get("status", "pending"),
-        "failures": new.get("failures", []),
-        "diagnosis": diagnose(new.get("failures", []), new.get("validation")),
-        "has_previous": previous_chapter_path(cfg.paths.output_dir, index, total).exists(),
-    }
+    remaining: dict[int, list[dict]] = {}
+    verdicts: dict[int, object] = {}
+    # Judge first, persist second. Validation is pure CPU over text already on disk, and
+    # "Fix all flagged" can hand us every flagged chapter in the novel — running it while
+    # holding the state lock would stall the translation worker for the whole sweep.
+    for index in indices:
+        ch = by_index.get(index)
+        rec = state.get(index)
+        if ch is None or not rec:
+            continue
+        prose = current_translation(cfg, index, total)
+        if not prose or not prose.strip():
+            remaining[index] = pronoun_conflicts(rec)  # nothing to re-judge; leave as-is
+            continue
+        val = validate_translation(stripped_chapter(ch), prose, cfg.validation, glossary_for(cfg, ch))
+        remaining[index] = val.pronoun_conflicts
+        verdicts[index] = val
+    if verdicts:
+        # Re-read under the lock and compare against THAT: the records judged above are a
+        # snapshot, and the worker may have rewritten one of these chapters since.
+        with _state_lock(cfg.paths.state_file):
+            fresh = State.load(cfg.paths.state_file)
+            changed = False
+            for index, val in verdicts.items():
+                rec = fresh.get(index) or {}
+                if val.failures == (rec.get("failures") or []):
+                    continue  # verdict unchanged — don't rewrite state for nothing
+                changed = True
+                fresh.update(
+                    index,
+                    status=state_mod.STATUS_VALIDATED if val.ok else state_mod.STATUS_NEEDS_REVIEW,
+                    validation=val.metrics,
+                    failures=val.failures,
+                    pronoun_conflicts=val.pronoun_conflicts,
+                )
+            if changed:
+                fresh.save(cfg.paths.state_file)
+    return remaining
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/fix-pronouns")
+async def fix_chapter_pronouns(pid: str, index: int) -> dict:
+    """Correct the pronouns of mis-gendered characters in ONE chapter.
+
+    Unlike AI resolve this does not re-translate: the glossary already knows each
+    character's pronoun, so the saved English is sent back to be rewritten with only
+    the pronouns changed. Cheaper, and it keeps prose the user may have edited.
+
+    The stored flag is re-checked against the saved text first, so a chapter that is
+    already correct clears itself here instead of queueing a model call that would
+    find nothing to change and leave it flagged all over again.
+    """
+    _, cfg = project_cfg(pid)
+    state = State.load(cfg.paths.state_file)
+    if not pronoun_conflicts(state.get(index)):
+        raise HTTPException(400, "This chapter has no mis-gendered characters to fix. "
+                                 "Pronouns are checked against the glossary, so a character "
+                                 "needs a pronoun set on the Glossary tab first.")
+    remaining = await run_in_threadpool(_recheck_saved, pid, cfg, [index])
+    if not remaining.get(index):
+        rec = State.load(cfg.paths.state_file).get(index) or {}
+        return {"cleared": [index], "queued": [], "job_id": None,
+                "status": rec.get("status"),
+                "message": "This chapter's pronouns already read correctly — "
+                           "the old flag was out of date and has been cleared."}
+    return {"cleared": [], **_enqueue_task(pid, cfg, [(index, True, TASK_PRONOUNS)])}
+
+
+@app.post("/api/projects/{pid}/pronouns/fix-flagged")
+async def fix_flagged_pronouns(pid: str) -> dict:
+    """Queue a pronoun fix for every chapter in this novel flagged as mis-gendered.
+
+    Chapters whose flag no longer holds are cleared for free (see ``_recheck_saved``)
+    and never reach the queue.
+    """
+    _, cfg = project_cfg(pid)
+    state = State.load(cfg.paths.state_file)
+    indices = sorted(
+        int(k) for k, rec in (state.chapters or {}).items()
+        if isinstance(rec, dict) and k.lstrip("-").isdigit() and pronoun_conflicts(rec)
+    )
+    if not indices:
+        raise HTTPException(400, "No chapters are flagged for wrong pronouns.")
+    remaining = await run_in_threadpool(_recheck_saved, pid, cfg, indices)
+    todo = [i for i in indices if remaining.get(i)]
+    cleared = [i for i in indices if i not in todo]
+    if not todo:
+        return {"cleared": cleared, "queued": [], "job_id": None,
+                "message": f"All {len(cleared)} chapter{'' if len(cleared) == 1 else 's'} "
+                           "already read correctly — the old flags were out of date and "
+                           "have been cleared."}
+    return {"cleared": cleared,
+            **_enqueue_task(pid, cfg, [(i, True, TASK_PRONOUNS) for i in todo])}
 
 
 @app.post("/api/projects/{pid}/chapters/{index}/accept")
@@ -1037,10 +1354,9 @@ def accept_chapter(pid: str, index: int) -> dict:
         if not prose:
             raise HTTPException(409, "No saved translation to accept — re-translate this chapter first.")
         write_chapter_file(cfg.paths.output_dir, index, total, prose)
-    state = State.load(cfg.paths.state_file)
-    state.update(index, status=state_mod.STATUS_VALIDATED, title=ch.title,
-                 source_hash=ch.metrics.content_hash, failures=[], manual_edit=True)
-    state.save(cfg.paths.state_file)
+    with mutate_state(cfg.paths.state_file) as state:
+        state.update(index, status=state_mod.STATUS_VALIDATED, title=ch.title,
+                     source_hash=ch.metrics.content_hash, failures=[], manual_edit=True)
     return {"ok": True, "status": state_mod.STATUS_VALIDATED}
 
 
@@ -1072,7 +1388,18 @@ def consistency_scan(pid: str) -> dict:
     """Scan a novel's translations for proper nouns spelled inconsistently across
     chapters, and frequent ones missing from the glossary. Lexical — no AI."""
     _, cfg = project_cfg(pid)
-    chapters = _translated_chapters(pid, cfg)  # (index, title, markdown)
+    return _consistency_report(pid, cfg)
+
+
+def _consistency_report(pid: str, cfg: Config) -> dict:
+    """The scan itself, callable per-novel or in a loop for the cross-novel Upkeep view.
+
+    Reads from disk only (see ``_translated_chapters_local``): the scan looks at the
+    English output, so fetching the Korean source document would be pure cost. Still
+    I/O-heavy across a whole library, so the library-wide caller runs it off the event
+    loop and caches the per-novel result.
+    """
+    chapters = _translated_chapters_local(cfg)  # (index, title, markdown)
     g = Glossary.load(cfg.paths.glossary_json)
     gloss_norm: dict[str, str] = {}
     for e in g.entries():
@@ -1159,6 +1486,197 @@ def consistency_replace(pid: str, body: ReplaceRequest) -> dict:
     return {"replaced": replaced, "chapters": changed}
 
 
+# --------------------------------------------------------------------- upkeep (all novels)
+# Glossary approval and consistency checks used to exist only per-novel, which doesn't
+# scale: with dozens of novels, staying on top of them meant opening every one by hand.
+# These endpoints follow the /api/review pattern — walk every project, isolate each in its
+# own try/except so one unreadable novel can't blank the page, and return flat rows.
+
+# The consistency scan reads every translated chapter file, so a library-wide sweep is
+# thousands of reads. Cache the per-novel summary and invalidate it when that novel's
+# chapters change (translation completes, a unify runs, an edit is saved).
+_consistency_cache: dict[str, dict] = {}
+
+
+def _invalidate_consistency(pid: str) -> None:
+    _consistency_cache.pop(pid, None)
+
+
+def _each_project():
+    """Yield (project, cfg) for every non-archived novel, skipping any that won't load."""
+    for project in pj.list_projects():
+        try:
+            yield project, pj.project_config(load_global_config(), project)
+        except Exception:  # noqa: BLE001 — one broken novel never breaks the sweep
+            continue
+
+
+@app.get("/api/glossary/pending")
+def all_pending_terms() -> dict:
+    """Every novel's unapproved glossary suggestions, grouped by novel. Cheap: one small
+    JSON read per project."""
+    novels = []
+    for project, cfg in _each_project():
+        try:
+            pending = load_pending(cfg.paths.glossary_pending)
+        except Exception:  # noqa: BLE001
+            continue
+        if pending:
+            novels.append({"pid": project["id"],
+                           "name": project.get("name", "Untitled novel"),
+                           "pending": pending})
+    novels.sort(key=lambda n: n["name"].lower())
+    return {"novels": novels, "total": sum(len(n["pending"]) for n in novels)}
+
+
+def _summarize_consistency(project: dict, cfg: Config) -> dict:
+    report = _consistency_report(project["id"], cfg)
+    return {
+        "pid": project["id"],
+        "name": project.get("name", "Untitled novel"),
+        "scanned": report["scanned"],
+        "variants": len(report["variants"]),
+        "missing": len(report["missing"]),
+        # Variants whose canonical spelling is already fixed by the glossary have an
+        # unambiguous correct target, so they're the only ones safe to bulk-fix.
+        "auto_fixable": sum(1 for v in report["variants"] if v.get("glossary_spelling")),
+    }
+
+
+_consistency_scan_task: asyncio.Task | None = None
+
+
+async def _scan_consistency_missing(pids_to_scan: list[str]) -> None:
+    """Fill the summary cache one novel at a time, off the event loop.
+
+    Deliberately incremental rather than one big batch: each novel lands in the cache as
+    soon as it's done, so the page fills in progressively instead of showing nothing for
+    the whole sweep. A cold sweep of a large library is genuinely slow — thousands of
+    files, and on Windows each read may be virus-scanned — so it must never block a
+    request.
+    """
+    by_id = {p["id"]: (p, c) for p, c in _each_project()}
+    for pid in pids_to_scan:
+        entry = by_id.get(pid)
+        if entry is None:
+            continue
+        try:
+            _consistency_cache[pid] = await run_in_threadpool(
+                _summarize_consistency, entry[0], entry[1]
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad novel never stalls the sweep
+            _consistency_cache[pid] = {
+                "pid": pid, "name": entry[0].get("name", "Untitled novel"),
+                "scanned": 0, "variants": 0, "missing": 0, "auto_fixable": 0,
+                "error": errors.explain(exc).title,
+            }
+
+
+@app.get("/api/consistency/summary")
+async def all_consistency_summary(refresh: bool = False) -> dict:
+    """Per-novel COUNTS only, served from cache and filled in in the background.
+
+    Two deliberate limits. First, counts rather than full reports: shipping every variant
+    for every novel would be megabytes the user hasn't asked to see, so the page fetches
+    one novel's full report from /api/projects/{pid}/consistency when a row is expanded.
+    Second, this never blocks — it answers immediately with whatever is cached and reports
+    how many novels are still being scanned, so the client can poll and watch rows appear.
+    """
+    global _consistency_scan_task
+
+    projects = [p for p, _c in _each_project()]
+    if refresh:
+        _consistency_cache.clear()
+
+    missing = [p["id"] for p in projects if p["id"] not in _consistency_cache]
+    if missing and (_consistency_scan_task is None or _consistency_scan_task.done()):
+        _consistency_scan_task = asyncio.create_task(_scan_consistency_missing(missing))
+        _running_tasks.add(_consistency_scan_task)
+        _consistency_scan_task.add_done_callback(_running_tasks.discard)
+
+    rows = [_consistency_cache[p["id"]] for p in projects if p["id"] in _consistency_cache]
+    rows.sort(key=lambda r: (-r["variants"], r["name"].lower()))
+    return {"novels": rows,
+            "scanning": len(missing) > 0,
+            "remaining": len(missing),
+            "total": len(projects),
+            "total_variants": sum(r["variants"] for r in rows),
+            "total_missing": sum(r["missing"] for r in rows),
+            "total_auto_fixable": sum(r["auto_fixable"] for r in rows)}
+
+
+class BulkGlossaryReview(BaseModel):
+    # pid -> the same {approve, reject} payload the per-novel endpoint takes.
+    by_project: dict[str, GlossaryReview] = {}
+
+
+@app.post("/api/glossary/review-bulk")
+def review_glossary_bulk(body: BulkGlossaryReview) -> dict:
+    """Approve/reject terms across several novels in one request.
+
+    One round trip instead of dozens of sequential ones from the browser, and each novel
+    is isolated so a single failure is reported rather than aborting the whole batch.
+    """
+    results, failed = [], []
+    for pid, review in body.by_project.items():
+        try:
+            res = review_glossary(pid, review)
+            results.append({"pid": pid, **res})
+        except HTTPException as exc:
+            failed.append({"pid": pid, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"pid": pid, "error": errors.explain(exc).title})
+    return {"novels": results, "failed": failed,
+            "approved": sum(r["approved"] for r in results),
+            "rejected": sum(r["rejected"] for r in results)}
+
+
+class BulkUnify(BaseModel):
+    pids: list[str] = []       # empty = every novel with auto-fixable variants
+
+
+@app.post("/api/consistency/unify-bulk")
+async def consistency_unify_bulk(body: BulkUnify) -> dict:
+    """Unify only the spellings with an unambiguous target — those where the glossary
+    already fixes the canonical spelling and some chapters disagree with it.
+
+    Variants with no glossary entry are deliberately skipped: picking a winner there is a
+    judgement call (which spelling is right?) and belongs to the user, not a bulk button.
+    """
+    def run() -> tuple[list[dict], list[dict]]:
+        done, failed = [], []
+        wanted = set(body.pids) if body.pids else None
+        for project, cfg in _each_project():
+            pid = project["id"]
+            if wanted is not None and pid not in wanted:
+                continue
+            try:
+                report = _consistency_report(pid, cfg)
+                fixed = 0
+                for v in report["variants"]:
+                    target = v.get("glossary_spelling")
+                    if not target:
+                        continue
+                    others = [o for o in v["options"] if o["spelling"] != target]
+                    if not others:
+                        continue
+                    chapters = sorted({c for o in others for c in o["chapters"]})
+                    res = consistency_replace(pid, ReplaceRequest(
+                        **{"from": [o["spelling"] for o in others], "to": target,
+                           "chapters": chapters}))
+                    fixed += res["replaced"]
+                if fixed:
+                    _invalidate_consistency(pid)
+                    done.append({"pid": pid, "name": project.get("name", ""), "replaced": fixed})
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"pid": pid, "error": errors.explain(exc).title})
+        return done, failed
+
+    done, failed = await run_in_threadpool(run)
+    return {"novels": done, "failed": failed,
+            "replaced": sum(d["replaced"] for d in done)}
+
+
 # ----------------------------------------------------------------------------- glossary
 @app.get("/api/projects/{pid}/glossary")
 def glossary(pid: str) -> dict:
@@ -1169,10 +1687,14 @@ def glossary(pid: str) -> dict:
 
 
 class TermDecision(BaseModel):
+    # Accept the wire key "register" but avoid shadowing a BaseModel attribute.
+    model_config = ConfigDict(populate_by_name=True)
     korean: str
     english: str
     type: str = "other"
     note: str = ""
+    pronoun: str = ""   # character profile: he / she / they
+    speech_register: str = Field("", alias="register")
 
 
 class GlossaryReview(BaseModel):
@@ -1185,7 +1707,9 @@ def review_glossary(pid: str, review: GlossaryReview) -> dict:
     _, cfg = project_cfg(pid)
     g = Glossary.load(cfg.paths.glossary_json)
     for t in review.approve:
-        g.add(GlossaryEntry(korean=t.korean, english=t.english, type=t.type, note=t.note))
+        g.add(GlossaryEntry(korean=t.korean, english=t.english, type=t.type, note=t.note,
+                            pronoun=normalize_pronoun(t.pronoun),
+                            register=t.speech_register.strip()))
     g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
     decided = {t.korean for t in review.approve} | set(review.reject)
     remaining = [p for p in load_pending(cfg.paths.glossary_pending) if p["korean"] not in decided]
@@ -1209,6 +1733,10 @@ class TermUpsert(BaseModel):
 class TermDelete(BaseModel):
     korean: str = ""
     english: str = ""
+
+
+class TermsDelete(BaseModel):
+    terms: list[TermDelete] = []
 
 
 class GlossaryImport(BaseModel):
@@ -1287,6 +1815,28 @@ def delete_glossary_term(pid: str, body: TermDelete) -> dict:
     return _locked_payload(g)
 
 
+@app.post("/api/projects/{pid}/glossary/term/delete-bulk")
+def delete_glossary_terms(pid: str, body: TermsDelete) -> dict:
+    """Drop several locked terms in one save — the multi-select delete on the
+    glossary page. A term that's already gone is counted as missing rather than
+    failing the whole batch, so a stale selection can't block the rest."""
+    _, cfg = project_cfg(pid)
+    g = Glossary.load(cfg.paths.glossary_json)
+    removed, missing = 0, []
+    for t in body.terms:
+        korean = t.korean.strip()
+        english = t.english.strip()
+        if not korean and not english:
+            continue
+        if g.remove(korean) if korean else g.remove_english(english):
+            removed += 1
+        else:
+            missing.append(korean or english)
+    if removed:
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return {**_locked_payload(g), "removed": removed, "missing": missing}
+
+
 @app.post("/api/projects/{pid}/glossary/import")
 def import_glossary(pid: str, body: GlossaryImport) -> dict:
     """Bulk add terms from a CSV/JSON the client parsed. mode=replace clears first."""
@@ -1300,7 +1850,8 @@ def import_glossary(pid: str, body: GlossaryImport) -> dict:
         g.add(entry)
         imported += 1
     g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {**_locked_payload(g), "imported": imported}
+    return {**_locked_payload(g), "imported": imported,
+            "skipped": len(body.entries) - imported}
 
 
 class GlossaryCopy(BaseModel):
@@ -1371,55 +1922,155 @@ async def learn_glossary(pid: str) -> dict:
         typ = t.get("type", "name")
         g.add(GlossaryEntry(korean="", english=english,
                             type=typ if typ in VALID_TYPES else "name",
-                            note=t.get("note", "")))
+                            note=t.get("note", ""),
+                            pronoun=normalize_pronoun(t.get("pronoun", ""))))
         existing_english.add(english.lower())
         added += 1
     g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
     return {"learned": added, "from_chapters": len(english_chs), **_locked_payload(g)}
 
 
+def _sample_project_english(pid: str, cfg: Config) -> str:
+    """English text for this novel: translated output chapters where they exist,
+    plus source chapters that are already English. Same spread/budget approach as
+    ``_sample_english`` so late-introduced characters are covered."""
+    chapters = get_chapters(pid, cfg)
+    total = _output_total(pid, chapters)
+    sampled = []  # Chapter or a title/text namespace — _sample_english reads only those
+    for ch in chapters:
+        translated = _safe_read(cfg.paths.output_dir / chapter_filename(ch.index, total))
+        if translated and translated.strip():
+            sampled.append(SimpleNamespace(title=ch.title, text=translated))
+        elif classify(ch, cfg) == "english":
+            sampled.append(ch)
+    return _sample_english(sampled)
+
+
+@app.post("/api/projects/{pid}/glossary/detect-pronouns")
+async def detect_pronouns(pid: str) -> dict:
+    """Fill in the pronoun for character entries that don't have one yet, judged
+    from the novel's own English text (translated chapters + already-English source).
+
+    Only empty pronoun fields on `name` entries are filled — a value the user set
+    by hand is never overwritten, and "unknown" results are left empty. Re-runnable;
+    clearing a field in the table is the undo.
+    """
+    _, cfg = project_cfg(pid)
+    g = Glossary.load(cfg.paths.glossary_json)
+    targets = [e for e in g.entries() if e.type == "name" and e.english and not e.pronoun]
+    if not targets:
+        if any(e.type == "name" and e.english for e in g.entries()):
+            raise HTTPException(400, "Every character already has a pronoun set.")
+        raise HTTPException(400, "No character entries in the glossary yet.")
+    sample = _sample_project_english(pid, cfg)
+    if not sample.strip():
+        raise HTTPException(400, "No English text yet — translate some chapters first.")
+    translator = Translator(cfg.anthropic, cfg.translation)
+    try:
+        detected = await run_in_threadpool(
+            translator.detect_pronouns, [e.english for e in targets], sample
+        )
+    except RateLimitedError as exc:
+        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
+    except TranslatorError as exc:
+        raise HTTPException(502, f"Couldn't read the chapters: {exc}")
+
+    filled, unresolved = [], []
+    for e in targets:
+        pronoun = detected.get(e.english.lower(), "")
+        if pronoun:
+            e.pronoun = pronoun  # entries() returns the live objects — mutate in place
+            filled.append({"english": e.english, "pronoun": pronoun})
+        else:
+            unresolved.append(e.english)
+    if filled:
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    return {"filled": filled, "unresolved": unresolved, **_locked_payload(g)}
+
+
+class BulkTermIn(BaseModel):
+    # Not TermUpsert: its `type = "other"` default would make "no type given"
+    # unrepresentable, and here "" is the signal for "auto-classify this row".
+    model_config = ConfigDict(populate_by_name=True)
+    korean: str = ""
+    english: str = ""  # validated per-row so bad rows are reported, not 422'd
+    type: str = ""
+    note: str = ""
+    pronoun: str = ""
+    speech_register: str = Field("", alias="register")
+
+
 class GlossaryBulkAdd(BaseModel):
-    text: str = ""  # comma/newline-separated English subjects, in any order
+    text: str = ""                           # legacy flat paste (old clients / curl)
+    entries: list[BulkTermIn] | None = None  # structured rows parsed client-side
 
 
 @app.post("/api/projects/{pid}/glossary/bulk-add")
 async def bulk_add_glossary(pid: str, body: GlossaryBulkAdd) -> dict:
-    """Add a pasted list of English names/places/terms, auto-classifying each one.
-    Entries land as English-only canonical spellings (like "Learn names"), so new
-    translations keep them consistent; types stay editable in the table."""
+    """Add a pasted batch of terms — full entries, per-type groups, or a flat list.
+
+    Rows that arrive with a recognizable type are added directly and never touch
+    the user's Claude plan; only unlabeled rows go through one classify_terms
+    call. Typed rows are saved even if that call fails (the response then carries
+    `classify_error` + `unclassified` so the client can offer a one-click retry);
+    the legacy all-untyped path keeps its all-or-nothing 429/502 behavior.
+    """
     _, cfg = project_cfg(pid)
-    seen: set[str] = set()
-    items: list[str] = []
-    for raw in re.split(r"[,\n;]", body.text):
-        term = raw.strip()
-        if term and term.lower() not in seen:
-            seen.add(term.lower())
-            items.append(term)
-    if not items:
-        raise HTTPException(400, "Nothing to add — paste terms separated by commas.")
+    if body.entries is not None:
+        rows = [{"korean": t.korean, "english": t.english, "type": t.type, "note": t.note,
+                 "pronoun": t.pronoun, "register": t.speech_register} for t in body.entries]
+    else:
+        rows = [{"english": t} for t in split_flat(body.text)]
+    if not rows:
+        raise HTTPException(400, "Nothing to add — paste terms separated by commas, or a JSON/CSV block.")
+    if len(rows) > MAX_ROWS:
+        raise HTTPException(400, f"Too many rows at once (max {MAX_ROWS}) — split the paste.")
 
     g = Glossary.load(cfg.paths.glossary_json)
-    existing = {e.english.lower() for e in g.entries() if e.english}
-    new_items = [t for t in items if t.lower() not in existing]
-    skipped = [t for t in items if t.lower() in existing]
-    if not new_items:
-        return {**_locked_payload(g), "added": [], "skipped": skipped}
+    plan = prepare_bulk_rows(rows, g.entries())
+    if len(plan.untyped) > MAX_UNTYPED:
+        raise HTTPException(400, f"{len(plan.untyped)} terms need type detection — max {MAX_UNTYPED} "
+                                 "per paste. Add types to the rows, or split the paste.")
+    if not (plan.typed or plan.untyped or plan.updated):
+        return {**_locked_payload(g), "added": [], "updated": [], "skipped": plan.skipped}
 
-    translator = Translator(cfg.anthropic, cfg.translation)
-    try:
-        types = await run_in_threadpool(translator.classify_terms, new_items)
-    except RateLimitedError as exc:
-        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
-    except TranslatorError as exc:
-        raise HTTPException(502, f"Couldn't classify the terms: {exc}")
+    added, updated = [], []
+    for e in plan.typed:
+        g.add(e)
+        added.append({"english": e.english, "type": e.type})
+    for e in plan.updated:
+        g.add(e)
+        updated.append({"english": e.english, "korean": e.korean, "type": e.type})
 
-    added = []
-    for term in new_items:
-        typ = types.get(term.lower(), "other")
-        g.add(GlossaryEntry(korean="", english=term, type=typ))
-        added.append({"english": term, "type": typ})
-    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {**_locked_payload(g), "added": added, "skipped": skipped}
+    classify_error = None
+    if plan.untyped:
+        translator = Translator(cfg.anthropic, cfg.translation)  # constructed only when needed
+        try:
+            types = await run_in_threadpool(translator.classify_terms,
+                                            [u["english"] for u in plan.untyped])
+        except RateLimitedError as exc:
+            if not (added or updated):
+                raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
+            classify_error = f"{exc} — try those again later, or add them with a type."
+        except TranslatorError as exc:
+            if not (added or updated):
+                raise HTTPException(502, f"Couldn't classify the terms: {exc}")
+            classify_error = f"Couldn't classify the terms: {exc}"
+        if classify_error is None:
+            for u in plan.untyped:
+                typ = types.get(u["english"].lower(), "other")  # model omissions stay "other"
+                e = GlossaryEntry(korean=u["korean"], english=u["english"], type=typ,
+                                  note=u["note"], pronoun=u["pronoun"], register=u["register"])
+                g.add(e)
+                added.append({"english": e.english, "type": typ})
+
+    if added or updated:
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    resp = {**_locked_payload(g), "added": added, "updated": updated, "skipped": plan.skipped}
+    if classify_error:
+        resp["classify_error"] = classify_error
+        resp["unclassified"] = [u["english"] for u in plan.untyped]
+    return resp
 
 
 @app.get("/api/projects/{pid}/glossary/export")
@@ -1446,6 +2097,60 @@ class TranslateRequest(BaseModel):
     force: bool = False
 
 
+# What a queued item asks the worker to do. All three run through the same Job so
+# they show up in the Activity view, stream to the live console, and honour Stop and
+# the rate-limit auto-resume without any of that being reimplemented per operation.
+TASK_TRANSLATE = "translate"   # translate the Korean source (the original behaviour)
+TASK_RESOLVE = "resolve"       # AI resolve: re-translate, corrected for what failed
+TASK_PRONOUNS = "pronouns"     # rewrite only the pronouns of mis-gendered characters
+TASK_KINDS = (TASK_TRANSLATE, TASK_RESOLVE, TASK_PRONOUNS)
+
+# How each kind is described in the UI and the terminal.
+TASK_LABEL = {
+    TASK_TRANSLATE: "Translating",
+    TASK_RESOLVE: "AI resolve on",
+    TASK_PRONOUNS: "Fixing pronouns in",
+}
+
+
+class TaskRefused(Exception):
+    """A repair declined to write anything, leaving the chapter exactly as it was.
+
+    Distinct from a failure: nothing broke and nothing changed, so the chapter must
+    keep its existing status rather than being marked failed. Raised when the pronoun
+    rewrite comes back having altered more than pronouns, or when there is nothing
+    saved to correct.
+    """
+
+
+def _run_task(
+    kind: str,
+    ch: Chapter,
+    total: int,
+    translator: Translator,
+    glossary: Glossary,
+    cfg: Config,
+    state: State,
+    hooks: StreamHooks,
+) -> str:
+    """Run one queued item. Blocking — always called via run_in_threadpool."""
+    if kind == TASK_RESOLVE:
+        rec = state.get(ch.index) or {}
+        instruction = _corrective_instruction(rec.get("failures", []), pronoun_conflicts(rec))
+        return repair_chapter(ch, total, translator, glossary, cfg, state,
+                              instruction=instruction)
+    if kind == TASK_PRONOUNS:
+        try:
+            return fix_pronouns_chapter(ch, total, translator, glossary, cfg, state,
+                                        conflicts=pronoun_conflicts(state.get(ch.index)),
+                                        hooks=hooks)
+        except ValueError as exc:
+            # The guard rejected the rewrite, or there was nothing to correct. Either
+            # way the chapter on disk is untouched — say so instead of failing it.
+            raise TaskRefused(str(exc)) from exc
+    return process_chapter(ch, total, translator, glossary, cfg, state, hooks)
+
+
 class Job:
     """A per-project translation worker fed by an APPENDABLE FIFO queue. Chapters can
     be enqueued while it runs, so the user never has to wait for one to finish before
@@ -1454,32 +2159,51 @@ class Job:
     def __init__(self, job_id: str, pid: str):
         self.id = job_id
         self.pid = pid
-        self.pending: deque[tuple[int, bool]] = deque()  # (chapter index, force)
+        # (chapter index, force, kind). `kind` is what to DO with the chapter:
+        # "translate" (the default), "resolve" (AI re-translate targeting its failures),
+        # or "pronouns" (rewrite only the mis-gendered pronouns). Routing them all
+        # through this one queue is what puts them in the Activity view for free, and
+        # keeps one worker per novel so writes to state.json stay serialized.
+        self.pending: deque[tuple[int, bool, str]] = deque()
         self.queued: set[int] = set()        # indices pending or in-flight (for dedup)
-        self.current: int | None = None       # chapter being translated right now
+        self.current: int | None = None       # chapter being worked on right now
+        self.kind: str = TASK_TRANSLATE       # what is being done to it
         self.history: list[dict] = []         # every event so far, replayed on (re)connect
         self.subscribers: list[asyncio.Queue] = []  # one queue per live SSE consumer
         self.done = False
         self.cancelled = False
         self.terminal: dict | None = None      # final event, replayable for late consumers
+        # Live view of the chapter in flight: the Korean the model was given plus the
+        # English streamed back so far. Replayed as one frame when a stream (re)connects
+        # mid-chapter, so a reload doesn't drop the user into a blank console.
+        self.live: dict | None = None
+        # Cooperative stop for the in-flight chapter. The translator polls this between
+        # streamed messages; a threadpool thread can't be killed from out here.
+        self.abort = threading.Event()
         # Set while the worker sleeps out a rate limit, waiting for the plan's usage
         # window to refresh: {resume_at, resets_at, message, since}. None otherwise.
         self.waiting: dict | None = None
         self.wake = asyncio.Event()            # cancel/resume-now interrupts the sleep
 
-    def enqueue(self, items: list[tuple[int, bool]]) -> list[int]:
-        """Append (index, force) pairs, skipping ones already queued/in-flight."""
+    def enqueue(self, items: list[tuple[int, bool, str]]) -> list[int]:
+        """Append (index, force, kind) triples, skipping ones already queued/in-flight."""
         added = []
-        for idx, force in items:
+        for idx, force, kind in items:
             if idx in self.queued:
                 continue
             self.queued.add(idx)
-            self.pending.append((idx, force))
+            self.pending.append((idx, force, kind))
             added.append(idx)
         return added
 
     def queue_state(self) -> dict:
-        return {"current": self.current, "pending": [i for i, _ in self.pending],
+        # Before anything starts, `kind` is the default and would mislabel a queued
+        # repair as "Translating" until its start event lands — so fall back to what
+        # is at the head of the queue.
+        kind = self.kind if self.current is not None else (
+            self.pending[0][2] if self.pending else self.kind)
+        return {"current": self.current, "kind": kind,
+                "pending": [i for i, _, _ in self.pending],
                 "waiting": self.waiting}
 
     def publish(self, ev: dict) -> None:
@@ -1495,8 +2219,27 @@ class Job:
         self.history.append(ev)
         if len(self.history) > 1000:
             self.history = self.history[-1000:]
+        console.print_event(self.pid, ev)
         for q in list(self.subscribers):
             q.put_nowait(ev)
+
+    def publish_live(self, ev: dict) -> None:
+        """Fan out a high-frequency streaming event WITHOUT recording it in history.
+
+        Deltas arrive many times per chapter; appending them would fill the 1000-event
+        replay buffer with fragments and evict the real start/chapter/done events. A
+        (re)connecting consumer gets ``self.live`` as a single catch-up frame instead.
+
+        Must be called on the event loop — the translator runs in a worker thread and
+        marshals here via ``loop.call_soon_threadsafe``.
+        """
+        console.print_event(self.pid, ev)
+        for q in list(self.subscribers):
+            q.put_nowait(ev)
+
+    def live_frame(self) -> dict | None:
+        """The current chapter's accumulated state as a replayable single event."""
+        return {"type": "live", **self.live, **self.queue_state()} if self.live else None
 
 
 def _persist_chapter_state(state: State, path: Path, idx: int) -> State:
@@ -1508,10 +2251,9 @@ def _persist_chapter_state(state: State, path: Path, idx: int) -> State:
     on-disk state, overlay just this chapter, save atomically, and hand the merged
     state back for the worker to keep using (so later is_done/cost reads are current)."""
     rec = state.chapters.get(str(idx))
-    fresh = State.load(path)
-    if rec is not None:
-        fresh.chapters[str(idx)] = rec
-    fresh.save(path)
+    with mutate_state(path) as fresh:
+        if rec is not None:
+            fresh.chapters[str(idx)] = rec
     return fresh
 
 
@@ -1536,7 +2278,111 @@ async def _sleep_until(job: Job, when: float) -> None:
             continue
 
 
+def _build_hooks(job: Job, loop: asyncio.AbstractEventLoop) -> tuple[StreamHooks, Callable[[], None]]:
+    """Live-progress hooks for one chapter.
+
+    ``process_chapter`` runs in a threadpool, so every callback here executes on a
+    WORKER THREAD while ``job.publish_live`` touches asyncio queues that belong to the
+    event loop. Each hook therefore marshals across with ``call_soon_threadsafe`` and
+    does no other work inline.
+
+    Deltas are coalesced on the worker-thread side: the SDK emits many small text
+    blocks, and scheduling a loop callback plus an SSE frame for each one would flood
+    both. We flush on a size or time threshold instead.
+
+    Returns the hooks plus a ``flush()`` the caller MUST invoke once the chapter ends —
+    otherwise the final sub-threshold fragment stays buffered and the live view is
+    permanently missing the chapter's last couple of sentences.
+    """
+    buf: list[str] = []
+    pending = {"chars": 0, "last": 0.0}
+    lock = threading.Lock()
+
+    FLUSH_CHARS = 200
+    FLUSH_SECONDS = 0.1
+
+    def _apply_text(text: str) -> None:
+        # Runs on the loop: mutate job.live, then fan out the accumulated snapshot.
+        if job.live is None:
+            return
+        job.live["english"] = job.live.get("english", "") + text
+        job.publish_live({
+            "type": "delta", "index": job.live.get("index"), "text": text,
+            "paragraphs": _paragraph_count(job.live["english"]),
+            "chunk": job.live.get("chunk", [1, 1]),
+        })
+
+    def _flush(force: bool = False) -> None:
+        with lock:
+            now = time.monotonic()
+            if not buf:
+                return
+            if not force and pending["chars"] < FLUSH_CHARS \
+                    and now - pending["last"] < FLUSH_SECONDS:
+                return
+            text = "".join(buf)
+            buf.clear()
+            pending["chars"] = 0
+            pending["last"] = now
+        loop.call_soon_threadsafe(_apply_text, text)
+
+    def on_text(chunk: str) -> None:
+        with lock:
+            buf.append(chunk)
+            pending["chars"] += len(chunk)
+        _flush()
+
+    def on_source(paragraphs: list[str]) -> None:
+        def apply() -> None:
+            if job.live is None:
+                return
+            job.live["source"] = paragraphs
+            job.publish_live({"type": "source", "index": job.live.get("index"),
+                              "source": paragraphs, "paragraphs": len(paragraphs)})
+        loop.call_soon_threadsafe(apply)
+
+    def on_reset(reason: str) -> None:
+        _flush(force=True)
+
+        def apply() -> None:
+            if job.live is None:
+                return
+            # "retry" redoes the whole chapter, so everything streamed is void. A
+            # reconnect/restart only lost the current chunk, so keep what earlier
+            # chunks committed (see StreamHooks' docstring).
+            job.live["english"] = "" if reason == "retry" else job.live.get("committed", "")
+            job.publish_live({"type": "reset", "index": job.live.get("index"),
+                              "reason": reason, "english": job.live["english"]})
+        loop.call_soon_threadsafe(apply)
+
+    def on_chunk(i: int, n: int) -> None:
+        _flush(force=True)
+
+        def apply() -> None:
+            if job.live is None:
+                return
+            # Chunk boundary = commit point: prose from completed chunks is final.
+            job.live["committed"] = job.live.get("english", "")
+            job.live["chunk"] = [i, n]
+            job.publish_live({"type": "chunk", "index": job.live.get("index"),
+                              "chunk": [i, n]})
+        loop.call_soon_threadsafe(apply)
+
+    hooks = StreamHooks(on_source=on_source, on_text=on_text, on_reset=on_reset,
+                        on_chunk=on_chunk, abort=job.abort)
+    return hooks, lambda: _flush(force=True)
+
+
+def _paragraph_count(text: str) -> int:
+    """Complete paragraphs in the streamed English so far — drives the progress bar
+    and the source-alignment highlight."""
+    if not text:
+        return 0
+    return len([p for p in re.split(r"\n\s*\n", text) if p.strip()])
+
+
 async def _run_worker(job: Job, cfg: Config) -> None:
+    loop = asyncio.get_running_loop()
     chapters = get_chapters(job.pid, cfg)
     total = _output_total(job.pid, chapters)  # match the on-disk chapter-NN.md pad width
     by_index = {c.index: c for c in chapters}
@@ -1549,9 +2395,18 @@ async def _run_worker(job: Job, cfg: Config) -> None:
     # work — start_translation keeps appending to this job while it waits).
     strikes = 0  # consecutive rate-limit hits; any completed chapter resets it
     while job.pending and not job.cancelled:
-        idx, force = job.pending.popleft()
+        idx, force, kind = job.pending.popleft()
         job.current = idx
+        job.kind = kind
         ch = by_index.get(idx)
+        if ch is None or kind != TASK_TRANSLATE:
+            # by_index is captured once when the worker starts; a repair queued later
+            # (and the fresh source its endpoint just fetched) would otherwise be read
+            # from a stale snapshot. get_chapters is cached, so this is cheap.
+            chapters = get_chapters(job.pid, cfg)
+            total = _output_total(job.pid, chapters)
+            by_index = {c.index: c for c in chapters}
+            ch = by_index.get(idx)
         if ch is None:
             job.queued.discard(idx)
             job.current = None
@@ -1560,38 +2415,75 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         # both to skip non-forced re-runs and to protect a good translation from being
         # clobbered if a forced re-translate is interrupted by a rate limit below.
         already_done = state.is_done(idx, ch.metrics.content_hash)
-        if not force and already_done:
+        # Only a plain translation may be skipped as already-done. A resolve or a
+        # pronoun fix is explicitly requested ON an already-translated chapter, so
+        # skipping it there would silently do nothing.
+        if kind == TASK_TRANSLATE and not force and already_done:
             job.queued.discard(idx)
             job.current = None
-            job.publish({"type": "chapter", "index": idx, "status": "validated",
+            job.publish({"type": "chapter", "index": idx, "kind": kind,
+                         "status": "validated",
                          "title": ch.title, "skipped": True})
             continue
+        # A fresh live buffer per chapter, so a reconnecting stream replays THIS
+        # chapter's text and never the previous one's.
+        job.abort.clear()
+        job.live = {"index": idx, "title": ch.title, "chars": ch.metrics.char_count,
+                    "source": [], "english": "", "committed": "", "chunk": [1, 1],
+                    "started_at": time.time()}
+        hooks, flush_live = _build_hooks(job, loop)
         job.publish({"type": "start", "index": idx, "title": ch.title,
-                     "chars": ch.metrics.char_count})
+                     "chars": ch.metrics.char_count, "kind": kind,
+                     "started_at": job.live["started_at"],
+                     "model": cfg.anthropic.model, "effort": cfg.anthropic.effort})
         try:
             status_val = await run_in_threadpool(
-                process_chapter, ch, total, translator, glossary, cfg, state
+                _run_task, kind, ch, total, translator, glossary, cfg, state, hooks
             )
+        except TranslationAborted:
+            # A deliberate stop, not a failure. Leave a chapter that already had a good
+            # translation on disk marked validated (same reasoning as the rate-limit
+            # branch below); only revert one that was genuinely unfinished.
+            flush_live()
+            # Only a stopped TRANSLATION leaves the chapter unfinished. A stopped repair
+            # never touched the saved text, so resetting it to "pending" would throw away
+            # a needs-review status and its failure list for no reason.
+            if kind == TASK_TRANSLATE and not already_done:
+                state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
+                state = _persist_chapter_state(state, cfg.paths.state_file, idx)
+            job.queued.discard(idx)
+            job.current = None
+            job.live = None
+            rec = state.get(idx) or {}
+            job.publish({"type": "chapter", "index": idx, "kind": kind,
+                         "status": rec.get("status", state_mod.STATUS_PENDING),
+                         "title": ch.title, "aborted": True})
+            if job.cancelled:
+                break
+            continue
         except RateLimitedError as exc:
+            flush_live()
+            job.live = None
             # A rate limit mid-flight must NOT downgrade a chapter that was already
             # validated on disk (e.g. an interrupted force-retranslate): that would
             # revert it to "pending"/"Queued" even though its finished English file
             # is still on disk. Only mark genuinely-unfinished chapters pending so
-            # they resume; a done chapter keeps its validated status.
-            if not already_done:
+            # they resume; a done chapter keeps its validated status. A repair likewise
+            # left the saved text alone, so it keeps whatever status it already had.
+            if kind == TASK_TRANSLATE and not already_done:
                 state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
                 state = _persist_chapter_state(state, cfg.paths.state_file, idx)
             # Put the interrupted chapter back at the head (it stays in job.queued)
             # and ride out the limit HERE — the worker stays alive and resumes by
             # itself when the plan's window refreshes, no browser needed.
-            job.pending.appendleft((idx, force))
+            job.pending.appendleft((idx, force, kind))
             job.current = None
             strikes += 1
             resets_at = getattr(getattr(exc, "info", None), "resets_at", None)
             if strikes >= _MAX_STRIKES:
                 # Something is off (limit hit right back N times in a row) — stop
                 # burning retries and hand resumption to the user/client instead.
-                remaining = [i for i, _ in job.pending]
+                remaining = [i for i, _, _ in job.pending]
                 job.done = True
                 job.publish({"type": "paused", "index": idx, "message": str(exc),
                              "resets_at": resets_at,
@@ -1612,23 +2504,52 @@ async def _run_worker(job: Job, cfg: Config) -> None:
                 break  # cancelled/cleared during the wait → normal terminal 'done'
             job.publish({"type": "resumed"})
             continue
+        except TaskRefused as exc:
+            # Nothing was written and nothing broke: keep the chapter's current status
+            # and report why, so the user sees "not applied" rather than "failed".
+            flush_live()
+            job.live = None
+            strikes = 0
+            job.queued.discard(idx)
+            job.current = None
+            # The attempt was still billed even though nothing was written, so persist
+            # the usage rather than silently dropping it from the novel's totals.
+            state = _persist_chapter_state(state, cfg.paths.state_file, idx)
+            rec = state.get(idx) or {}
+            job.publish({"type": "chapter", "index": idx, "kind": kind,
+                         "status": rec.get("status", state_mod.STATUS_NEEDS_REVIEW),
+                         "title": ch.title, "refused": True, "error": str(exc),
+                         "totals": state.totals()})
+            continue
         except Exception as exc:  # isolation: one bad chapter never kills the queue
+            flush_live()
+            job.live = None
             strikes = 0  # Claude answered (badly) — the rate limit isn't the problem
             state.update(idx, status=state_mod.STATUS_FAILED, title=ch.title,
                          error=f"{type(exc).__name__}: {exc}")
             state = _persist_chapter_state(state, cfg.paths.state_file, idx)
             job.queued.discard(idx)
             job.current = None
-            job.publish({"type": "chapter", "index": idx, "status": "failed",
-                         "title": ch.title, "error": str(exc)})
+            # Carry the same plain-English explanation the HTTP layer produces, so a
+            # mid-queue failure opens the identical "what went wrong / how to fix it"
+            # dialog instead of dumping a raw exception string into the log.
+            job.publish({"type": "chapter", "index": idx, "kind": kind,
+                         "status": "failed",
+                         "title": ch.title, "error": str(exc),
+                         "explain": errors.as_dict(errors.explain(exc))})
             continue
+        flush_live()
+        job.live = None
         strikes = 0
         state = _persist_chapter_state(state, cfg.paths.state_file, idx)
         rec = state.get(idx) or {}
         job.queued.discard(idx)
         job.current = None
-        job.publish({"type": "chapter", "index": idx, "status": status_val,
-                     "title": ch.title, "cost_usd": state.totals()["cost_usd"],
+        totals = state.totals()
+        job.publish({"type": "chapter", "index": idx, "kind": kind,
+                     "status": status_val,
+                     "title": ch.title, "cost_usd": totals["cost_usd"],
+                     "tokens": rec.get("usage", {}), "totals": totals,
                      "failures": rec.get("failures", [])})
 
     job.done = True
@@ -1656,14 +2577,21 @@ def _spawn_worker(pid: str, cfg: Config, job: Job) -> None:
     task.add_done_callback(_cleanup)
 
 
-def _resolve_items(pid: str, cfg: Config, req: TranslateRequest) -> list[tuple[int, bool]]:
+def _resolve_items(pid: str, cfg: Config, req: TranslateRequest) -> list[tuple[int, bool, str]]:
     if req.indices:
-        return [(i, req.force) for i in req.indices]
+        return [(i, req.force, TASK_TRANSLATE) for i in req.indices]
     chapters = get_chapters(pid, cfg)
     state = State.load(cfg.paths.state_file)
+    korean = [c for c in chapters if classify(c, cfg) == "korean"]
+    # A forced run with no explicit indices means "re-translate this whole novel", so the
+    # already-done filter must NOT apply — otherwise every validated chapter is skipped
+    # and the request appears to succeed while queuing nothing. Already-English and empty
+    # tabs are still excluded: forcing those has no meaning.
+    if req.force:
+        return [(c.index, True, TASK_TRANSLATE) for c in korean]
     return [
-        (c.index, req.force) for c in chapters
-        if classify(c, cfg) == "korean" and not state.is_done(c.index, c.metrics.content_hash)
+        (c.index, False, TASK_TRANSLATE) for c in korean
+        if not state.is_done(c.index, c.metrics.content_hash)
     ]
 
 
@@ -1686,8 +2614,20 @@ async def start_translation(pid: str, req: TranslateRequest) -> dict:
                             "document isn't available on this device, so it can't be "
                             "translated here.")
     items = _resolve_items(pid, cfg, req)
+    return _enqueue_task(pid, cfg, items)
 
-    # If a worker is already running, just append — it picks the new chapters up.
+
+def _enqueue_task(pid: str, cfg: Config, items: list[tuple[int, bool, str]]) -> dict:
+    """Queue work on this novel's single worker, starting one if none is running.
+
+    MUST be called from an ``async def`` endpoint: starting a worker schedules an
+    asyncio task, and a sync endpoint runs in a threadpool with no running loop.
+
+    Every operation — translate, AI resolve, pronoun fix — comes through here, which is
+    why they all appear in Activity and why only one of them can touch a novel's
+    state.json at a time. A repair requested while a translation runs simply queues
+    behind it rather than racing it.
+    """
     existing_id = _active_job_by_project.get(pid)
     if existing_id and existing_id in _jobs and not _jobs[existing_id].done:
         job = _jobs[existing_id]
@@ -1702,18 +2642,38 @@ async def start_translation(pid: str, req: TranslateRequest) -> dict:
     return {"job_id": job.id, "queued": added, **job.queue_state()}
 
 
+class CancelRequest(BaseModel):
+    # Default false preserves the original semantics ("clear the queue, let the running
+    # chapter finish"); true also stops the chapter in flight.
+    stop_current: bool = False
+
+
 @app.post("/api/projects/{pid}/translate/cancel")
-def cancel_queue(pid: str) -> dict:
-    """Drop the not-yet-started chapters from the queue. The in-flight one finishes."""
+def cancel_queue(pid: str, req: CancelRequest = CancelRequest()) -> dict:
+    """Drop the not-yet-started chapters from the queue.
+
+    With ``stop_current`` the chapter being translated right now is stopped too. That
+    can't be done by killing the worker thread, so it sets ``job.abort``, which the
+    translator polls between streamed messages and turns into ``TranslationAborted``.
+    A stopped chapter is never marked failed and never overwrites good output.
+    """
     require_project(pid)
     jid = _active_job_by_project.get(pid)
     if jid and jid in _jobs and not _jobs[jid].done:
         job = _jobs[jid]
         job.pending.clear()
-        job.queued = {job.current} if job.current is not None else set()
+        stopped = None
+        if req.stop_current:
+            stopped = job.current
+            job.cancelled = True     # ends the drain loop after the current chapter unwinds
+            job.abort.set()          # cooperative stop inside the in-flight agent call
+            job.queued.clear()
+        else:
+            job.queued = {job.current} if job.current is not None else set()
         job.wake.set()  # a worker waiting out a rate limit exits promptly
-        return {"ok": True, "current": job.current, "pending": []}
-    return {"ok": True, "current": None, "pending": []}
+        return {"ok": True, "current": None if req.stop_current else job.current,
+                "pending": [], "stopped": stopped}
+    return {"ok": True, "current": None, "pending": [], "stopped": None}
 
 
 @app.post("/api/projects/{pid}/translate/resume")
@@ -1769,6 +2729,12 @@ async def stream_job(pid: str, job_id: str, request: Request) -> StreamingRespon
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 if ev.get("type") in ("done", "paused"):
                     return
+            # Deltas are deliberately not in history (they'd evict the real events), so
+            # catch a mid-chapter consumer up with one snapshot of the text so far —
+            # otherwise a reload during a long chapter lands on an empty console.
+            frame = job.live_frame()
+            if frame is not None:
+                yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
             while True:
                 # Wake periodically even with no events so a client that navigated away
                 # or closed the tab is detected and its subscriber queue is released —

@@ -55,7 +55,7 @@ export const STEPS = [
       'Open a novel and click “Glossary” at the top.',
       'New names the app finds appear under “New terms to review” — approve or fix them.',
       'If some chapters are already in English, click “Learn names” to copy those spellings in automatically.',
-      'Already know the names? Click “Bulk add” and paste them separated by commas — the app works out which are people, places, or terms.',
+      'Already know the names? Click “Bulk add” and paste them — a plain comma-separated list, a spreadsheet table, or JSON with full details. Types you include are added instantly; the app only asks Claude to label the ones you leave blank.',
       'A name showing “— EN” is an English spelling to match (its Korean isn’t known yet — that fills in as you translate).',
     ],
   },
@@ -125,4 +125,4 @@ export const FAQ = [
 ]
 
 export const COST_NOTE =
-  'These use your Claude plan: Translate, Learn names, Bulk add, and Deep check. Reading, copying, searching, and exporting are free.'
+  'These use your Claude plan: Translate, Learn names, Bulk add (only when it has to detect types), and Deep check. Reading, copying, searching, and exporting are free.'

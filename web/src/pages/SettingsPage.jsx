@@ -4,8 +4,8 @@ import { api } from '../api'
 import { Dot } from '../components/ui'
 
 const MODELS = [
-  { id: 'claude-opus-4-8', label: 'Opus — best quality (recommended)' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet — faster, lighter' },
+  { id: 'claude-opus-5', label: 'Opus — best quality (recommended)' },
+  { id: 'claude-sonnet-5', label: 'Sonnet — near-Opus quality, faster' },
   { id: 'claude-haiku-4-5', label: 'Haiku — fastest, simplest' },
 ]
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']

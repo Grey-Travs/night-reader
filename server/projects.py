@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import re
 import shutil
 import uuid
@@ -22,6 +21,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from translation_bot.atomic import atomic_write_text
 from translation_bot.config import Config
 from translation_bot.docs_extract import Chapter
 from translation_bot.text_source import chapters_to_records, records_to_chapters
@@ -57,10 +57,7 @@ def _now() -> str:
 def _atomic_write_json(path: Path, data: dict) -> None:
     """Write JSON via a temp file + os.replace so a crash or a concurrent reader can
     never observe a half-written/truncated file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def list_projects() -> list[dict]:
@@ -179,14 +176,10 @@ def cache_source(pid: str, chapters: list[Chapter]) -> None:
     project folder is fully self-contained: it can then be read (with the Korean
     source) on any device, copied, or backed up without re-fetching the doc."""
     path = PROJECTS_DIR / pid / "source.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic write so a crash mid-write never leaves a half-written snapshot.
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(
-        json.dumps(chapters_to_records(chapters), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    atomic_write_text(
+        path, json.dumps(chapters_to_records(chapters), ensure_ascii=False, indent=2)
     )
-    os.replace(tmp, path)
 
 
 def load_cached_source(pid: str) -> list[Chapter]:

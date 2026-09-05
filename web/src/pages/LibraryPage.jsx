@@ -3,6 +3,8 @@ import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import NovelCard from '../components/NovelCard'
 import { SkeletonCards } from '../components/ui'
+import { useError } from '../components/ErrorDialog'
+import { errorTitle } from '../errors'
 import { useToast } from '../toast'
 import { useConfirm } from '../confirm'
 
@@ -36,6 +38,35 @@ export default function LibraryPage() {
   const [nameFilter, setNameFilter] = useState('')
   const [queued, setQueued] = useState(0)
   const [queueNovels, setQueueNovels] = useState(0)
+  const showError = useError()
+
+  // Re-translate every Korean chapter of a novel from scratch. Gated behind a confirm
+  // that names the real cost: this re-spends plan allowance on chapters that are already
+  // finished, and it can be dozens of chapters at once.
+  async function retranslateNovel(p) {
+    const n = p.chapter_count || p.translated || 0
+    const ok = await confirm({
+      title: `Re-translate all of “${p.name}”?`,
+      body:
+        `Every Korean chapter is translated again from scratch — around ${n} chapter${n === 1 ? '' : 's'}.\n\n`
+        + `This spends your Claude plan allowance again on chapters that are already done, and at `
+        + `Opus with high effort it can take a long while.\n\n`
+        + `Your current translations are snapshotted first, so any single chapter can still be `
+        + `reverted from the reader. Chapters already in English, and empty tabs, are skipped.\n\n`
+        + `You can stop it at any time from the novel's Activity tab.`,
+      confirmLabel: `Re-translate ${n || 'all'}`,
+    })
+    if (!ok) return
+    try {
+      const res = await api.translate(p.id, { force: true })
+      const count = (res.queued || []).length
+      toast(count
+        ? `Queued ${count} chapter${count === 1 ? '' : 's'} — track it in Activity`
+        : 'Nothing to re-translate (no Korean chapters found)')
+    } catch (e) {
+      showError(e, { context: `re-translating ${p.name}`, onRetry: () => retranslateNovel(p) })
+    }
+  }
 
   async function load() {
     setLoading(true)
@@ -223,7 +254,12 @@ export default function LibraryPage() {
             </div>
           </form>
         )}
-        {error && <div className="mt-3 rounded-btn px-3 py-2 text-sm pill-review">{error}</div>}
+        {error && (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-btn px-3 py-2 text-sm pill-review">
+            <span>{errorTitle(error)}</span>
+            <button onClick={() => showError(error)} className="shrink-0 text-xs underline hover:no-underline">Details →</button>
+          </div>
+        )}
       </section>
 
       {importMsg && (
@@ -293,7 +329,7 @@ export default function LibraryPage() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {shownProjects.map((p) => (
-            <NovelCard key={p.id} p={p} onOpen={open} onToggleArchive={toggleArchive} onRemove={remove} />
+            <NovelCard key={p.id} p={p} onOpen={open} onToggleArchive={toggleArchive} onRemove={remove} onRetranslate={retranslateNovel} />
           ))}
         </div>
       )}

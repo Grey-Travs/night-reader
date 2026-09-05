@@ -17,10 +17,16 @@ from .config import Config
 from .docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
 from .glossary import Glossary, queue_new_terms
 from .google_auth import build_docs_service, get_credentials
-from .sanitize import remove_snippets, strip_reasoning, strip_source_header
+from .sanitize import remove_snippets, strip_export_footer, strip_reasoning, strip_source_header
 from . import state as state_mod
 from .state import State
-from .translator import RateLimitedError, Translator, TranslationResult
+from .translator import (
+    RateLimitedError,
+    StreamHooks,
+    TranslationAborted,
+    TranslationResult,
+    Translator,
+)
 from .validate import ValidationResult, validate_translation
 
 
@@ -30,6 +36,28 @@ def _pad_width(total: int) -> int:
 
 def chapter_filename(index: int, total: int) -> str:
     return f"chapter-{index:0{_pad_width(total)}d}.md"
+
+
+def stripped_chapter(chapter: Chapter) -> Chapter:
+    """The chapter as the MODEL should see it: export header and footer removed.
+
+    Everything that judges a translation has to measure it against this, not against the
+    raw tab. The paragraph and length checks compare output to source, and the raw tab
+    carries three header blocks plus a closing copyright notice that were never meant to
+    be translated — counting them makes a faithful translation look short.
+
+    The server used to validate against the raw chapter while the pipeline validated
+    against the stripped one, so one chapter could get two different verdicts depending on
+    which asked. Both go through here now.
+
+    Returns the original object when there is nothing to strip, so the common path
+    allocates nothing.
+    """
+    clean = strip_export_footer(strip_source_header(chapter.text)[0])
+    if not clean or clean == chapter.text:
+        return chapter
+    return Chapter(index=chapter.index, title=chapter.title,
+                   paragraphs=[p for p in re.split(r"\n\s*\n", clean) if p.strip()])
 
 
 def write_chapter_file(output_dir: Path, index: int, total: int, prose: str) -> Path:
@@ -53,6 +81,29 @@ def write_chapter_file(output_dir: Path, index: int, total: int, prose: str) -> 
 def previous_chapter_path(output_dir: Path, index: int, total: int) -> Path:
     """Path of the retained prior translation (sibling ``previous/`` folder)."""
     return output_dir.parent / "previous" / chapter_filename(index, total)
+
+
+# The audit file records source + translation under fixed headings (see write_audit).
+# It is the ONLY place a needs-review chapter's translation is saved, so this is how
+# the app recovers that prose for display, for Accept, and for the pronoun repair.
+_AUDIT_TRANSLATION_MARK = "## Translation (English)"
+
+
+def read_audit_translation(audit_dir: Path, index: int, total: int) -> str | None:
+    """Recover a chapter's translated prose from its audit copy.
+
+    A needs-review chapter is written ONLY to audit/ (never chapters/), so without this
+    its finished translation is invisible in the app and un-acceptable. The audit is a
+    fixed-format doc — source, then the translation under a known heading — so the prose is
+    everything after that heading."""
+    try:
+        text = (audit_dir / chapter_filename(index, total)).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text or _AUDIT_TRANSLATION_MARK not in text:
+        return None
+    prose = text.rsplit(_AUDIT_TRANSLATION_MARK, 1)[-1].strip()
+    return prose or None
 
 
 def write_audit(
@@ -103,23 +154,28 @@ def _translate_with_retry(
     glossary: Glossary,
     cfg: Config,
     state: State,
+    hooks: StreamHooks | None = None,
 ) -> tuple[TranslationResult, ValidationResult]:
     """Translate, validate, and auto-retry once on failure with the same glossary."""
     relevant = glossary.relevant_to(chapter.text)
     extra = cfg.translation.extra_instruction
 
-    result = translator.translate_chapter(chapter, relevant, extra_instruction=extra)
+    result = translator.translate_chapter(chapter, relevant, extra_instruction=extra, hooks=hooks)
     state.add_usage(chapter.index, result.usage, result.cost_usd)
     state.update(chapter.index, status=state_mod.STATUS_TRANSLATED)
-    validation = validate_translation(chapter, result.prose, cfg.validation)
+    validation = validate_translation(chapter, result.prose, cfg.validation, relevant)
 
     if validation.ok:
         return result, validation
 
-    # One emphatic corrective retry with the same glossary.
-    retry = translator.translate_chapter(chapter, relevant, extra_instruction=extra, retry_reminder=True)
+    # One emphatic corrective retry with the same glossary. The first attempt's text
+    # was already streamed to any watcher, so tell it to discard and start over.
+    if hooks is not None:
+        hooks.reset("retry")
+    retry = translator.translate_chapter(chapter, relevant, extra_instruction=extra,
+                                         retry_reminder=True, hooks=hooks)
     state.add_usage(chapter.index, retry.usage, retry.cost_usd)
-    retry_validation = validate_translation(chapter, retry.prose, cfg.validation)
+    retry_validation = validate_translation(chapter, retry.prose, cfg.validation, relevant)
     retry.warnings = ["[retry attempt]", *retry.warnings]
     return retry, retry_validation
 
@@ -130,6 +186,7 @@ def _deep_check_and_fix(
     result: TranslationResult,
     validation: ValidationResult,
     cfg: Config,
+    glossary=None,
 ) -> tuple[TranslationResult, ValidationResult]:
     """Have Claude read the finished translation and strip any non-story text the fast
     checks can't pattern-match. Runs as a check -> fix -> re-check loop, so a second AI
@@ -138,6 +195,8 @@ def _deep_check_and_fix(
     for _ in range(2):
         try:
             snippets = translator.find_meta_leaks(result.prose)
+        except TranslationAborted:
+            raise  # a user stop must propagate, not be swallowed as a failed deep check
         except Exception:  # noqa: BLE001 — the deep check is a bonus layer, never fatal
             break
         if not snippets:
@@ -148,7 +207,7 @@ def _deep_check_and_fix(
             break  # nothing actually removable -> stop (and don't blank the chapter)
         result.prose = cleaned
         result.warnings = [*result.warnings, f"deep-check removed {n_snip + len(removed)} leak block(s)"]
-        validation = validate_translation(chapter, cleaned, cfg.validation)
+        validation = validate_translation(chapter, cleaned, cfg.validation, glossary)
     return result, validation
 
 
@@ -159,8 +218,13 @@ def process_chapter(
     glossary: Glossary,
     cfg: Config,
     state: State,
+    hooks: StreamHooks | None = None,
 ) -> str:
-    """Run one chapter through translate/validate/write. Returns the final status."""
+    """Run one chapter through translate/validate/write. Returns the final status.
+
+    ``hooks`` is optional live progress (the web worker uses it to stream the English
+    into the UI and to honour a user stop); the CLI passes nothing and behaves as before.
+    """
     if not chapter.paragraphs:
         state.update(
             chapter.index,
@@ -183,22 +247,24 @@ def process_chapter(
             return state_mod.STATUS_ENGLISH
 
     metrics = chapter.metrics  # ORIGINAL — keeps the resumable "done" fingerprint stable
-    # Strip the export-header cruft (URL, title, "N minutes", "NNN화") before the model
-    # sees it, so it can't leak into the translation — but keep in-story part markers
-    # ("33."). The state hash stays on the original, so existing chapters aren't redone.
-    clean_text, _num = strip_source_header(chapter.text)
-    src = chapter
-    if clean_text and clean_text != chapter.text:
-        src = Chapter(index=chapter.index, title=chapter.title,
-                      paragraphs=[p for p in re.split(r"\n\s*\n", clean_text) if p.strip()])
+    # Strip the export cruft (URL, title, "N minutes", the repeated chapter number, and
+    # the closing copyright notice) before the model sees it, so none of it can leak into
+    # the translation. In-story part markers survive — see stripped_chapter. The state
+    # hash stays on the original, so existing chapters aren't redone.
+    src = stripped_chapter(chapter)
 
-    result, validation = _translate_with_retry(translator, src, glossary, cfg, state)
+    # Publish the source AS THE MODEL SEES IT (post header-strip), so a live view lines
+    # the Korean up against the English instead of showing cruft the model never got.
+    if hooks is not None:
+        hooks.source(src.paragraphs)
+
+    result, validation = _translate_with_retry(translator, src, glossary, cfg, state, hooks)
 
     # Optional AI deep-check layer (off | flagged | always). "flagged" only spends a
     # call on chapters the fast checks already rejected; "always" checks every chapter.
     mode = getattr(cfg.translation, "deep_check", "flagged")
     if mode == "always" or (mode == "flagged" and not validation.ok):
-        result, validation = _deep_check_and_fix(translator, src, result, validation, cfg)
+        result, validation = _deep_check_and_fix(translator, src, result, validation, cfg, glossary.relevant_to(src.text))
 
     status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW
     write_audit(cfg.paths.audit_dir, src, total, result, validation, status)
@@ -219,6 +285,7 @@ def process_chapter(
         chunks=result.n_chunks,
         validation=validation.metrics,
         failures=validation.failures,
+        pronoun_conflicts=validation.pronoun_conflicts,
         new_terms_queued=queued,
     )
     return status
@@ -245,11 +312,7 @@ def repair_chapter(
         return state_mod.STATUS_EMPTY
 
     metrics = chapter.metrics  # ORIGINAL hash — keeps the resumable fingerprint stable
-    clean_text, _num = strip_source_header(chapter.text)
-    src = chapter
-    if clean_text and clean_text != chapter.text:
-        src = Chapter(index=chapter.index, title=chapter.title,
-                      paragraphs=[p for p in re.split(r"\n\s*\n", clean_text) if p.strip()])
+    src = stripped_chapter(chapter)
 
     # Layer the corrective instruction on top of any per-novel one (cfg is a per-request copy).
     base = (cfg.translation.extra_instruction or "").strip()
@@ -258,7 +321,7 @@ def repair_chapter(
     result, validation = _translate_with_retry(translator, src, glossary, cfg, state)
     mode = getattr(cfg.translation, "deep_check", "flagged")
     if mode == "always" or (mode == "flagged" and not validation.ok):
-        result, validation = _deep_check_and_fix(translator, src, result, validation, cfg)
+        result, validation = _deep_check_and_fix(translator, src, result, validation, cfg, glossary.relevant_to(src.text))
 
     status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW
     write_audit(cfg.paths.audit_dir, src, total, result, validation, status)
@@ -273,7 +336,130 @@ def repair_chapter(
         chunks=result.n_chunks,
         validation=validation.metrics,
         failures=validation.failures,
+        pronoun_conflicts=validation.pronoun_conflicts,
         new_terms_queued=queued,
+    )
+    return status
+
+
+# --------------------------------------------------------------------------- pronoun repair
+# Every pronoun token the repair pass is allowed to touch. Used to build a "skeleton"
+# of the text with all pronouns blanked out: if the skeleton is unchanged, the model
+# rewrote pronouns and nothing else, which is exactly the contract.
+_PRONOUN_TOKEN_RE = re.compile(
+    r"\b(?:he|him|his|himself|she|her|hers|herself|"
+    r"they|them|their|theirs|themselves)\b", re.I)
+
+
+def _pronoun_skeleton(text: str) -> str:
+    """``text`` with every pronoun blanked and whitespace flattened.
+
+    Whitespace is normalised because a model re-emitting a chapter often reflows a
+    soft-wrapped line without changing a single word; that is harmless. Anything
+    else that differs means real prose was altered.
+    """
+    return re.sub(r"\s+", " ", _PRONOUN_TOKEN_RE.sub("\x00", text)).strip()
+
+
+def pronouns_only_changed(before: str, after: str) -> bool:
+    """True when ``after`` differs from ``before`` in pronoun tokens ONLY.
+
+    This is the safety net for the AI pronoun repair. The model is told not to touch
+    anything but pronouns, but "told not to" is not a guarantee — and silently
+    replacing a chapter the user has read (or hand-edited) with a re-written one
+    would be far worse than not fixing the pronouns at all.
+    """
+    return _pronoun_skeleton(before) == _pronoun_skeleton(after)
+
+
+def current_translation(cfg: Config, index: int, total: int) -> str | None:
+    """The chapter's translated prose, wherever it currently lives.
+
+    A chapter that failed validation is written ONLY to ``audit/`` — never to
+    ``chapters/`` (see :func:`process_chapter`). Mis-gendered chapters are exactly
+    that case, so the pronoun repair has to look in both places or it would find
+    nothing to fix on the chapters that need it most.
+    """
+    path = cfg.paths.output_dir / chapter_filename(index, total)
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+    return read_audit_translation(cfg.paths.audit_dir, index, total)
+
+
+def fix_pronouns_chapter(
+    chapter: Chapter,
+    total: int,
+    translator: Translator,
+    glossary: Glossary,
+    cfg: Config,
+    state: State,
+    *,
+    conflicts: list[dict],
+    hooks: StreamHooks | None = None,
+) -> str:
+    """Correct the pronouns of mis-gendered characters IN PLACE, without re-translating.
+
+    A wrong-gender chapter is usually a good translation with one wrong assumption in
+    it, so re-translating from Korean (what "AI resolve" does) throws away sound prose
+    and re-rolls every other decision. This sends the finished English back with the
+    glossary's authoritative pronouns and accepts the result only if nothing but
+    pronouns moved.
+
+    The prior version is snapshotted to ``previous/`` by :func:`write_chapter_file`, so
+    the reader's compare/revert works exactly as it does after an AI resolve.
+    Returns the resulting status.
+    """
+    if not conflicts:
+        return (state.get(chapter.index) or {}).get("status", state_mod.STATUS_NEEDS_REVIEW)
+
+    before = current_translation(cfg, chapter.index, total)
+    if not before or not before.strip():
+        raise ValueError("This chapter has no saved translation to correct yet.")
+
+    if hooks is not None:
+        # Show the text being corrected in the live console's left-hand column, the
+        # same slot the Korean source occupies during a translation.
+        hooks.source([p for p in re.split(r"\n\s*\n", before) if p.strip()])
+
+    after, usage, cost = translator.fix_pronouns(before, conflicts, hooks=hooks)
+    if usage:
+        state.add_usage(chapter.index, usage, cost)
+
+    if not pronouns_only_changed(before, after):
+        # The model edited prose, not just pronouns. Leave the chapter untouched and
+        # say so — a silent partial rewrite is the one outcome we must never produce.
+        raise ValueError(
+            "The AI changed more than the pronouns, so nothing was written. "
+            "The chapter is exactly as it was — try AI resolve instead."
+        )
+
+    if after.strip() == before.strip():
+        # Nothing was altered. The model is told to leave a pronoun alone when it can't
+        # be sure who it belongs to, so this means the flagged pronouns read correctly
+        # to it. Rewriting the file with identical text and re-running the same check
+        # would just re-raise the same flag, leaving the user pressing a button that
+        # visibly does nothing — so report the dead end instead.
+        raise ValueError(
+            "The AI found no pronouns it could safely change: the ones flagged here "
+            "look correct in context, so they most likely belong to another character. "
+            "Use “Mark fine” to clear the flag, or “AI resolve” to re-translate."
+        )
+
+    write_chapter_file(cfg.paths.output_dir, chapter.index, total, after)
+    validation = validate_translation(chapter, after, cfg.validation,
+                                      glossary.relevant_to(chapter.text))
+    status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW
+    state.update(
+        chapter.index,
+        status=status,
+        title=chapter.title,
+        source_hash=chapter.metrics.content_hash,
+        validation=validation.metrics,
+        failures=validation.failures,
+        pronoun_conflicts=validation.pronoun_conflicts,
     )
     return status
 

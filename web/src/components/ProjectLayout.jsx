@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { api } from '../api'
+import { errorTitle } from '../errors'
+import { useError } from './ErrorDialog'
 import { clearPausedJob, getLastRead, getPausedJob, setPausedJob } from '../prefs'
 
 // The persistent shell for one novel. It OWNS the translation job (the SSE stream,
@@ -15,6 +17,9 @@ function ensureNotifyPermission() {
 function notify(title, body) {
   try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body }) } catch { /* ignore */ }
 }
+
+// What the worker is doing to a chapter, for log lines. Mirrors TASK_LABEL in app.py.
+const TASK_VERB = { translate: 'Translating', resolve: 'AI resolve on', pronouns: 'Fixing pronouns in' }
 
 const subClass = ({ isActive }) => `subtab ${isActive ? 'subtab-active' : ''}`
 
@@ -33,16 +38,27 @@ export default function ProjectLayout() {
   const [running, setRunning] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [log, setLog] = useState([])
+  // The chapter in flight: { index, title, chars, source: [], english, chunk }. Kept
+  // OUT of `log` on purpose — streamed text arrives many times per chapter and would
+  // grow that array without bound while rerendering every line.
+  const [live, setLive] = useState(null)
+  const [totals, setTotals] = useState(null)
   const [paused, setPaused] = useState(null) // { message, resets_at, pending } | null
   // Server-side wait: the worker is riding out a rate limit and resumes by itself.
   const [waiting, setWaiting] = useState(null) // { resume_at, resets_at, message, since } | null
-  const [queue, setQueue] = useState({ current: null, pending: [] })
+  const [queue, setQueue] = useState({ current: null, kind: 'translate', pending: [] })
   const esRef = useRef(null)
   const jobIdRef = useRef(null)
   const resumeRef = useRef(null)
   const resumeJobRef = useRef(null)
   const submittingRef = useRef(false)  // guards against double-submit races
   const dataRef = useRef(null)         // live `data` for long-lived stream closures
+  // The SSE handler is attached once at stream start, so anything it calls has to be
+  // reached through a ref rather than captured from this render's scope.
+  const showError = useError()
+  const showErrorRef = useRef(showError)
+  const enqueueRef = useRef(null)
+  useEffect(() => { showErrorRef.current = showError }, [showError])
 
   // Keep a ref in sync with `data` so the SSE onmessage closure (attached once, at
   // stream start) reads the CURRENT project, not the null it closed over at attach.
@@ -54,7 +70,7 @@ export default function ProjectLayout() {
     try {
       setData(await api.chapters(pid, refresh))
     } catch (e) {
-      setError(String(e.message || e))
+      setError(e)
     } finally {
       setLoading(false)
     }
@@ -74,13 +90,13 @@ export default function ProjectLayout() {
   // restore its pause banner into the novel now being viewed.
   useEffect(() => {
     let alive = true
-    setData(null); setLog([]); setPaused(null); setWaiting(null); setQueue({ current: null, pending: [] }); setRunning(false); setGlossary([])
+    setData(null); setLog([]); setLive(null); setTotals(null); setPaused(null); setWaiting(null); setQueue({ current: null, kind: 'translate', pending: [] }); setRunning(false); setGlossary([])
     load(); loadPending()
     api.activeJob(pid).then((j) => {
       if (!alive) return
       if (j.job_id) {
         setRunning(true)
-        setQueue({ current: j.current ?? null, pending: j.pending || [] })
+        setQueue({ current: j.current ?? null, kind: j.kind || 'translate', pending: j.pending || [] })
         setWaiting(j.waiting ?? null)
         attachStream(j.job_id)
       } else restorePause()
@@ -135,37 +151,85 @@ export default function ProjectLayout() {
     es.onmessage = (ev) => {
       let e
       try { e = JSON.parse(ev.data) } catch { return }  // ignore a malformed/keep-alive frame
-      if ('pending' in e) setQueue({ current: e.current ?? null, pending: e.pending || [] })
+      if ('pending' in e) setQueue({ current: e.current ?? null, kind: e.kind || 'translate', pending: e.pending || [] })
       if ('waiting' in e) setWaiting(e.waiting ?? null)
       if (e.type === 'start') {
         setRowStatus(e.index, 'translating')
-        setLog((l) => [...l, `Translating chapter ${e.index}…`])
+        setLive({
+          index: e.index, title: e.title, chars: e.chars, model: e.model, effort: e.effort,
+          task: e.kind || 'translate',
+          source: [], english: '', committed: '', chunk: [1, 1],
+          started_at: e.started_at || Date.now() / 1000,
+        })
+        setLog((l) => [...l, { kind: 'info', text: `${TASK_VERB[e.kind] || TASK_VERB.translate} chapter ${e.index}…` }])
+      } else if (e.type === 'live') {
+        // Catch-up frame for a stream that connected mid-chapter (reload, second tab).
+        setLive({
+          index: e.index, title: e.title, chars: e.chars,
+          source: e.source || [], english: e.english || '', committed: e.committed || '',
+          chunk: e.chunk || [1, 1], started_at: e.started_at,
+        })
+      } else if (e.type === 'source') {
+        setLive((v) => (v && v.index === e.index ? { ...v, source: e.source || [] } : v))
+      } else if (e.type === 'delta') {
+        setLive((v) => (v && v.index === e.index
+          ? { ...v, english: v.english + (e.text || ''), chunk: e.chunk || v.chunk }
+          : v))
+      } else if (e.type === 'chunk') {
+        setLive((v) => (v && v.index === e.index
+          ? { ...v, chunk: e.chunk || v.chunk, committed: v.english }
+          : v))
+      } else if (e.type === 'reset') {
+        setLive((v) => (v && v.index === e.index ? { ...v, english: e.english || '' } : v))
+        setLog((l) => [...l, { kind: 'warn', text: `Restarting (${e.reason})…` }])
       } else if (e.type === 'chapter') {
         setRowStatus(e.index, e.status)
-        setLog((l) => [...l, `Chapter ${e.index}: ${e.skipped ? 'already done' : e.status}`])
+        setLive(null)
+        if (e.totals) setTotals(e.totals)
+        // `refused` means a repair declined to write anything — the chapter is exactly
+        // as it was. That's a warning, not a failure, and the text must say so.
+        const what = e.aborted ? 'stopped' : e.skipped ? 'already done'
+          : e.refused ? 'left unchanged' : e.status
+        setLog((l) => [...l, {
+          kind: e.status === 'failed' ? 'error' : e.refused ? 'warn'
+            : e.status === 'validated' ? 'good' : 'info',
+          text: `Chapter ${e.index}: ${what}${e.error ? ` — ${e.error}` : ''}`,
+        }])
+        // A mid-queue failure carries the same explanation the HTTP layer produces, so
+        // surface it the same way rather than leaving it as one grey log line.
+        if (e.status === 'failed' && e.explain) {
+          showErrorRef.current?.(e.explain, {
+            context: `translating chapter ${e.index}`,
+            onRetry: () => enqueueRef.current?.([e.index], true),
+          })
+        }
       } else if (e.type === 'queued') {
-        setLog((l) => [...l, `Queued ${(e.added || []).length} chapter${(e.added || []).length === 1 ? '' : 's'}`])
+        setLog((l) => [...l, { kind: 'info', text: `Queued ${(e.added || []).length} chapter${(e.added || []).length === 1 ? '' : 's'}` }])
       } else if (e.type === 'waiting') {
         // The SERVER is riding this out and will resume by itself — keep the
         // stream open and `running` true; no client timer. localStorage is kept
         // in sync only as a fallback for a server restart mid-wait.
         const when = e.resume_at ? new Date(e.resume_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'soon'
-        setLog((l) => [...l, `Rate limit reached — waiting for Claude to refresh (resumes ~${when})`])
+        setLive(null)
+        setLog((l) => [...l, { kind: 'warn', text: `Rate limit reached — waiting for Claude to refresh (resumes ~${when})` }])
         notify('Waiting for Claude to refresh', 'Translation will resume automatically.')
         setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: e.pending || [] })
       } else if (e.type === 'resumed') {
-        setLog((l) => [...l, 'Claude refreshed — resuming…'])
+        setLog((l) => [...l, { kind: 'info', text: 'Claude refreshed — resuming…' }])
         clearPausedJob(pid)
       } else if (e.type === 'paused') {
         const pend = e.pending || []
         setPaused({ message: e.message, resets_at: e.resets_at, pending: pend })
-        setLog((l) => [...l, `Paused: ${e.message}`])
+        setLive(null)
+        setLog((l) => [...l, { kind: 'warn', text: `Paused: ${e.message}` }])
         notify('Translation paused', e.message)
         setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: pend })
         scheduleResume(e.resets_at)
         finish(es)
       } else if (e.type === 'done') {
-        setLog((l) => [...l, 'Done.'])
+        if (e.totals) setTotals(e.totals)
+        setLive(null)
+        setLog((l) => [...l, { kind: 'good', text: 'Done.' }])
         clearPausedJob(pid)
         notify('Translation complete', `${dataRef.current?.project?.name || 'Your novel'} — chapters are ready.`)
         finish(es)
@@ -174,44 +238,91 @@ export default function ProjectLayout() {
     es.onerror = () => { if (es.readyState === EventSource.CLOSED) finish(es) }
   }
 
-  async function enqueue(indices, force = false, { foldBacklog = true } = {}) {
+  // Every operation on this novel — translate, AI resolve, fix pronouns — goes through
+  // one submit path, because they all queue on the SAME server-side worker. That's what
+  // puts a repair in the Activity view and on the live console for free, and it's why a
+  // repair requested mid-translation queues behind it instead of racing it.
+  async function submitTask(call, { context, onRetry, resetLog = true } = {}) {
     // Re-entrancy guard: a rapid second click (or a resume firing mid-start) must not
     // race the first request and attach a second EventSource for the same job.
-    if (submittingRef.current) return
+    if (submittingRef.current) return null
     submittingRef.current = true
     setSubmitting(true)
     const wasIdle = !esRef.current
-    const backlog = wasIdle && foldBacklog
-      ? ((paused?.pending?.length ? paused.pending : getPausedJob(pid)?.pending) || [])
-      : []
     if (wasIdle) {
       clearResumeTimer()
       clearPausedJob(pid)
       setPaused(null)
-      setLog([])
+      if (resetLog) setLog([])
+      setLive(null)
       setRunning(true)
       ensureNotifyPermission()
     }
     try {
-      const res = await api.translate(pid, { ...(indices ? { indices } : {}), force })
-      setQueue({ current: res.current ?? null, pending: res.pending || [] })
+      const res = await call()
+      if (!res.job_id) {
+        // Nothing was queued — the request resolved on the spot (a pronoun flag that
+        // turned out to be stale clears itself without a model call). There is no job
+        // to stream, so undo the optimistic "running" or the novel would sit there
+        // claiming to be busy forever, and pick up the new state instead.
+        setQueue({ current: null, kind: 'translate', pending: [] })
+        if (wasIdle) setRunning(false)
+        if (res.message) setLog((l) => [...l, { kind: 'good', text: res.message }])
+        load()
+        return res
+      }
+      setQueue({ current: res.current ?? null, kind: res.kind || 'translate', pending: res.pending || [] })
       if (jobIdRef.current !== res.job_id) {
         esRef.current?.close()
         attachStream(res.job_id)
         setRunning(true)
       }
-      if (backlog.length) {
-        const more = await api.translate(pid, { indices: backlog, force: true })
-        setQueue({ current: more.current ?? null, pending: more.pending || [] })
-      }
+      return res
     } catch (e) {
-      setError(String(e.message || e))
+      setError(e)
+      showError(e, { context, onRetry })
       if (wasIdle) setRunning(false)
+      return null
     } finally {
       submittingRef.current = false
       setSubmitting(false)
     }
   }
+
+  async function enqueue(indices, force = false, { foldBacklog = true } = {}) {
+    const wasIdle = !esRef.current
+    const backlog = wasIdle && foldBacklog
+      ? ((paused?.pending?.length ? paused.pending : getPausedJob(pid)?.pending) || [])
+      : []
+    const res = await submitTask(
+      () => api.translate(pid, { ...(indices ? { indices } : {}), force }),
+      { context: 'starting a translation', onRetry: () => enqueue(indices, force) },
+    )
+    if (res && backlog.length) {
+      try {
+        const more = await api.translate(pid, { indices: backlog, force: true })
+        setQueue({ current: more.current ?? null, kind: more.kind || 'translate', pending: more.pending || [] })
+      } catch { /* the main request already started; a failed backlog fold isn't fatal */ }
+    }
+  }
+  enqueueRef.current = enqueue
+
+  // AI resolve: re-translate ONE flagged chapter with a correction aimed at what failed.
+  const resolveChapter = (index) => submitTask(
+    () => api.resolveChapter(pid, index),
+    { context: `AI resolve on chapter ${index}`, onRetry: () => resolveChapter(index), resetLog: false },
+  )
+
+  // Fix pronouns: rewrite only the mis-gendered pronouns, keeping the existing prose.
+  const fixPronouns = (index) => submitTask(
+    () => api.fixPronouns(pid, index),
+    { context: `fixing pronouns in chapter ${index}`, onRetry: () => fixPronouns(index), resetLog: false },
+  )
+
+  const fixPronounsFlagged = () => submitTask(
+    () => api.fixPronounsFlagged(pid),
+    { context: 'fixing pronouns across this novel', onRetry: () => fixPronounsFlagged(), resetLog: false },
+  )
 
   function finish(es) {
     es?.close()
@@ -220,12 +331,12 @@ export default function ProjectLayout() {
     jobIdRef.current = null
     setRunning(false)
     setWaiting(null)
-    setQueue({ current: null, pending: [] })
+    setQueue({ current: null, kind: 'translate', pending: [] })
     load()
     loadPending()
   }
 
-  async function cancelQueue() {
+  async function cancelQueue({ stopCurrent = false } = {}) {
     // Cancelling must also cancel a pending auto-resume — otherwise the timer fires
     // later and silently re-enqueues the backlog the user just cleared.
     clearResumeTimer()
@@ -233,11 +344,23 @@ export default function ProjectLayout() {
     setPaused(null)
     setWaiting(null)
     try {
-      const r = await api.cancelQueue(pid)
-      setQueue({ current: r.current ?? null, pending: r.pending || [] })
-      setLog((l) => [...l, 'Queue cleared.'])
-    } catch (e) { setError(String(e.message || e)) }
+      const r = await api.cancelQueue(pid, stopCurrent)
+      setQueue({ current: r.current ?? null, kind: r.kind || 'translate', pending: r.pending || [] })
+      setLog((l) => [...l, {
+        kind: 'warn',
+        text: stopCurrent
+          ? `Stopping${r.stopped != null ? ` chapter ${r.stopped}` : ''}…`
+          : 'Queue cleared.',
+      }])
+    } catch (e) {
+      setError(e)
+      showError(e, { context: stopCurrent ? 'stopping the translation' : 'clearing the queue' })
+    }
   }
+  // Stop the chapter mid-flight as well as clearing the backlog. The server can't kill
+  // the worker thread, so this asks the translator to bail out cooperatively — it lands
+  // within a message or two rather than instantly.
+  const stopAll = () => cancelQueue({ stopCurrent: true })
 
   function setProjectMeta(updated) {
     setData((d) => d && { ...d, project: { ...d.project, ...updated } })
@@ -258,9 +381,11 @@ export default function ProjectLayout() {
 
   const ctx = {
     pid, status, data, loading, error, reload: load, loadPending, pendingCount, glossary,
-    setRowStatus, setProjectMeta,
+    setRowStatus, setProjectMeta, showError,
     chapters, offline, counts, koreanTotal, done, remaining,
-    running, submitting, log, paused, waiting, queue, totalQueued, enqueue, cancelQueue, resumeJob,
+    running, submitting, log, live, totals: totals || data?.totals, paused, waiting,
+    queue, totalQueued, enqueue, cancelQueue, stopAll, resumeJob,
+    resolveChapter, fixPronouns, fixPronounsFlagged,
   }
 
   return (
@@ -309,7 +434,19 @@ export default function ProjectLayout() {
         </div>
       </header>
 
-      {error && <div className="mx-auto mt-4 max-w-6xl px-6"><div className="rounded-card px-3 py-2 text-sm pill-review">{error}</div></div>}
+      {error && (
+        <div className="mx-auto mt-4 max-w-6xl px-6">
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-card px-3 py-2 text-sm pill-review">
+            <span>{errorTitle(error)}</span>
+            <button
+              onClick={() => showError(error)}
+              className="shrink-0 text-xs underline hover:no-underline"
+            >
+              Details →
+            </button>
+          </div>
+        </div>
+      )}
 
       <Outlet context={ctx} />
     </div>

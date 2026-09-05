@@ -29,12 +29,19 @@ You are an expert literary translator who adapts web novels into dynamic, natura
 - Use the glossary's spellings and choices exactly; be fully consistent with established names and terms.
 - Keep relational honorifics like -hyung (and similar) attached to names. Localize or drop the address particles -ssi, -ya, -ah, and -nim into natural English rather than romanizing them.
 {honorific_note_line}\
+**Character gender & pronouns:**
+- Korean routinely omits subjects and pronouns; you must supply them in English. Never re-guess a character's gender sentence-by-sentence.
+- Glossary entries may carry a `[pronoun: ...]` tag. That pronoun is authoritative for that character — use it for every reference to them, in narration and dialogue, throughout the chapter.
+- A `[register: ...]` tag describes how that character speaks (formal/casual); keep their dialogue tone consistent with it.
+- For characters without a tag, determine gender ONCE from context — honorifics are strong evidence (-hyung and -oppa address an older male; -noona and -unnie address an older female), as are titles and descriptions — then keep that gender consistent for the whole chapter.
+- Never flip a character's gender mid-chapter and never contradict a glossary pronoun tag. If the source truly gives no evidence, prefer repeating the name or using they/them over guessing.
+
 **Glossary — locked reference, do not change these spellings:**
 {glossary_block}
 {names_section}
 **Output contract:**
 1. First, the translated chapter as clean Markdown prose only — no translator's notes, no glossary inside the prose.
-2. Then a line containing only `{delimiter}`, followed by a JSON array of names/terms newly encountered in this chapter that are not already in the glossary: `[{{"korean": "...", "english": "...", "type": "name|place|skill|term|other", "note": "..."}}]`. If none, output `[]`. Output nothing after this block.
+2. Then a line containing only `{delimiter}`, followed by a JSON array of names/terms newly encountered in this chapter that are not already in the glossary: `[{{"korean": "...", "english": "...", "type": "name|place|skill|term|other", "note": "...", "pronoun": "he|she|they|unknown"}}]`. For `name` entries set `"pronoun"` to the character's gender as evidenced in THIS chapter (honorifics, titles, descriptions) and mention the evidence in `note`; use `"unknown"` when the chapter gives no evidence. For non-name entries use `""`. If none, output `[]`. Output nothing after this block.
 
 **CRITICAL — no thinking in the output.** Do all reasoning, name-checking, and self-correction silently (in your private thinking), never in the answer. The prose section must contain ONLY the finished translated chapter. Never write meta-commentary such as "Wait", "Let me redo", "Let me re-read", "Actually the name is…", "the narrator is…", "the glossary says…", or a first draft followed by a corrected one. If you change your mind about a name or wording, output only the final corrected text — no drafts, no notes, no "---" separating attempts.
 {web_access_line}\
@@ -63,9 +70,11 @@ must keep consistent: character names, place names, organizations, skills/abilit
 techniques, and special in-world terms. For each, give the exact English spelling as it
 appears, a type, and a short note for characters (who they are) when clear from the text.
 Ignore common words, sentence-initial capitalization, one-off mentions, and generic nouns.
+For "name" entries, set "pronoun" to the pronoun the text itself uses for that character;
+"unknown" if it is never clear. For non-name entries use "".
 
 Output ONLY a JSON array, nothing else:
-[{"english": "...", "type": "name|place|skill|term|other", "note": "..."}]
+[{"english": "...", "type": "name|place|skill|term|other", "note": "...", "pronoun": "he|she|they|unknown"}]
 If you find nothing, output [].
 """
 
@@ -84,6 +93,60 @@ Web-novel context matters: single capitalized fantasy words are usually characte
 
 Output ONLY a JSON array with one object per input line, spelling kept EXACTLY as given:
 [{"english": "...", "type": "name|place|skill|term|other"}]
+"""
+
+
+PRONOUN_FIX_PROMPT = """\
+You are correcting the pronouns in an ALREADY-TRANSLATED English chapter of a web
+novel. Korean omits subjects, so the translator guessed some characters' gender
+wrongly. The glossary is authoritative, and you are given the correct pronoun for
+each affected character.
+
+You are given (1) a list of characters and the pronoun each one MUST take, and
+(2) the full chapter text.
+
+Rewrite the chapter so that every pronoun referring to a listed character uses
+that character's pronoun. CHANGE NOTHING ELSE.
+
+Hard rules:
+- Do NOT re-translate, rephrase, improve, shorten, expand, or otherwise "fix"
+  anything. This is not an editing pass.
+- Do NOT change wording, names, punctuation, quotes, italics, line breaks, or
+  paragraph breaks. Preserve the curly quotes exactly as they are.
+- The ONLY words you may change are pronoun tokens: he/him/his/himself,
+  she/her/hers/herself, they/them/their/theirs/themselves.
+- Leave pronouns belonging to any OTHER character exactly as they are. Only the
+  listed characters were translated with the wrong gender.
+- If you cannot tell for certain who a pronoun refers to, LEAVE IT UNCHANGED.
+  Leaving a pronoun alone is always safer than changing the wrong one.
+- Get "her" right, because it is two different words:
+    possessive determiner -> "her eyes"    becomes "his eyes"
+    object pronoun        -> "beside her"  becomes "beside him"
+  In the other direction, "his" -> "her" (possessive) but "him" -> "her" (object).
+- Fixed honorific phrases such as "Her Highness" or "His Majesty" belong to
+  whoever holds that title. Do not touch them unless the title holder is one of
+  the listed characters.
+
+Output ONLY the corrected chapter text: no preamble, no notes, no explanation,
+no code fences, and nothing after the chapter.
+"""
+
+
+PRONOUN_DETECT_PROMPT = """\
+You maintain a glossary for a web-novel translation. You are given (1) a list of
+character names, one per line, and (2) sample passages from the novel's English
+chapters. For EACH listed name, determine which pronoun the text itself uses for
+that character:
+- "he"      — referred to as he/him, or clearly male (addressed with -hyung/-oppa, "the boy", "her brother", ...)
+- "she"     — referred to as she/her, or clearly female (addressed with -noona/-unnie, "the girl", "his sister", ...)
+- "they"    — the text deliberately uses they/them for this character
+- "unknown" — the passages never make it clear
+
+Judge ONLY from the provided text. Do not guess from the sound of the name or
+from what names are typically used for.
+
+Output ONLY a JSON array with one object per input name, spelling kept EXACTLY as given:
+[{"english": "...", "pronoun": "he|she|they|unknown", "evidence": "..."}]
 """
 
 

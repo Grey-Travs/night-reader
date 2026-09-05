@@ -1,54 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useOutletContext } from 'react-router-dom'
 import { api } from '../api'
 import Hint from '../components/Hint'
 import { useConfirm } from '../confirm'
+import { FORMAT_LABELS, MAX_UNTYPED, parseBulk, parseGlossaryFile } from '../glossary-parse'
 
 const TYPES = ['name', 'place', 'skill', 'term', 'other']
 const BLANK = { korean: '', english: '', type: 'name', note: '', pronoun: '', register: '' }
-
-// Minimal RFC-4180-ish CSV parser (handles quotes, commas and newlines in fields).
-function parseCsv(text) {
-  const rows = []
-  let row = [], cur = '', q = false
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i]
-    if (q) {
-      if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++ } else q = false }
-      else cur += c
-    } else if (c === '"') q = true
-    else if (c === ',') { row.push(cur); cur = '' }
-    else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = '' }
-    else if (c !== '\r') cur += c
-  }
-  if (cur !== '' || row.length) { row.push(cur); rows.push(row) }
-  return rows.filter((r) => r.some((x) => x.trim() !== ''))
-}
-
-function parseGlossaryFile(name, text) {
-  if (name.toLowerCase().endsWith('.json') || text.trim().startsWith('[')) {
-    const arr = JSON.parse(text)
-    return (Array.isArray(arr) ? arr : []).map((e) => ({
-      korean: e.korean || '', english: e.english || '', type: e.type || 'other',
-      note: e.note || '', pronoun: e.pronoun || '', register: e.register || '',
-    }))
-  }
-  const rows = parseCsv(text)
-  if (!rows.length) return []
-  const header = rows[0].map((h) => h.trim().toLowerCase())
-  const hasHeader = header.includes('korean') && header.includes('english')
-  const at = (n) => header.indexOf(n)
-  const col = hasHeader
-    ? { korean: at('korean'), english: at('english'), type: at('type'), note: at('note'), pronoun: at('pronoun'), register: at('register') }
-    : { korean: 0, english: 1, type: 2, note: 5, pronoun: 3, register: 4 }
-  const body = hasHeader ? rows.slice(1) : rows
-  const cell = (r, i) => (i >= 0 && i < r.length ? (r[i] || '').trim() : '')
-  return body.map((r) => ({
-    korean: cell(r, col.korean), english: cell(r, col.english),
-    type: cell(r, col.type) || 'other', note: cell(r, col.note),
-    pronoun: cell(r, col.pronoun), register: cell(r, col.register),
-  }))
-}
 
 export default function GlossaryPage() {
   const { pid, loadPending, enqueue } = useOutletContext()
@@ -75,9 +33,16 @@ export default function GlossaryPage() {
   const [affected, setAffected] = useState(null)
   const [learning, setLearning] = useState(false)
   const [learnMsg, setLearnMsg] = useState(null)
+  const [detecting, setDetecting] = useState(false)
+  const [detectMsg, setDetectMsg] = useState(null)
   const [projects, setProjects] = useState([])
   const [copyFrom, setCopyFrom] = useState('')
   const [copyMsg, setCopyMsg] = useState(null)
+  // Multi-select: pending rows keyed by korean|english, locked rows by entryId.
+  const [pendingSel, setPendingSel] = useState(() => new Set())
+  const [lockedSel, setLockedSel] = useState(() => new Set())
+  const [lastPending, setLastPending] = useState(null)  // anchors for shift-click ranges
+  const [lastLocked, setLastLocked] = useState(null)
   const fileRef = useRef(null)
 
   const entryId = (e) => (e.korean ? `k:${e.korean}` : `e:${e.english}`)
@@ -89,10 +54,14 @@ export default function GlossaryPage() {
     d.locked = d.locked || []
     setData(d)
     const init = {}
-    for (const p of d.pending) init[pkey(p)] = { english: p.english, type: p.type || 'other', note: p.note || '' }
+    for (const p of d.pending) init[pkey(p)] = { english: p.english, type: p.type || 'other', note: p.note || '', pronoun: p.pronoun || '' }
     setDrafts(init)
+    setPendingSel(new Set()); setLastPending(null)  // the queue was just replaced
   }
-  useEffect(() => { load().catch((e) => setError(String(e.message || e))) }, [pid])
+  useEffect(() => {
+    setLockedSel(new Set()); setLastLocked(null)
+    load().catch((e) => setError(String(e.message || e)))
+  }, [pid])
   useEffect(() => { api.listProjects().then((d) => setProjects(d.projects || [])).catch(() => {}) }, [])
 
   async function copyFromNovel() {
@@ -112,15 +81,53 @@ export default function GlossaryPage() {
     setDrafts((d) => ({ ...d, [key]: { ...d[key], [field]: value } }))
   }
 
+  // ---- multi-select ---------------------------------------------------------
+  // One click toggles a row; shift-click extends from the last clicked row, using
+  // the order the rows are currently rendered in (so it matches what you see).
+  function rowCheck(e, id, ids, setSel, anchor, setAnchor) {
+    if (e.shiftKey && anchor != null) {
+      const a = ids.indexOf(anchor), b = ids.indexOf(id)
+      if (a !== -1 && b !== -1) {
+        const [lo, hi] = a < b ? [a, b] : [b, a]
+        setSel((s) => { const n = new Set(s); ids.slice(lo, hi + 1).forEach((i) => n.add(i)); return n })
+        setAnchor(id)
+        return
+      }
+    }
+    setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
+    setAnchor(id)
+  }
+  function toggleAll(ids, allOn, setSel) {
+    setSel((s) => { const n = new Set(s); ids.forEach((i) => allOn ? n.delete(i) : n.add(i)); return n })
+  }
+
   async function decide(approve, reject) {
     setBusy(true); setError(null)
     try { await api.reviewGlossary(pid, { approve, reject }); await load(); onChanged?.() }
     catch (e) { setError(String(e.message || e)) }
     finally { setBusy(false) }
   }
-  const approveOne = (p) => decide([{ korean: p.korean, ...drafts[pkey(p)] }], [])
+  // Derived from the live list, so an id left over from a row that's since gone
+  // simply drops out of the selection instead of showing a phantom count.
+  const pendingRows = data?.pending || []
+  const selectedPending = pendingRows.filter((p) => pendingSel.has(pkey(p)))
+  const allPendingSelected = pendingRows.length > 0 && selectedPending.length === pendingRows.length
+
+  const asDecision = (p) => ({ korean: p.korean, ...drafts[pkey(p)] })
+  const approveOne = (p) => decide([asDecision(p)], [])
   const rejectOne = (p) => decide([], [p.korean])
-  const approveAll = () => decide((data?.pending || []).map((p) => ({ korean: p.korean, ...drafts[pkey(p)] })), [])
+  const approveAll = () => decide((data?.pending || []).map(asDecision), [])
+  const approveSelected = () => selectedPending.length && decide(selectedPending.map(asDecision), [])
+  async function rejectSelected() {
+    const n = selectedPending.length
+    if (!n) return
+    if (!(await confirm({
+      title: `Reject ${n} term${n === 1 ? '' : 's'}?`,
+      body: 'They go back to being unknown — a later chapter can propose them again.',
+      confirmLabel: 'Reject', danger: true,
+    }))) return
+    decide([], selectedPending.map((p) => p.korean))
+  }
 
   async function saveTerm(body) {
     setBusy(true); setError(null)
@@ -157,6 +164,27 @@ export default function GlossaryPage() {
     finally { setBusy(false) }
   }
 
+  async function removeSelectedTerms() {
+    const items = selectedLocked
+    if (!items.length) return
+    const names = items.slice(0, 5).map((e) => e.korean || e.english).join(', ')
+    if (!(await confirm({
+      title: `Remove ${items.length} term${items.length === 1 ? '' : 's'}?`,
+      body: `Remove ${names}${items.length > 5 ? ` and ${items.length - 5} more` : ''} from the glossary?`,
+      confirmLabel: 'Remove', danger: true,
+    }))) return
+    setBusy(true); setError(null)
+    try {
+      const d = await api.deleteGlossaryTerms(pid, {
+        terms: items.map((e) => ({ korean: e.korean || '', english: e.english || '' })),
+      })
+      setData((cur) => cur && { ...cur, locked: d.locked })
+      if (editing && items.some((e) => entryId(e) === editing)) setEditing(null)
+      setLockedSel(new Set()); setLastLocked(null)
+    } catch (err) { setError(String(err.message || err)) }
+    finally { setBusy(false) }
+  }
+
   async function learnNames() {
     setLearning(true); setError(null); setLearnMsg(null)
     try {
@@ -167,19 +195,63 @@ export default function GlossaryPage() {
     finally { setLearning(false) }
   }
 
+  async function detectPronouns() {
+    setDetecting(true); setError(null); setDetectMsg(null)
+    try {
+      const d = await api.detectPronouns(pid)
+      setData((cur) => cur && { ...cur, locked: d.locked })
+      const n = (d.filled || []).length
+      const m = (d.unresolved || []).length
+      setDetectMsg(`Filled ${n} pronoun${n === 1 ? '' : 's'}` +
+        (m ? ` · ${m} character${m === 1 ? '' : 's'} unclear from the text — set manually.` : '.'))
+    } catch (e) { setError(String(e.message || e)) }
+    finally { setDetecting(false) }
+  }
+
+  // Parsed live so the panel can show what the paste was understood as before
+  // anything is submitted. type === '' rows are the only ones that use the plan.
+  const bulk = useMemo(() => (bulkText.trim() ? parseBulk(bulkText) : null), [bulkText])
+  const bulkRows = useMemo(() => (bulk?.rows || []).filter((r) => !r.invalid), [bulk])
+  const bulkInvalid = (bulk?.rows.length || 0) - bulkRows.length
+  const bulkUntyped = bulkRows.filter((r) => !r.type).length
+  const bulkSummary = useMemo(() => {
+    if (!bulk || bulk.error || !bulkRows.length) return null
+    const byType = {}
+    for (const r of bulkRows) if (r.type) byType[r.type] = (byType[r.type] || 0) + 1
+    const parts = Object.entries(byType).map(([t, n]) => `${n} ${t}${n === 1 ? '' : 's'}`)
+    let s = `${FORMAT_LABELS[bulk.format] || 'Rows'} · ${bulkRows.length} row${bulkRows.length === 1 ? '' : 's'}`
+    if (parts.length) s += ` — ${parts.join(', ')}`
+    if (bulkUntyped) s += ` · ${bulkUntyped} will have ${bulkUntyped === 1 ? 'its type' : 'types'} auto-detected (uses your Claude plan)`
+    return s
+  }, [bulk, bulkRows, bulkUntyped])
+
   async function bulkAdd() {
-    if (!bulkText.trim()) return
+    if (!bulkRows.length || bulk?.error) return
     setBulkBusy(true); setError(null); setBulkMsg(null)
     try {
-      const d = await api.bulkAddGlossary(pid, bulkText)
+      const entries = bulkRows.map(({ korean, english, type, note, pronoun, register }) =>
+        ({ korean, english, type, note, pronoun, register }))
+      const d = await api.bulkAddGlossary(pid, { entries })
       setData((cur) => cur && { ...cur, locked: d.locked })
       const byType = {}
       for (const a of d.added || []) byType[a.type] = (byType[a.type] || 0) + 1
       const parts = Object.entries(byType).map(([t, n]) => `${n} ${t}${n === 1 ? '' : 's'}`)
-      setBulkMsg(`Added ${(d.added || []).length}${parts.length ? ` (${parts.join(', ')})` : ''}` +
-        `${d.skipped?.length ? ` · ${d.skipped.length} already in glossary` : ''}.`)
-      setBulkText('')
-      setBulkOpen(false)
+      let msg = `Added ${(d.added || []).length}${parts.length ? ` (${parts.join(', ')})` : ''}`
+      if (d.updated?.length) msg += ` · ${d.updated.length} updated with Korean`
+      if (d.skipped?.length) {
+        const byReason = {}
+        for (const s of d.skipped) byReason[s.reason || 'already in glossary'] = (byReason[s.reason || 'already in glossary'] || 0) + 1
+        msg += ` · skipped ${Object.entries(byReason).map(([r, n]) => `${n} ${r}`).join(', ')}`
+      }
+      if (d.classify_error) {
+        // Typed rows were saved; refill the box with just the leftovers for a retry.
+        setBulkText((d.unclassified || []).join(', '))
+        setBulkMsg(`${msg} — ${(d.unclassified || []).length} left in the box, ${d.classify_error}`)
+      } else {
+        setBulkMsg(msg + '.')
+        setBulkText('')
+        setBulkOpen(false)
+      }
     } catch (e) { setError(String(e.message || e)) }
     finally { setBulkBusy(false) }
   }
@@ -203,6 +275,12 @@ export default function GlossaryPage() {
   const shownLocked = q
     ? locked.filter((e) => (e.korean + e.english + (e.note || '')).toLowerCase().includes(q))
     : locked
+  // Selection survives a search change (it's keyed by term, not row position), so
+  // you can build one up across several searches; "select all" only spans what's shown.
+  const shownIds = shownLocked.map(entryId)
+  const selectedLocked = locked.filter((e) => lockedSel.has(entryId(e)))
+  const allShownSelected = shownIds.length > 0 && shownIds.every((id) => lockedSel.has(id))
+  const hiddenSelected = selectedLocked.length - shownIds.filter((id) => lockedSel.has(id)).length
 
   const fieldRow = (term, onField) => (
     <>
@@ -234,9 +312,22 @@ export default function GlossaryPage() {
       )}
 
       <div className="mb-6">
-        <div className="mb-2 flex items-center justify-between">
-          <h4 className="text-sm font-medium text-muted">New terms to review {data ? `(${data.pending.length})` : ''}</h4>
-          {data?.pending.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            {pendingRows.length > 0 && (
+              <input type="checkbox" checked={allPendingSelected} onChange={() => toggleAll(pendingRows.map(pkey), allPendingSelected, setPendingSel)}
+                aria-label="Select all new terms" title="Select all · tip: shift-click a row to select a range" style={{ accentColor: 'var(--accent)' }} />
+            )}
+            <h4 className="text-sm font-medium text-muted">New terms to review {data ? `(${data.pending.length})` : ''}</h4>
+          </div>
+          {selectedPending.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-muted">{selectedPending.length} selected</span>
+              <button onClick={approveSelected} disabled={busy} className="btn btn-primary px-3 py-1.5 text-xs">Approve selected</button>
+              <button onClick={rejectSelected} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs" style={{ color: 'var(--danger)' }}>Reject selected</button>
+              <button onClick={() => { setPendingSel(new Set()); setLastPending(null) }} className="btn btn-ghost px-2.5 py-1.5 text-xs">Clear</button>
+            </div>
+          ) : pendingRows.length > 0 && (
             <button onClick={approveAll} disabled={busy} className="btn btn-primary px-3 py-1.5 text-xs">Approve all</button>
           )}
         </div>
@@ -247,12 +338,23 @@ export default function GlossaryPage() {
           {data?.pending.map((p) => (
             <div key={pkey(p)} className="rounded-card border border-line p-3">
               <div className="flex flex-wrap items-center gap-2 text-sm">
+                <input type="checkbox" checked={pendingSel.has(pkey(p))} readOnly
+                  onClick={(ev) => rowCheck(ev, pkey(p), pendingRows.map(pkey), setPendingSel, lastPending, setLastPending)}
+                  aria-label={`Select ${p.korean}`} style={{ accentColor: 'var(--accent)' }} />
                 <span className="font-korean font-medium">{p.korean}</span>
                 <span className="text-hint">→</span>
                 <input value={drafts[pkey(p)]?.english ?? ''} onChange={(e) => edit(pkey(p), 'english', e.target.value)} className="input min-w-[10rem] flex-1 !py-1" />
                 <select value={drafts[pkey(p)]?.type ?? 'other'} onChange={(e) => edit(pkey(p), 'type', e.target.value)} className="input !py-1">
                   {TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
                 </select>
+                {(drafts[pkey(p)]?.type ?? p.type) === 'name' && (
+                  <select value={drafts[pkey(p)]?.pronoun ?? ''} onChange={(e) => edit(pkey(p), 'pronoun', e.target.value)} className="input !py-1" title="Pronoun — keeps this character's gender consistent across chapters">
+                    <option value="">pronoun?</option>
+                    <option value="he">he</option>
+                    <option value="she">she</option>
+                    <option value="they">they</option>
+                  </select>
+                )}
                 {p.chapter && <span className="text-xs text-hint">ch.{p.chapter}</span>}
               </div>
               {(p.note || p.conflict_with) && (
@@ -277,12 +379,19 @@ export default function GlossaryPage() {
             the chapters already in English so new translations use the same spellings.
             <Hint text="Claude reads your already-English chapters and lists their names. New translations will then spell those names the same way. Uses your plan." className="ml-1" />
           </div>
-          <button onClick={learnNames} disabled={learning || busy} className="btn btn-primary shrink-0 px-3 py-1.5 text-xs">
-            {learning ? 'Reading chapters…' : 'Learn names'}
-          </button>
+          <div className="flex shrink-0 gap-2">
+            <button onClick={learnNames} disabled={learning || detecting || busy} className="btn btn-primary px-3 py-1.5 text-xs">
+              {learning ? 'Reading chapters…' : 'Learn names'}
+            </button>
+            <button onClick={detectPronouns} disabled={learning || detecting || busy} className="btn btn-ghost px-3 py-1.5 text-xs"
+              title="Fill in he/she/they for characters that don't have a pronoun yet, judged from your English chapters. Never overwrites a pronoun you set yourself.">
+              {detecting ? 'Detecting…' : 'Detect pronouns'}
+            </button>
+          </div>
         </div>
         {learnMsg && <div className="mt-2 text-xs">{learnMsg}</div>}
-        <div className="mt-1 text-xs opacity-80">Uses your Claude plan. Review the results below — a name with no Korean yet is a canonical English spelling to match.</div>
+        {detectMsg && <div className="mt-2 text-xs">{detectMsg}</div>}
+        <div className="mt-1 text-xs opacity-80">Uses your Claude plan. Review the results below — a name with no Korean yet is a canonical English spelling to match. Pronouns keep each character's gender consistent across chapters.</div>
       </div>
 
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -291,24 +400,36 @@ export default function GlossaryPage() {
           {locked.length > 0 && (
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search…" className="input !py-1 text-xs" />
           )}
-          <a href={api.glossaryExportUrl(pid, 'csv')} className="btn btn-ghost px-3 py-1.5 text-xs" title="Download as CSV">Export</a>
-          <button onClick={() => fileRef.current?.click()} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs">Import</button>
-          <input ref={fileRef} type="file" accept=".csv,.json,text/csv,application/json" onChange={onImportFile} className="hidden" />
-          {projects.length > 1 && (
-            <span className="flex items-center gap-1">
-              <select value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)} disabled={busy} className="input !py-1 text-xs" title="Copy locked terms from another novel — keeps a series consistent">
-                <option value="">Copy from…</option>
-                {projects.filter((p) => p.id !== pid).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-              <button onClick={copyFromNovel} disabled={!copyFrom || busy} className="btn btn-ghost px-2.5 py-1.5 text-xs">Copy</button>
-            </span>
+          {selectedLocked.length > 0 ? (
+            <>
+              <span className="text-xs text-muted">
+                {selectedLocked.length} selected{hiddenSelected > 0 ? ` (${hiddenSelected} not shown)` : ''}
+              </span>
+              <button onClick={removeSelectedTerms} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs" style={{ color: 'var(--danger)' }}>Delete selected</button>
+              <button onClick={() => { setLockedSel(new Set()); setLastLocked(null) }} className="btn btn-ghost px-2.5 py-1.5 text-xs">Clear</button>
+            </>
+          ) : (
+            <>
+              <a href={api.glossaryExportUrl(pid, 'csv')} className="btn btn-ghost px-3 py-1.5 text-xs" title="Download as CSV">Export</a>
+              <button onClick={() => fileRef.current?.click()} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs">Import</button>
+              <input ref={fileRef} type="file" accept=".csv,.json,text/csv,application/json" onChange={onImportFile} className="hidden" />
+              {projects.length > 1 && (
+                <span className="flex items-center gap-1">
+                  <select value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)} disabled={busy} className="input !py-1 text-xs" title="Copy locked terms from another novel — keeps a series consistent">
+                    <option value="">Copy from…</option>
+                    {projects.filter((p) => p.id !== pid).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>
+                  <button onClick={copyFromNovel} disabled={!copyFrom || busy} className="btn btn-ghost px-2.5 py-1.5 text-xs">Copy</button>
+                </span>
+              )}
+              <button onClick={() => { setBulkOpen((v) => !v); setBulkMsg(null) }} disabled={busy || bulkBusy} className="btn btn-ghost px-3 py-1.5 text-xs" title="Paste a list, a CSV/TSV table, or JSON arrays of terms — types you provide are added instantly; missing ones are detected automatically">
+                {bulkOpen ? 'Cancel' : 'Bulk add'}
+              </button>
+              <button onClick={() => { setAdding((v) => !v); setNewTerm(BLANK) }} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs">
+                {adding ? 'Cancel' : '＋ Add term'}
+              </button>
+            </>
           )}
-          <button onClick={() => { setBulkOpen((v) => !v); setBulkMsg(null) }} disabled={busy || bulkBusy} className="btn btn-ghost px-3 py-1.5 text-xs" title="Paste a comma-separated list of English names/places/terms — types are detected automatically">
-            {bulkOpen ? 'Cancel' : 'Bulk add'}
-          </button>
-          <button onClick={() => { setAdding((v) => !v); setNewTerm(BLANK) }} disabled={busy} className="btn btn-ghost px-3 py-1.5 text-xs">
-            {adding ? 'Cancel' : '＋ Add term'}
-          </button>
         </div>
       </div>
 
@@ -318,20 +439,60 @@ export default function GlossaryPage() {
       {bulkOpen && (
         <div className="mb-3 rounded-card border border-line p-3">
           <div className="mb-2 text-sm text-muted">
-            Paste English names, places, and terms separated by commas — in any order. The type of each
-            one is detected automatically (and stays editable in the table below). Uses your Claude plan.
+            Paste terms as a plain list, a spreadsheet table (CSV/TSV), or JSON — full entries or
+            groups like {'{"names": […], "places": […]}'}. Rows that come with a type are added
+            instantly and don’t use your plan; only unlabeled terms have their type detected.
           </div>
           <textarea
             value={bulkText}
             onChange={(e) => setBulkText(e.target.value)}
-            placeholder="Kael, Ironhold Citadel, mana core, Sera, …"
-            rows={3}
+            placeholder={'Kael, Ironhold Citadel (place), mana core, …\nor: [{"korean": "카엘", "english": "Kael", "type": "name", "pronoun": "he"}]'}
+            rows={5}
             className="input w-full !py-1.5"
             disabled={bulkBusy}
           />
+          {bulk?.error && <div className="mt-2 rounded-btn px-3 py-2 text-xs pill-review">{bulk.error}</div>}
+          {bulkSummary && (
+            <div className="mt-2 text-xs text-muted">
+              {bulkSummary}
+              {bulkInvalid > 0 && <span style={{ color: 'var(--b-review-tx)' }}> · {bulkInvalid} row{bulkInvalid === 1 ? '' : 's'} can’t be added — open “Show rows”</span>}
+            </div>
+          )}
+          {bulkUntyped > MAX_UNTYPED && (
+            <div className="mt-1 text-xs" style={{ color: 'var(--b-review-tx)' }}>
+              That's over the {MAX_UNTYPED}-term auto-detect limit — add types to the rows, or split the paste.
+            </div>
+          )}
+          {(bulk?.notices || []).map((n, i) => (
+            <div key={i} className="mt-1 text-xs text-muted">· {n}</div>
+          ))}
+          {!bulk?.error && (bulk?.rows.length || 0) > 0 && (
+            <details className="mt-2">
+              <summary className="cursor-pointer text-xs text-muted">Show rows</summary>
+              <div className="mt-1 max-h-48 overflow-y-auto rounded-btn border border-line">
+                <table className="w-full text-xs">
+                  <tbody>
+                    {bulk.rows.map((r, i) => (
+                      <tr key={i} className="border-t border-line first:border-t-0">
+                        <td className="px-2 py-1">{r.english || <span className="text-hint">—</span>}</td>
+                        <td className="px-2 py-1 font-korean">{r.korean}</td>
+                        <td className="px-2 py-1 text-muted">
+                          {r.invalid
+                            ? <span style={{ color: 'var(--b-review-tx)' }}>{r.invalid}</span>
+                            : (r.type || 'auto-detect')}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
           <div className="mt-2 flex gap-2">
-            <button onClick={bulkAdd} disabled={bulkBusy || !bulkText.trim()} className="btn btn-primary px-3 py-1 text-xs">
-              {bulkBusy ? 'Detecting types…' : 'Add all'}
+            <button onClick={bulkAdd} disabled={bulkBusy || !bulkRows.length || !!bulk?.error || bulkUntyped > MAX_UNTYPED} className="btn btn-primary px-3 py-1 text-xs">
+              {bulkBusy
+                ? (bulkUntyped ? 'Detecting types…' : 'Adding…')
+                : `Add ${bulkRows.length || 'all'}${bulkUntyped ? ` · detect ${bulkUntyped} type${bulkUntyped === 1 ? '' : 's'}` : ''}`}
             </button>
             <button onClick={() => { setBulkOpen(false); setBulkText('') }} disabled={bulkBusy} className="btn btn-ghost px-3 py-1 text-xs">Cancel</button>
           </div>
@@ -352,6 +513,17 @@ export default function GlossaryPage() {
 
       <div className="overflow-x-auto rounded-card border border-line">
         <table className="w-full min-w-[380px] text-sm">
+          {shownLocked.length > 0 && (
+            <thead>
+              <tr className="border-b border-line">
+                <th className="w-9 px-3 py-2">
+                  <input type="checkbox" checked={allShownSelected} onChange={() => toggleAll(shownIds, allShownSelected, setLockedSel)}
+                    aria-label="Select all terms" title="Select all shown · tip: shift-click a row to select a range" style={{ accentColor: 'var(--accent)' }} />
+                </th>
+                <th colSpan={4} />
+              </tr>
+            </thead>
+          )}
           <tbody>
             {shownLocked.length === 0 && (
               <tr><td className="px-3 py-2 text-sm text-muted">{locked.length === 0 ? 'No locked terms yet.' : 'No terms match your search.'}</td></tr>
@@ -359,7 +531,7 @@ export default function GlossaryPage() {
             {shownLocked.map((e) => (
               editing === entryId(e) ? (
                 <tr key={entryId(e)} className="border-t border-line first:border-t-0">
-                  <td colSpan={4} className="px-3 py-2">
+                  <td colSpan={5} className="px-3 py-2">
                     <div className="flex flex-wrap items-center gap-2">
                       {fieldRow(editDraft, (f, v) => setEditDraft((t) => ({ ...t, [f]: v })))}
                       <button onClick={saveEdit} disabled={busy} className="btn btn-primary px-3 py-1 text-xs">Save</button>
@@ -369,6 +541,11 @@ export default function GlossaryPage() {
                 </tr>
               ) : (
                 <tr key={entryId(e)} className="rowhover border-t border-line first:border-t-0">
+                  <td className="px-3 py-1.5">
+                    <input type="checkbox" checked={lockedSel.has(entryId(e))} readOnly
+                      onClick={(ev) => rowCheck(ev, entryId(e), shownIds, setLockedSel, lastLocked, setLastLocked)}
+                      aria-label={`Select ${e.korean || e.english}`} style={{ accentColor: 'var(--accent)' }} />
+                  </td>
                   <td className="px-3 py-1.5 font-korean font-medium">{e.korean || <span className="font-ui text-xs text-hint" title="Canonical English spelling — Korean not known yet">— EN</span>}</td>
                   <td className="px-3 py-1.5">
                     {e.english}

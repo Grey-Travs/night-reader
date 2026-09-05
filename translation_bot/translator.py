@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -35,11 +37,19 @@ from claude_agent_sdk import (
 
 from .config import AnthropicConfig, TranslationConfig
 from .docs_extract import Chapter
-from .glossary import VALID_TYPES, GlossaryEntry, format_injection, format_names
+from .glossary import (
+    VALID_TYPES,
+    GlossaryEntry,
+    format_injection,
+    format_names,
+    normalize_pronoun,
+)
 from .prompts import (
     META_SCAN_PROMPT,
     NAME_EXTRACTION_PROMPT,
     NEW_TERMS_DELIMITER,
+    PRONOUN_DETECT_PROMPT,
+    PRONOUN_FIX_PROMPT,
     TERM_CLASSIFY_PROMPT,
     build_system_prompt,
 )
@@ -62,6 +72,78 @@ _RETRY_REMINDER = (
 
 class TranslatorError(RuntimeError):
     """A non-recoverable error from the agent (not a rate limit)."""
+
+
+class TranslationAborted(RuntimeError):
+    """The user stopped this chapter mid-flight. Not a failure — the caller must
+    leave the chapter's existing status/output alone rather than marking it failed."""
+
+
+# The SDK raises a BARE Exception when the Claude Code CLI is spawned but doesn't
+# answer the `initialize` control request in time ("Control request timeout:
+# initialize"). It's almost always a slow cold start (antivirus scanning the node
+# process, a machine under load), so it retries successfully — but as a bare
+# Exception it matched none of our except clauses and escaped as a 500.
+_STARTUP_TIMEOUT_MARKERS = ("control request timeout", "initialize timeout")
+
+
+def _is_startup_timeout(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(m in text for m in _STARTUP_TIMEOUT_MARKERS)
+
+
+def _emit(fn: Callable | None, *args) -> None:
+    """Call a progress hook defensively. A broken/slow callback must never be able
+    to fail a translation that otherwise succeeded."""
+    if fn is None:
+        return
+    try:
+        fn(*args)
+    except Exception:  # noqa: BLE001 — progress reporting is never worth failing over
+        pass
+
+
+@dataclass
+class StreamHooks:
+    """Live-progress callbacks for one chapter, invoked from the translator's thread.
+
+    The web worker runs ``process_chapter`` in a threadpool, so implementations must
+    be non-blocking and must marshal back to the event loop themselves (see
+    ``server/app.py``). They must not raise; ``_emit`` swallows it if they do.
+
+    Text arrives as an append-only stream, punctuated by two boundary signals:
+
+    * ``on_chunk(i, n)`` — an oversized chapter is translated in ``n`` calls whose
+      prose is CONCATENATED. Everything streamed so far is final; treat this as a
+      commit point, not a clear.
+    * ``on_reset(reason)`` — discard streamed text. ``"reconnect"``/``"restart"``
+      abandon only the current chunk's partial output (earlier chunks stand);
+      ``"retry"`` means the whole chapter is being redone from scratch, so drop
+      everything.
+    """
+
+    on_source: Callable[[list[str]], None] | None = None    # the Korean the model sees
+    on_text: Callable[[str], None] | None = None            # a chunk of English arrived
+    on_reset: Callable[[str], None] | None = None           # discard shown text (retry/chunk)
+    on_chunk: Callable[[int, int], None] | None = None      # chunk i of n starting
+    abort: threading.Event | None = None                    # set -> raise TranslationAborted
+
+    def aborted(self) -> bool:
+        return self.abort is not None and self.abort.is_set()
+
+    # Callers use these rather than the raw fields, so an unset hook and a hook that
+    # raises are both handled in one place.
+    def source(self, paragraphs: list[str]) -> None:
+        _emit(self.on_source, paragraphs)
+
+    def text(self, chunk: str) -> None:
+        _emit(self.on_text, chunk)
+
+    def reset(self, reason: str) -> None:
+        _emit(self.on_reset, reason)
+
+    def chunk(self, i: int, n: int) -> None:
+        _emit(self.on_chunk, i, n)
 
 
 class RateLimitedError(RuntimeError):
@@ -99,6 +181,7 @@ def _agent_model(model: str) -> str:
         return "sonnet"
     if "haiku" in m:
         return "haiku"
+    # Fable/unknown ids pass through unchanged — the SDK accepts full model ids.
     return model or "opus"
 
 
@@ -208,6 +291,8 @@ class Translator:
 
     def _options(self, system_text: str, max_turns: int = 1) -> ClaudeAgentOptions:
         web = self.cfg.web_access
+        # Fable 5 has thinking always on; {"type": "disabled"} is rejected with a 400.
+        fable = "fable" in (self.cfg.model or "").lower()
         return ClaudeAgentOptions(
             system_prompt=system_text,           # fully replaces the default agent prompt
             allowed_tools=(["WebSearch"] if web else []),
@@ -218,10 +303,11 @@ class Translator:
             max_turns=max_turns,                   # 1 for translation; more for aux checks
             model=_agent_model(self.cfg.model),
             effort=(self.cfg.effort if self.cfg.effort in _VALID_EFFORT else "high"),
-            thinking={"type": "adaptive"} if self.cfg.thinking else {"type": "disabled"},
+            thinking={"type": "adaptive"} if (self.cfg.thinking or fable) else {"type": "disabled"},
         )
 
-    async def _aquery(self, system_text: str, user_text: str, max_turns: int = 1) -> tuple[str, dict, float]:
+    async def _aquery(self, system_text: str, user_text: str, max_turns: int = 1,
+                      hooks: StreamHooks | None = None) -> tuple[str, dict, float]:
         texts: list[str] = []
         usage: dict = {}
         cost = 0.0
@@ -229,10 +315,17 @@ class Translator:
         last_info = None  # latest rate-limit info seen, even non-rejected warnings
         got_result = False
         async for msg in query(prompt=user_text, options=self._options(system_text, max_turns)):
+            # Cooperative stop: a threadpool thread can't be killed, so the only way
+            # to end an in-flight chapter is to check between streamed messages and
+            # break out — which closes the generator and tears the CLI subprocess down.
+            if hooks is not None and hooks.aborted():
+                raise TranslationAborted("stopped by the user")
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         texts.append(block.text)
+                        if hooks is not None:
+                            hooks.text(block.text)
             elif isinstance(msg, RateLimitEvent):
                 info = msg.rate_limit_info
                 last_info = info
@@ -263,18 +356,33 @@ class Translator:
             raise TranslatorError("incomplete response: the model run ended before finishing")
         return "".join(texts).strip(), usage, cost
 
-    def _call(self, system_text: str, user_text: str, max_turns: int = 1) -> tuple[str, dict, float]:
+    def _call(self, system_text: str, user_text: str, max_turns: int = 1,
+              hooks: StreamHooks | None = None) -> tuple[str, dict, float]:
         """One agent call -> (text, usage dict, plan-equivalent cost)."""
         last: Exception | None = None
         attempts = max(1, self.cfg.api_retry_count)
         for attempt in range(attempts):
             try:
-                return asyncio.run(self._aquery(system_text, user_text, max_turns))
-            except (RateLimitedError, TranslatorError, CLINotFoundError):
-                raise  # don't retry hard limits / config errors
+                return asyncio.run(self._aquery(system_text, user_text, max_turns, hooks))
+            except (RateLimitedError, TranslatorError, CLINotFoundError, TranslationAborted):
+                raise  # don't retry hard limits / config errors / a deliberate stop
             except (CLIConnectionError, ProcessError) as exc:
                 last = exc
                 if attempt < attempts - 1:
+                    if hooks is not None:
+                        hooks.reset("reconnect")
+                    time.sleep(min(2 ** attempt, 30))
+            except Exception as exc:  # noqa: BLE001
+                # A startup timeout is transient — retry it like a dropped connection.
+                # Anything else genuinely unknown becomes a TranslatorError rather than
+                # escaping bare: callers (and the HTTP layer) only handle our own types,
+                # so a bare exception here surfaced as an opaque 500 + raw traceback.
+                if not _is_startup_timeout(exc):
+                    raise TranslatorError(f"{type(exc).__name__}: {exc}") from exc
+                last = exc
+                if attempt < attempts - 1:
+                    if hooks is not None:
+                        hooks.reset("restart")
                     time.sleep(min(2 ** attempt, 30))
         raise TranslatorError(f"agent connection failed after {attempts} attempts: {last}")
 
@@ -285,6 +393,7 @@ class Translator:
         *,
         extra_instruction: str = "",
         retry_reminder: bool = False,
+        hooks: StreamHooks | None = None,
     ) -> TranslationResult:
         system_text = build_system_prompt(
             format_injection(glossary_entries),
@@ -300,8 +409,10 @@ class Translator:
         warnings: list[str] = []
 
         if chapter.metrics.char_count <= self.tcfg.chunk_threshold:
+            if hooks is not None:
+                hooks.chunk(1, 1)
             user_text = _build_user_message(chapter.text, extra_instruction=reminder)
-            text, u, c = self._call(system_text, user_text)
+            text, u, c = self._call(system_text, user_text, hooks=hooks)
             _accumulate(usage, u)
             cost += c
             prose, new_terms, w = parse_response(text)
@@ -318,10 +429,12 @@ class Translator:
             continuity = None
             if i > 0 and self.tcfg.continuity_paragraphs > 0:
                 continuity = "\n\n".join(prev_source_paras[-self.tcfg.continuity_paragraphs :])
+            if hooks is not None:
+                hooks.chunk(i + 1, len(chunks))
             user_text = _build_user_message(
                 "\n\n".join(chunk_paras), continuity=continuity, extra_instruction=reminder
             )
-            text, u, c = self._call(system_text, user_text)
+            text, u, c = self._call(system_text, user_text, hooks=hooks)
             _accumulate(usage, u)
             cost += c
             prose, new_terms, w = parse_response(text)
@@ -355,7 +468,7 @@ class Translator:
     def extract_glossary(self, english_text: str) -> list[dict]:
         """Have Claude pull the cast/places/terms out of already-English chapters,
         so their established spellings can seed the glossary. Returns a list of
-        ``{english, type, note}`` dicts (best-effort; never raises on bad output)."""
+        ``{english, type, note, pronoun}`` dicts (best-effort; never raises on bad output)."""
         if not english_text.strip():
             return []
         user_text = "Extract the glossary from this novel text:\n\n" + english_text
@@ -374,6 +487,7 @@ class Translator:
                     "english": str(d["english"]).strip(),
                     "type": str(d.get("type", "name")).strip().lower(),
                     "note": str(d.get("note", "")).strip(),
+                    "pronoun": normalize_pronoun(d.get("pronoun", "")),
                 })
         return out
 
@@ -398,3 +512,71 @@ class Translator:
                 typ = str(d.get("type", "")).strip().lower()
                 out[str(d["english"]).strip().lower()] = typ if typ in VALID_TYPES else "other"
         return out
+
+    def detect_pronouns(self, names: list[str], sample: str) -> dict[str, str]:
+        """Determine each character's pronoun from the novel's own English text.
+        Returns ``{english_lowercased: "he"|"she"|"they"}``; names the model omits
+        or marks "unknown" are simply absent (callers leave those empty)."""
+        items = [n.strip() for n in names if n.strip()]
+        if not items or not sample.strip():
+            return {}
+        user_text = "Names:\n\n" + "\n".join(items) + "\n\nNovel text:\n\n" + sample
+        text, _u, _c = self._call(PRONOUN_DETECT_PROMPT, user_text, max_turns=8)
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            return {}
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+        out: dict[str, str] = {}
+        for d in data if isinstance(data, list) else []:
+            if isinstance(d, dict) and str(d.get("english", "")).strip():
+                pronoun = normalize_pronoun(d.get("pronoun", ""))
+                if pronoun:
+                    out[str(d["english"]).strip().lower()] = pronoun
+        return out
+
+    # Pronoun forms in the order the prompt should present them, so the model is told
+    # the full paradigm rather than a single token.
+    _PRONOUN_FORMS = {
+        "he": "he/him/his/himself",
+        "she": "she/her/hers/herself",
+        "they": "they/them/their/theirs/themselves",
+    }
+
+    def fix_pronouns(
+        self,
+        prose: str,
+        fixes: list[dict],
+        hooks: StreamHooks | None = None,
+    ) -> tuple[str, dict, float]:
+        """Rewrite ONLY the pronouns of the named characters in an existing translation.
+
+        This is deliberately not a re-translation: the chapter's English is already
+        good apart from the gender the model guessed for a character whose glossary
+        ``pronoun`` says otherwise. Sending the finished prose back with an explicit
+        character -> pronoun list is far cheaper than re-translating from Korean, and
+        it keeps the prose the user has already read and possibly edited.
+
+        ``fixes`` is a list of ``{"name": str, "expected": "he"|"she"|"they"}``.
+        Returns ``(corrected_prose, usage, cost_usd)``. The CALLER must verify that
+        nothing but pronouns changed — see ``pipeline.pronouns_only_changed``.
+        """
+        wanted = [f for f in fixes if f.get("name") and f.get("expected") in self._PRONOUN_FORMS]
+        if not wanted or not prose.strip():
+            return prose, {}, 0.0
+
+        lines = [f"- {f['name']} is {f['expected']} — use {self._PRONOUN_FORMS[f['expected']]}"
+                 for f in wanted]
+        user_text = ("Characters whose pronouns are wrong in this chapter:\n\n"
+                     + "\n".join(lines)
+                     + "\n\nChapter:\n\n" + prose)
+
+        # One chunk: the whole chapter goes in a single call so the model can resolve
+        # referents across the entire text, and the live console shows one clean pass.
+        if hooks is not None:
+            hooks.chunk(1, 1)
+        text, usage, cost = self._call(PRONOUN_FIX_PROMPT, user_text, hooks=hooks)
+        cleaned, _removed = strip_reasoning(text)
+        return (cleaned.strip() or prose), usage, cost

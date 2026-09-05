@@ -139,15 +139,41 @@ _HDR_URL = re.compile(r"https?://|ridibooks\.com", re.I)
 _HDR_MIN = re.compile(r"^\s*\d+\s*(?:[-–]\s*\d+\s*)?min(?:ute)?s?\.?\s*$", re.I)
 # A header line ENDING in a chapter marker — "NNN화", "Chapter N", or "Title — Chapter N".
 _HDR_ENDNUM = re.compile(r"(?:chapter|ch\.?|episode|ep\.?)\s+(\d+)\s*$|(\d+)\s*화\s*$", re.I)
+# A block that is nothing but a number: "29" / "29."
+_BARE_NUM = re.compile(r"^(\d{1,4})\s*\.?$")
+
+
+def is_chapter_number_block(block: str, number: str | None) -> bool:
+    """True when ``block`` is a bare number that merely repeats the chapter's own number.
+
+    The single rule for "this digit block is export cruft, not content", shared by the
+    source stripper and by the one-off repair of already-saved chapters, so the two can
+    never drift apart. Without a known chapter number nothing qualifies — a bare number
+    we cannot tie to the header is in-story content.
+    """
+    if not number:
+        return False
+    m = _BARE_NUM.match((block or "").strip())
+    return bool(m) and int(m.group(1)) == int(number)
 
 
 def strip_source_header(text: str) -> tuple[str, str | None]:
     """Remove the leading export-header block (URL, novel title, reading-time, and the
     "NNN화"/"Chapter N" line) from a chapter, and return (clean_text, chapter_number).
 
-    Deliberately KEEPS a bare part marker like "33." — those are sequential in-story
-    section numbers, not junk. Stops at the first real line, so only the contiguous
-    header at the very top is touched."""
+    The export then repeats the chapter number on its own ("…29화" and, right under it,
+    "29."), and that bare block used to be kept — which put a stray "29." at the top of
+    the saved translation. It is invisible in the reader, because a lone "29." is an EMPTY
+    ordered-list item in Markdown and the reading CSS gives lists no styling, but it is
+    still in the file and shows up the moment a chapter is copied or edited.
+
+    A bare number is only dropped when it REPEATS the number the header line already gave
+    us. A part marker that differs ("33." inside chapter 29) is in-story content and is
+    kept, as is any bare number in a chapter whose header never established a number —
+    removing those would be a guess.
+
+    Stops at the first real line, so only the contiguous header at the very top is touched.
+    """
     blocks = re.split(r"\n\s*\n", (text or "").strip())
     number: str | None = None
     i = 0
@@ -165,7 +191,40 @@ def strip_source_header(text: str) -> tuple[str, str | None]:
             i += 1
             continue
         break
+    if i < len(blocks) and is_chapter_number_block(blocks[i], number):
+        i += 1
     return "\n\n".join(blocks[i:]).strip(), number
+
+
+# The closing rights notice every RIDI export carries, in Korean and in the English the
+# model produces when it translates it instead of dropping it.
+_FOOTER_MARK = re.compile(
+    r"본\s*저작물의\s*권리|저작권자에게\s*있습니다|무단\s*전재|"
+    r"rights?\s+(?:to|in|of)\s+this\s+work|copyright\s+holder|"
+    r"criminal\s+(?:punishment|penalt)",
+    re.I)
+
+
+def strip_export_footer(text: str) -> str:
+    """Remove the export's closing copyright notice from the END of a chapter.
+
+    "※ 본 저작물의 권리는 저작권자에게 있습니다…" is the last paragraph of every RIDI tab.
+    Nothing used to remove it, so the model saw it, and in 132 chapters translated it —
+    leaving a legal boilerplate paragraph glued to the end of the prose.
+
+    Only TRAILING blocks are considered: a line about rights in the middle of a chapter is
+    part of the story. The length cap keeps a long paragraph that merely mentions a
+    copyright holder from being mistaken for the notice.
+    """
+    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    j = len(blocks)
+    while j > 0:
+        b = blocks[j - 1].strip()
+        if b and len(b) <= 400 and _FOOTER_MARK.search(b):
+            j -= 1
+            continue
+        break
+    return "\n\n".join(blocks[:j]).strip()
 
 
 def remove_korean_echoes(text: str) -> tuple[str, int]:

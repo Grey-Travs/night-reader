@@ -9,9 +9,10 @@ never forces a full, re-billed re-run.
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .atomic import atomic_write_text
 
 # Lifecycle: pending -> translated -> validated, or -> needs-review / failed.
 STATUS_PENDING = "pending"
@@ -52,15 +53,12 @@ class State:
     def save(self, path: str | Path) -> None:
         # Atomic write: serialize to a temp file in the same dir, then os.replace — a
         # concurrent reader (now common with enqueue-while-running) never sees a
-        # half-written file, only the old or the new one.
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(
-            json.dumps({"chapters": self.chapters}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        # half-written file, only the old or the new one. The server saves this file from
+        # several threads at once, so the temp name MUST be unique per call;
+        # atomic_write_text owns that (see translation_bot/atomic.py).
+        atomic_write_text(
+            path, json.dumps({"chapters": self.chapters}, ensure_ascii=False, indent=2)
         )
-        os.replace(tmp, path)
 
     def get(self, index: int) -> dict | None:
         return self.chapters.get(str(index))

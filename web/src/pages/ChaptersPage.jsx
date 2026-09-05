@@ -3,19 +3,78 @@ import { Link, useNavigate, useOutletContext } from 'react-router-dom'
 import { api } from '../api'
 import { Badge, STATUS_LABEL, SkeletonRows } from '../components/ui'
 import Hint from '../components/Hint'
+import { useConfirm } from '../confirm'
+import { errorTitle } from '../errors'
+import { fmtCost, fmtTokens } from '../format'
 import { getReadChapters } from '../prefs'
 
 const SELECTABLE = ['pending', 'needs-review', 'failed', 'validated']
 const FILTER_ORDER = ['pending', 'validated', 'needs-review', 'failed', 'english-source', 'empty']
 const isSelectable = (ch) => ch.language === 'korean' && SELECTABLE.includes(ch.status)
+// Mis-gendered chapters are flagged separately from everything else, because they have
+// their own repair — rewriting the pronouns instead of re-translating the chapter.
+const isPronoun = (ch) => (ch.flags || []).includes('pronoun')
+
+// Tokens actually billed for a chapter: what was sent plus what came back. Cache reads
+// are excluded here since they're the cheap part — they get their own readout on Activity.
+const chapterTokens = (ch) => {
+  const u = ch?.usage || {}
+  return (Number(u.input_tokens) || 0) + (Number(u.output_tokens) || 0)
+}
+const usageTitle = (ch) => {
+  const u = ch?.usage || {}
+  return [
+    `in ${Number(u.input_tokens) || 0}`,
+    `out ${Number(u.output_tokens) || 0}`,
+    `cached ${Number(u.cache_read_input_tokens) || 0}`,
+  ].join(' · ')
+}
 
 export default function ChaptersPage() {
   const {
     pid, data, loading, chapters, offline, counts, done, remaining,
-    running, submitting, waiting, queue, totalQueued, enqueue, cancelQueue,
+    running, submitting, waiting, queue, totalQueued, totals, enqueue, cancelQueue,
+    stopAll, showError, fixPronounsFlagged,
   } = useOutletContext()
   const navigate = useNavigate()
+  const confirm = useConfirm()
   const openReader = (index) => navigate(`/novel/${pid}/chapter/${index}`)
+
+  const pronounFlagged = chapters.filter(isPronoun).length
+
+  // Bulk pronoun repair for the whole novel. Confirmed because it rewrites saved
+  // chapters, and worth saying out loud that each one stays revertible.
+  async function runFixPronouns() {
+    const ok = await confirm({
+      title: `Fix pronouns in ${pronounFlagged} chapter${pronounFlagged === 1 ? '' : 's'}?`,
+      body: `Each chapter is sent back to Claude to have ONLY its pronouns corrected to match `
+        + `your glossary — the prose itself is left alone, and the result is rejected outright `
+        + `if anything else changed.
+
+`
+        + `The version before the fix is kept, so any chapter can be compared and reverted from `
+        + `the reader. This uses your Claude plan, and runs on the Activity tab where you can `
+        + `watch it or stop it.`,
+      confirmLabel: 'Fix them',
+    })
+    if (!ok) return
+    await fixPronounsFlagged?.()
+  }
+
+  async function stop() {
+    if (queue.current != null) {
+      const ok = await confirm({
+        title: `Stop chapter ${queue.current}?`,
+        body: `It stops as soon as Claude sends its next update, usually within a second or two.\n\n`
+          + `The chapter won't be marked failed and nothing already saved is overwritten — but the `
+          + `work done so far is discarded, and re-running it spends your plan allowance again.`
+          + (queue.pending.length ? `\n\nThe ${queue.pending.length} chapter(s) still queued are dropped too.` : ''),
+        confirmLabel: 'Stop it',
+      })
+      if (!ok) return
+    }
+    stopAll()
+  }
 
   const [readSet] = useState(() => getReadChapters(pid))
   const [selected, setSelected] = useState(() => new Set())
@@ -93,23 +152,32 @@ export default function ChaptersPage() {
     try {
       setSearchResults((await api.searchChapters(pid, q)).results)
     } catch (err) {
-      setError(String(err.message || err))
+      setError(err)
     } finally {
       setSearching(false)
     }
   }
 
+  const libTokens = totals?.tokens || {}
   const STATS = [
     ['Translated', done],
     ['To translate', counts.pending || 0],
     ['Needs review', counts['needs-review'] || 0],
     ['Already English', counts['english-source'] || 0],
-    ['Plan usage', `$${(data?.totals?.cost_usd ?? 0).toFixed(2)}`],
+    ['Plan usage', fmtCost(totals?.cost_usd ?? 0)],
+    ...(chapterTokens({ usage: libTokens }) > 0
+      ? [['Tokens', fmtTokens(chapterTokens({ usage: libTokens }))]]
+      : []),
   ]
 
   return (
     <div className="page">
-      {error && <div className="mb-4 rounded-card px-3 py-2 text-sm pill-review">{error}</div>}
+      {error && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-card px-3 py-2 text-sm pill-review">
+          <span>{errorTitle(error)}</span>
+          <button onClick={() => showError(error)} className="shrink-0 text-xs underline hover:no-underline">Details →</button>
+        </div>
+      )}
 
       {offline && (
         <div className="mb-6 rounded-card border border-line p-4 text-sm" style={{ background: 'var(--b-queued-bg)', color: 'var(--b-queued-tx)' }}>
@@ -159,7 +227,12 @@ export default function ChaptersPage() {
           <span className="flex items-center gap-2">
             <Link to={`/novel/${pid}/activity`} className="font-medium hover:underline">View console →</Link>
             {queue.pending.length > 0 && (
-              <button onClick={cancelQueue} className="btn btn-ghost shrink-0 px-3 py-1 text-xs">Clear queue</button>
+              <button onClick={() => cancelQueue()} className="btn btn-ghost shrink-0 px-3 py-1 text-xs">Clear queue</button>
+            )}
+            {/* Reachable while a single chapter runs, which is exactly when the old
+                pending-only condition hid every control. */}
+            {(queue.current != null || queue.pending.length > 0) && (
+              <button onClick={stop} className="btn btn-ghost shrink-0 px-3 py-1 text-xs" title="Stop the chapter being translated right now">■ Stop</button>
             )}
           </span>
         </div>
@@ -194,6 +267,11 @@ export default function ChaptersPage() {
                 )}
                 {!offline && (counts.failed || 0) > 0 && (
                   <button onClick={() => selectByStatus('failed')} className="btn btn-ghost px-2.5 py-1 text-xs">Select failed ({counts.failed})</button>
+                )}
+                {!offline && pronounFlagged > 0 && (
+                  <button onClick={runFixPronouns} disabled={submitting} className="btn btn-ghost px-2.5 py-1 text-xs" title="Rewrite the pronouns in every chapter that refers to a character by the wrong gender">
+                    Fix pronouns in {pronounFlagged} flagged
+                  </button>
                 )}
                 {done > 0 && (
                   <form onSubmit={doSearch} className="flex items-center gap-1.5">
@@ -236,12 +314,13 @@ export default function ChaptersPage() {
                   <th className="px-4 py-2 font-medium">Title</th>
                   <th className="px-4 py-2 font-medium">Lang</th>
                   <th className="px-4 py-2 font-medium">Status</th>
+                  <th className="hidden px-4 py-2 text-right font-medium lg:table-cell">Usage</th>
                   <th className="px-4 py-2 text-right font-medium">Action</th>
                 </tr>
               </thead>
               <tbody>
                 {visible.length === 0 && (
-                  <tr><td colSpan={6} className="px-4 py-8 text-center text-hint">No chapters match this filter.</td></tr>
+                  <tr><td colSpan={7} className="px-4 py-8 text-center text-hint">No chapters match this filter.</td></tr>
                 )}
                 {visible.map((ch) => {
                   const selectable = !offline && isSelectable(ch)
@@ -267,7 +346,20 @@ export default function ChaptersPage() {
                       <td className="px-4 py-2 text-xs text-muted">
                         {ch.language === 'korean' ? '🇰🇷' : ch.language === 'english' ? '🇬🇧' : '—'}
                       </td>
-                      <td className="px-4 py-2"><Badge status={ch.status} /></td>
+                      <td className="px-4 py-2">
+                        <Badge status={ch.status} />
+                        {isPronoun(ch) && <span className="ml-1.5 pill pill-review !px-1.5 !py-0 text-[11px]" title="A character is referred to by the wrong gender">wrong gender</span>}
+                      </td>
+                      {/* Recorded per chapter all along in state.json, never shown until now. */}
+                      <td className="hidden px-4 py-2 text-right text-xs tabular-nums text-hint lg:table-cell">
+                        {ch.cost_usd > 0 || chapterTokens(ch) > 0 ? (
+                          <span title={usageTitle(ch)}>
+                            {chapterTokens(ch) > 0 && `${fmtTokens(chapterTokens(ch))} tok`}
+                            {ch.cost_usd > 0 && chapterTokens(ch) > 0 && ' · '}
+                            {ch.cost_usd > 0 && fmtCost(ch.cost_usd)}
+                          </span>
+                        ) : '—'}
+                      </td>
                       <td className="px-4 py-2 text-right whitespace-nowrap">
                         {isCurrent ? (
                           <span className="text-xs text-muted">Translating…</span>

@@ -22,11 +22,13 @@ from .glossary import (
     Glossary,
     GlossaryEntry,
     load_pending,
+    normalize_pronoun,
     save_pending,
 )
 from .google_auth import build_docs_service, get_credentials
 from . import pipeline
 from .state import State
+from .term import force_utf8_stdio
 
 
 def _cmd_auth(args) -> int:
@@ -118,7 +120,9 @@ def _cmd_review(args) -> int:
         typ, note = item.get("type", "other"), item.get("note", "")
         conflict = item.get("conflict_with")
         chap = item.get("chapter", "?")
-        print(f"[{i + 1}/{len(pending)}] {ko} -> {en}  ({typ})  ch.{chap}")
+        pron = str(item.get("pronoun", "")).strip()
+        print(f"[{i + 1}/{len(pending)}] {ko} -> {en}  ({typ})  ch.{chap}"
+              + (f"  [pronoun: {pron}]" if pron else ""))
         if note:
             print(f"      note: {note}")
         if conflict:
@@ -145,8 +149,10 @@ def _cmd_review(args) -> int:
             if typ not in VALID_TYPES:
                 typ = "other"
             note = _prompt("  note", note)
-        # approve (a or edited e)
-        glossary.add(GlossaryEntry(korean=ko, english=en, type=typ, note=note))
+        # approve (a or edited e) — carry the queued character profile through
+        glossary.add(GlossaryEntry(korean=ko, english=en, type=typ, note=note,
+                                   pronoun=normalize_pronoun(item.get("pronoun", "")),
+                                   register=str(item.get("register", "")).strip()))
         approved += 1
 
     glossary.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
@@ -182,20 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _force_utf8_stdio() -> None:
-    """Korean titles and curly quotes are printed to the console; a cp1252
-    Windows console would raise UnicodeEncodeError. Reconfigure to UTF-8."""
-    import sys
-
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-        except (AttributeError, ValueError):
-            pass
-
-
 def main(argv: list[str] | None = None) -> int:
-    _force_utf8_stdio()
+    force_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

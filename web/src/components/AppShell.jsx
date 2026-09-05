@@ -1,4 +1,6 @@
+import { useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
+import { api } from '../api'
 import { Dot } from './ui'
 import ThemeToggle from './ThemeToggle'
 import CommandPalette from './CommandPalette'
@@ -10,6 +12,7 @@ const NAV = [
   { to: '/', end: true, icon: '📚', label: 'Library' },
   { to: '/activity', icon: '⚡', label: 'Activity' },
   { to: '/review', icon: '🚩', label: 'Review' },
+  { to: '/upkeep', icon: '🧹', label: 'Upkeep', badge: 'upkeep' },
   { to: '/archive', icon: '📦', label: 'Archive' },
   { to: '/guide', icon: '❓', label: 'Guide' },
   { to: '/settings', icon: '⚙', label: 'Settings' },
@@ -18,6 +21,19 @@ const NAV = [
 const linkClass = ({ isActive }) => `navlink ${isActive ? 'navlink-active' : ''}`
 
 export default function AppShell({ status, setStatus, onSetup }) {
+  // How many glossary suggestions are waiting library-wide. Cheap (one small JSON read
+  // per novel) and fetched once per mount, so the sidebar can show there's work to do
+  // without the user having to go looking for it.
+  const [upkeepCount, setUpkeepCount] = useState(0)
+  useEffect(() => {
+    let alive = true
+    api.allPendingTerms()
+      .then((d) => { if (alive) setUpkeepCount(d.total || 0) })
+      .catch(() => { /* a badge is not worth surfacing an error for */ })
+    return () => { alive = false }
+  }, [])
+  const badgeFor = (n) => (n.badge === 'upkeep' && upkeepCount > 0 ? upkeepCount : null)
+
   return (
     <div className="flex min-h-screen bg-page text-ink">
       {/* Desktop: vertical sidebar */}
@@ -34,6 +50,9 @@ export default function AppShell({ status, setStatus, onSetup }) {
             <NavLink key={n.to} to={n.to} end={n.end} className={linkClass}>
               <span className="navicon" aria-hidden>{n.icon}</span>
               <span>{n.label}</span>
+              {badgeFor(n) != null && (
+                <span className="pill pill-review ml-auto !px-1.5 !py-0 text-[11px]">{badgeFor(n)}</span>
+              )}
             </NavLink>
           ))}
         </nav>
