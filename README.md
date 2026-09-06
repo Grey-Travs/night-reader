@@ -1,9 +1,10 @@
-# Web-Novel Translator
+# Night Reader
 
 A local app that translates Korean web novels into natural, native-English
 web-novel prose using Claude — with consistent character names, automatic quality
-checks, and a clean reading view. You keep a **library** of novels: paste a Google
-Doc, and the app reads it, translates it chapter by chapter, and saves clean output.
+checks, and a clean reading view. You keep a **library** of novels: add one from a
+Google Doc, from pasted text, or from photos of its pages, and the app translates it
+chapter by chapter and saves clean output.
 
 > **Runs on your own Claude subscription** (Max/Pro) via the Claude Agent SDK — no
 > API key, no per-word charges. Everything runs locally on your computer; your
@@ -13,8 +14,15 @@ Doc, and the app reads it, translates it chapter by chapter, and saves clean out
 
 ## What it does
 
-- **Library of novels.** Paste a Google Docs link (one chapter per tab). The app
-  reads the doc, names the project from its title, and tracks each one separately.
+- **Three ways in.** Paste a Google Docs link (one chapter per tab), paste text or a
+  `.txt` file, or add photos, screenshots and scans of the pages. Each novel is
+  tracked separately.
+- **Reads novels from pictures.** Claude transcribes the Korean out of each page; you
+  check each one against its photo, and the app works out where a sentence runs
+  across a page break so it doesn't become a false paragraph break. It even flags a
+  page that looks like it was never photographed.
+- **Fix one paragraph.** Rewrite or re-translate a single paragraph without touching
+  the rest of the chapter. Every version is kept, so you compare and pick.
 - **Faithful translation.** Whole-chapter calls preserve voice and honorifics;
   fidelity is the top priority (no omissions, no padding).
 - **Name/term consistency.** A per-novel glossary locks character names and terms so
@@ -45,10 +53,12 @@ files. Shared settings and logins live in `config.toml` / your Claude + Google l
 
 ## Requirements
 
-- **Python 3.11+** and **Node.js 18+**
+- **Python 3.11+** and **Node.js 20.19+** (Vite 8 requires it)
 - A **Claude Max or Pro subscription**, logged in via Claude Code (this app uses that
   login — it does **not** use a paid API key)
-- A **Google account** that owns the novel documents
+- *Optional:* a **Google account** that owns the novel documents. Only needed to read
+  a Google Doc — novels from pasted text or from page photos never touch it, and the
+  app no longer asks you to connect Google before you can use it.
 
 ---
 

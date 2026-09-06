@@ -131,6 +131,8 @@ export const LEGEND = [
   { label: 'Already English', cls: 'pill-english', meaning: 'That chapter was already in English, so it was left as-is.' },
   { label: 'Queued', cls: 'pill-queued', meaning: 'Waiting in line to be translated.' },
   { label: 'Translating', cls: 'pill-translating', meaning: 'Being translated right now.' },
+  { label: 'Failed', cls: 'pill-review', meaning: 'Something went wrong. Open it to see why, then try again.' },
+  { label: 'Empty', cls: 'pill-muted', meaning: 'That tab has no text in it, so there was nothing to translate.' },
 ]
 
 // Plain-language meanings for the words you’ll see.
@@ -145,7 +147,7 @@ export const TERMS = [
 
 export const FAQ = [
   ['It says “method not allowed”, or a new button doesn’t work',
-   'Close the app window and run start.bat again, then refresh the page (Ctrl+Shift+R). New features need the app restarted.'],
+   'Close the app window and run start.bat again, then refresh the page (Ctrl+Shift+R). The app rebuilds its interface automatically when anything has changed.'],
   ['Translation is “waiting for Claude to refresh”',
    'Your Claude plan reached its limit for now. The app keeps the queue and continues automatically the moment the plan resets — you can close the tab. Or click “Resume now” to try right away.'],
   ['A “Google not connected” message',
@@ -155,4 +157,8 @@ export const FAQ = [
 ]
 
 export const COST_NOTE =
-  'These use your Claude plan: Translate, Learn names, Bulk add (only when it has to detect types), and Deep check. Reading, copying, searching, and exporting are free.'
+  'These use your Claude plan: Translate, AI resolve, Fix pronouns, Detect pronouns, '
+  + 'Learn names, Bulk add (only when it has to detect types), Deep check, reading pages '
+  + 'from photos, double-checking a page against its photo, working out how pages join, '
+  + 'and re-translating or rephrasing a paragraph. Reading, copying, searching, '
+  + 'editing by hand, building chapters, and exporting are free.'

@@ -13,14 +13,15 @@ from pydantic import BaseModel, Field
 
 
 class AnthropicConfig(BaseModel):
+    # NOTE: `temperature` and `max_output_tokens` used to live here. Neither was ever
+    # forwarded to the SDK — Translator._options builds ClaudeAgentOptions from model,
+    # effort, thinking and web_access only — and the comment on `temperature` described
+    # a "forward it when the model accepts it" mechanism that was never written. They
+    # are removed rather than left as tunables that quietly do nothing. Pydantic
+    # ignores unknown keys, so an existing config.toml that still lists them loads fine.
     model: str = "claude-opus-5"
     effort: str = "high"
     thinking: bool = True
-    # Current models (Opus 5, Sonnet 5, Opus 4.8/4.7, Fable 5) reject `temperature`
-    # (400). Keep it optional; the translator only forwards it when set AND the
-    # model is known to accept it.
-    temperature: float | None = None
-    max_output_tokens: int = 32000
     web_access: bool = False
     api_retry_count: int = 4
 
@@ -42,10 +43,13 @@ class PathsConfig(BaseModel):
 
 
 class TranslationConfig(BaseModel):
+    # NOTE: `include_prev_translation` and `romanization` used to live here and were
+    # read by nothing. Removed rather than left advertised. Both name real gaps that
+    # remain open (no cross-chapter context is ever passed; no romanization scheme is
+    # enforced), but a dead knob is worse than an honest absence — it reads as a
+    # setting you can turn on.
     chunk_threshold: int = 12000
     continuity_paragraphs: int = 3
-    include_prev_translation: bool = False
-    romanization: str = "Revised Romanization (RR)"
     # Per-novel framing for the system prompt (genre/tone/audience). Empty = a neutral
     # "Korean web novel". Set per project so a fantasy serial isn't framed as romance.
     style_note: str = ""

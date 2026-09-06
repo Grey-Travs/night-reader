@@ -36,6 +36,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from translation_bot import ocr
 from translation_bot import state as state_mod
+from translation_bot.atomic import atomic_write_text
 from translation_bot.config import Config
 from translation_bot.docs_extract import (
     Chapter, ChapterMetrics, extract_chapters, fetch_document, hangul_fraction,
@@ -495,7 +496,11 @@ def update_settings(s: Settings) -> dict:
         text = setkey(text, "effort", s.effort, section="anthropic")
     if s.deep_check is not None:
         text = setkey(text, "deep_check", s.deep_check, section="translation")
-    CONFIG_PATH.write_text(text, encoding="utf-8")
+    # Atomic: a half-written config.toml makes load_global_config raise, and every
+    # request after that answers 400 — the app becomes unusable until the file is
+    # repaired by hand. This is the one file atomic_write_text exists for that wasn't
+    # using it.
+    atomic_write_text(CONFIG_PATH, text)
     return {"ok": True}
 
 

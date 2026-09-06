@@ -118,10 +118,6 @@ def _write_project(project: dict) -> dict:
     return project
 
 
-def rename_project(pid: str, name: str) -> dict:
-    return update_project(pid, name=name)
-
-
 def update_project(pid: str, **fields) -> dict:
     """Patch editable project fields (name, style_note, instructions, honorific_note)."""
     project = get_project(pid)

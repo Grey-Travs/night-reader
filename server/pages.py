@@ -98,10 +98,6 @@ def unsupported_reason(head: bytes) -> str:
 
 # ---- paths -------------------------------------------------------------------
 
-def project_dir(pid: str) -> Path:
-    return PROJECTS_DIR / pid
-
-
 def pages_dir(pid: str) -> Path:
     return PROJECTS_DIR / pid / PAGES_DIRNAME
 
@@ -193,13 +189,6 @@ def find_page(doc: dict, page_id: str) -> dict | None:
         if page.get("id") == page_id:
             return page
     return None
-
-
-def page_index(doc: dict, page_id: str) -> int:
-    for i, page in enumerate(doc.get("pages", [])):
-        if page.get("id") == page_id:
-            return i
-    return -1
 
 
 def safe_label(name: str, limit: int = 120) -> str:

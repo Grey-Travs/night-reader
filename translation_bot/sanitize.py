@@ -262,10 +262,6 @@ def find_leaks(text: str) -> list[str]:
     return [b.strip()[:160] for b in blocks if _block_is_meta(b)]
 
 
-def has_leak(text: str) -> bool:
-    return bool(find_leaks(text))
-
-
 def strip_reasoning(text: str) -> tuple[str, list[str]]:
     """Remove leaked reasoning. Returns (cleaned_text, removed_blocks).
 

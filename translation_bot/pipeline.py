@@ -165,7 +165,11 @@ def write_audit(
         result.prose,
         "",
     ]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    # Atomic: a chapter that fails validation is written ONLY here, never to
+    # chapters/, so this file is the sole copy of that translation and the only thing
+    # Accept, Fix-pronouns and the paragraph panel can recover it from. A crash or an
+    # antivirus lock partway through a plain write_text would lose it outright.
+    atomic_write_text(path, "\n".join(lines))
     return path
 
 
