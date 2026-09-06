@@ -262,7 +262,7 @@ def find_leaks(text: str) -> list[str]:
     return [b.strip()[:160] for b in blocks if _block_is_meta(b)]
 
 
-def strip_reasoning(text: str) -> tuple[str, list[str]]:
+def strip_reasoning(text: str, *, keep_korean: bool = False) -> tuple[str, list[str]]:
     """Remove leaked reasoning. Returns (cleaned_text, removed_blocks).
 
     Two strategies:
@@ -270,6 +270,14 @@ def strip_reasoning(text: str) -> tuple[str, list[str]]:
        ``---`` separator, means the model restarted; drop everything up to and
        including that separator and keep the redo.
     2. Otherwise drop the individual meta blocks wherever they appear.
+
+    ``keep_korean=True`` for output where Korean is the CONTENT rather than an echoed
+    source — page transcription. This function was written for translation output, so
+    strategy 2 walks past leading Korean blocks on the assumption they are the model
+    re-printing the source before its English. On an OCR'd page that assumption is
+    inverted: a reply of "Here is the transcription:" followed by the page's Korean
+    made the walk delete the preamble *and every Korean paragraph after it*, losing
+    the whole page.
     """
     text = (text or "").strip()
     blocks = re.split(r"\n\s*\n", text)
@@ -288,7 +296,8 @@ def strip_reasoning(text: str) -> tuple[str, list[str]]:
         nxt = run_end + 1
         if nxt < len(blocks) - 1 and _HR.match(blocks[nxt].strip()):
             removed = blocks[: nxt + 1]
-            cleaned, more = strip_reasoning("\n\n".join(blocks[nxt + 1:]))
+            cleaned, more = strip_reasoning("\n\n".join(blocks[nxt + 1:]),
+                                            keep_korean=keep_korean)
             return cleaned, removed + more
 
     # 2. Leading preamble: when a "let me translate" marker sits in the first few
@@ -299,11 +308,18 @@ def strip_reasoning(text: str) -> tuple[str, list[str]]:
         # Only walk past meta blocks, horizontal rules, and WHOLE-paragraph Korean
         # echoes — never a real prose block that merely contains some Hangul (a sound
         # effect or kept term), which would silently delete translated content.
-        while i < len(blocks) and (flags[i] or _HR.match(blocks[i].strip()) or _is_korean_echo(blocks[i])):
+        while i < len(blocks) and (
+            flags[i]
+            or _HR.match(blocks[i].strip())
+            # Only an ECHO. When Korean is the content (a transcribed page), walking
+            # past it deletes the very thing that was read off the photo.
+            or (not keep_korean and _is_korean_echo(blocks[i]))
+        ):
             i += 1
         if 0 < i < len(blocks):
             removed = blocks[:i]
-            cleaned, more = strip_reasoning("\n\n".join(blocks[i:]))
+            cleaned, more = strip_reasoning("\n\n".join(blocks[i:]),
+                                            keep_korean=keep_korean)
             return cleaned, removed + more
 
     # 3. Otherwise drop the individual meta blocks wherever they appear.

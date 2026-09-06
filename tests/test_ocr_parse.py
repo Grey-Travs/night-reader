@@ -77,6 +77,49 @@ def test_english_preamble_is_stripped_but_the_page_is_kept():
     assert page.text == KO, "a model preamble must never reach the stored source"
 
 
+def test_a_recognised_preamble_does_not_take_the_page_with_it():
+    """The leak-stripper was written for TRANSLATION output, where a leading Korean
+    block is the model echoing its source before its English. On a transcribed page
+    that assumption is inverted — the Korean IS the page.
+
+    Once a leading block IS recognised as meta, the walk continues past every Korean
+    block after it and stops at the first one that is neither: a short line (an
+    ellipsis, a one-word shout — ordinary in these novels) ended the run, and
+    everything before it was deleted. The preamble AND both real paragraphs.
+    """
+    page = ("Let me redo that.\n\n"
+            "그는 천천히 문을 열었다. 밖에는 아무도 없었다.\n\n"
+            "한참을 그렇게 서 있었다. 바람이 차가웠다.\n\n"
+            "……")
+    result = parse_page_response(_reply(page, META))
+
+    assert "그는 천천히 문을 열었다" in result.text, "the first paragraph was deleted"
+    assert "한참을 그렇게 서 있었다" in result.text, "the second paragraph was deleted"
+    assert "……" in result.text
+    assert "Let me redo" not in result.text, "the preamble must still go"
+
+
+def test_a_transcription_preamble_is_stripped():
+    """The shared leak patterns are translation-specific — they match "here is the
+    translation", not "transcription" — so this opener sailed into the stored page."""
+    page = "Here is the transcription:\n\n그는 천천히 문을 열었다."
+    result = parse_page_response(_reply(page, META))
+
+    assert result.text == "그는 천천히 문을 열었다."
+
+
+def test_a_transcription_preamble_is_never_stripped_down_to_nothing():
+    """If the opener is all there is, keep it — an empty page tells the reader less
+    than a page that visibly contains only a stray line."""
+    result = parse_page_response(_reply("Here is the transcription:", META))
+    assert result.text.strip()
+
+
+def test_a_page_that_is_entirely_korean_is_untouched():
+    page = "첫 번째 문단이다. 그는 걸었다.\n\n두 번째 문단이다. 그녀가 웃었다."
+    assert parse_page_response(_reply(page, META)).text == page
+
+
 def test_metadata_fields_are_read():
     page = parse_page_response(_reply(KO, META))
     assert page.confidence == "high"

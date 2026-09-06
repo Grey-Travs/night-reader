@@ -19,6 +19,7 @@ Three calls live here:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +43,26 @@ _VALID_ISSUE_KINDS = ("missing", "extra", "wrong", "leak")
 # How much of each page to show the stitcher. Enough to judge a seam, small enough
 # that ~25 boundaries stay a couple of KB.
 _SEAM_CHARS = 200
+
+# A TRANSCRIPTION preamble, e.g. "Here is the transcription:" or "Transcribed text:".
+#
+# sanitize's shared leak patterns are translation-specific — they match "here is the
+# translation", not "transcription" — so this kind of opener sailed straight through
+# into the stored page. Handled here rather than by loosening the shared regex, which
+# is also applied to finished prose: a rule broad enough to catch "here is the text"
+# would delete a real paragraph that happened to contain that phrase.
+#
+# Anchored to the start and requires content after it, so it can only ever remove an
+# opening line, never the page itself.
+_PREAMBLE_RE = re.compile(
+    r"\A[ \t]*(?:"
+    r"(?:here(?:'s|\s+is)|below\s+is)\s+(?:the\s+|your\s+|my\s+)?"
+    r"(?:transcri\w*|text|page|content|korean)\b[^\n]*"
+    r"|transcri\w+\s*[:：][^\n]*"
+    r"|(?:i(?:'ll|\s+will)|let\s+me)\s+(?:now\s+)?transcribe\b[^\n]*"
+    r")\n+",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -134,8 +155,13 @@ def split_page_meta(raw: str) -> tuple[str, dict | None]:
 def parse_page_response(raw: str) -> PageText:
     """Turn a raw transcription reply into a :class:`PageText`."""
     prose, meta = split_page_meta(raw)
-    # A "let me look at the image..." preamble must never reach the stored source.
-    prose, _dropped = strip_reasoning(prose)
+    # A "let me look at the image..." preamble must never reach the stored source —
+    # but keep_korean, because here the Korean IS the page, not an echoed source.
+    # Without it a preamble followed by the transcription deleted the whole page.
+    prose, _dropped = strip_reasoning(prose, keep_korean=True)
+    # Then the transcription-specific opener the shared patterns don't know about.
+    if _PREAMBLE_RE.match(prose) and _PREAMBLE_RE.sub("", prose, count=1).strip():
+        prose = _PREAMBLE_RE.sub("", prose, count=1)
     page = PageText(text=prose.strip())
 
     if meta is None:
