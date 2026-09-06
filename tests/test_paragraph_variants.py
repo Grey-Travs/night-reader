@@ -167,6 +167,52 @@ def test_pruning_preserves_order():
     assert numbers == sorted(numbers)
 
 
+def test_ids_are_never_reused_after_pruning():
+    """The collision that let "Use this" splice the WRONG version's text.
+
+    Ids were f"v{len(variants)}". prune() removes from the middle, so the list
+    shrinks while the numbering does not, and the next variant reused a live id.
+    find_variant returns the first match, so applying one version wrote another's
+    text into the chapter and relocate then marked the group stale.
+    """
+    _doc, group = _doc_with_group()
+    for i in range(1, 14):
+        V.add_variant(group, kind=V.KIND_REPHRASE, text=f"version {i}")
+    V.prune({"groups": [group]}, max_variants=12)
+    V.add_variant(group, kind=V.KIND_REPHRASE, text="after the prune")
+
+    ids = [v["id"] for v in group["variants"]]
+    assert len(ids) == len(set(ids)), f"duplicate variant ids: {ids}"
+
+
+def test_every_variant_resolves_to_its_own_text():
+    _doc, group = _doc_with_group()
+    for i in range(1, 14):
+        V.add_variant(group, kind=V.KIND_REPHRASE, text=f"version {i}")
+    V.prune({"groups": [group]}, max_variants=12)
+    V.add_variant(group, kind=V.KIND_REPHRASE, text="after the prune")
+
+    for variant in group["variants"]:
+        assert V.find_variant(group, variant["id"])["text"] == variant["text"], \
+            "picking a version must return that version's text, not another's"
+
+
+def test_ids_are_not_reused_in_a_group_written_before_next_seq_existed():
+    """Old variants.json files on disk have no next_seq — recover a safe floor."""
+    group = {
+        "id": "deadbeef", "paragraph": 0, "original": ORIGINAL, "current_id": "v0",
+        "stale": False,
+        "variants": [
+            {"id": "v0", "kind": V.KIND_ORIGINAL, "text": ORIGINAL},
+            {"id": "v3", "kind": V.KIND_REPHRASE, "text": "kept after an old prune"},
+        ],
+    }
+    V.add_variant(group, kind=V.KIND_REPHRASE, text="new")
+    ids = [v["id"] for v in group["variants"]]
+    assert len(ids) == len(set(ids)), f"duplicate ids from a legacy group: {ids}"
+    assert ids[-1] == "v4", "the new id must clear the highest id already present"
+
+
 def test_pruning_leaves_a_short_history_alone():
     _doc, group = _doc_with_group()
     V.add_variant(group, kind=V.KIND_REPHRASE, text="one")

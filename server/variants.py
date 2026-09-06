@@ -126,6 +126,8 @@ def new_group(doc: dict, paragraph: int, original: str, *,
         "paragraph": paragraph,
         "original": original,
         "current_id": "v0",
+        # v0 is taken by the seed below; ids are minted from here and never reused.
+        "next_seq": 1,
         "stale": False,
         "source_ko": source_ko,
         "alignment": alignment,
@@ -146,13 +148,37 @@ def new_group(doc: dict, paragraph: int, original: str, *,
     return group
 
 
+def next_variant_id(group: dict) -> str:
+    """Mint an id that has never been used in this group.
+
+    Ids used to be ``f"v{len(variants)}"``. That collides as soon as :func:`prune`
+    removes an entry from the middle: the list shrinks but the numbering does not, so
+    the next variant reuses a LIVE id. :func:`find_variant` returns the first match,
+    which meant picking a version could splice a *different* version's text into the
+    chapter — and :func:`relocate` would then anchor on that stale text and mark the
+    whole group stale, destroying its history.
+    """
+    seq = group.get("next_seq")
+    if not isinstance(seq, int):
+        # Written before next_seq existed. Recover a floor from the ids actually
+        # present so an id is never reissued, even if prune already ran.
+        highest = 0
+        for variant in group.get("variants", []):
+            vid = str(variant.get("id") or "")
+            if vid.startswith("v") and vid[1:].isdigit():
+                highest = max(highest, int(vid[1:]) + 1)
+        seq = max(highest, len(group.get("variants", [])))
+    group["next_seq"] = seq + 1
+    return f"v{seq}"
+
+
 def add_variant(group: dict, *, kind: str, text: str, instruction: str | None = None,
                 usage: dict | None = None, cost: float = 0.0,
                 warnings: tuple[str, ...] = ()) -> dict:
     """Append a generated version. Does NOT make it current — the reader picks."""
     variants = group.setdefault("variants", [])
     variant = {
-        "id": f"v{len(variants)}",
+        "id": next_variant_id(group),
         "kind": kind,
         "text": text,
         "instruction": instruction,

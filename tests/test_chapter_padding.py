@@ -104,6 +104,59 @@ def test_zero_total_is_a_no_op(tmp_path, monkeypatch):
     assert (d / "chapter-01.md").exists()
 
 
+# ---- the CALLER has to pass the right total ---------------------------------
+# Every test above exercises _normalize_chapter_padding directly. The bug was one
+# level up: get_chapters passed len(_chapter_cache[pid]) instead of _output_total.
+# On the offline fallback the cache is rebuilt from state.json alone and can hold
+# far fewer records than the novel really has, so the short count NARROWED the
+# filenames the rest of the app then failed to find.
+
+def test_offline_fallback_does_not_narrow_existing_chapter_files(tmp_path, monkeypatch):
+    import json
+
+    import server.app as A
+    import server.projects as pj
+    from translation_bot.config import Config
+
+    monkeypatch.setattr(pj, "PROJECTS_DIR", tmp_path)
+    pid = "abcdef012345"
+    pdir = tmp_path / pid
+    (pdir / "chapters").mkdir(parents=True)
+
+    # A 150-chapter novel: files are 3-digit padded.
+    (pdir / "project.json").write_text(
+        json.dumps({"id": pid, "name": "Big novel", "chapter_count": 150}),
+        encoding="utf-8")
+    for i in (1, 2, 99):
+        (pdir / "chapters" / f"chapter-{i:03d}.md").write_text(f"ch {i}", encoding="utf-8")
+
+    # state.json knows about only a handful, which is what the offline rebuild sees.
+    (pdir / "state.json").write_text(
+        json.dumps({"chapters": {str(i): {"status": "validated", "title": f"Tab {i}"}
+                                 for i in (1, 2, 99)}}),
+        encoding="utf-8")
+
+    # Force the offline branch deterministically — never touch the network or the
+    # developer's real token.json.
+    monkeypatch.setattr(A, "load_saved_credentials",
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("offline")))
+    A._chapter_cache.pop(pid, None)
+    A._offline_projects.discard(pid)
+
+    cfg = pj.project_config(Config(), pj.get_project(pid))
+    try:
+        A.get_chapters(pid, cfg)
+    finally:
+        A._chapter_cache.pop(pid, None)
+        A._offline_projects.discard(pid)
+
+    for i in (1, 2, 99):
+        assert (pdir / "chapters" / f"chapter-{i:03d}.md").exists(), (
+            f"chapter-{i:03d}.md was re-padded away; the app would report a finished "
+            f"chapter as untranslated and re-bill the whole novel to redo it")
+        assert not (pdir / "chapters" / f"chapter-{i:02d}.md").exists()
+
+
 def test_missing_project_dir_does_not_raise(tmp_path, monkeypatch):
     import server.projects as pj
 

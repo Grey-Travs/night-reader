@@ -305,7 +305,13 @@ def get_chapters(pid: str, cfg: Config, refresh: bool = False) -> list[Chapter]:
                         raise
                     _chapter_cache[pid] = local
                     _offline_projects.add(pid)
-        _normalize_chapter_padding(pid, len(_chapter_cache[pid]))
+        # MUST be _output_total, not len(): on the offline fallback above, the cache
+        # can hold FEWER chapters than the novel really has (a state-only rebuild).
+        # Passing the short count re-padded chapter-001.md down to chapter-01.md while
+        # every reader still looked for the 3-digit name — a novel's finished
+        # translations would vanish while state.json still called them validated, and
+        # re-translating them re-billed the whole book.
+        _normalize_chapter_padding(pid, _output_total(pid, _chapter_cache[pid]))
     return _chapter_cache[pid]
 
 
@@ -2026,7 +2032,9 @@ async def rephrase_paragraph(pid: str, index: int, body: ParagraphRephrase) -> d
 @app.post("/api/projects/{pid}/chapters/{index}/paragraph/apply")
 def apply_paragraph(pid: str, index: int, body: ParagraphPick) -> dict:
     """Put one version into the chapter. Picking v0 is revert-to-original."""
-    _project, cfg, ch, total, text, blocks = _paragraph_context(pid, index)
+    # `_text` deliberately unused: the authoritative read happens inside the file lock
+    # below. This one only serves the cheap pre-checks.
+    _project, cfg, ch, total, _text, blocks = _paragraph_context(pid, index)
     if _worker_owns_chapter(pid, index):
         raise HTTPException(
             409, "That chapter is being worked on right now — try again when it finishes.")
@@ -2043,19 +2051,35 @@ def apply_paragraph(pid: str, index: int, body: ParagraphPick) -> dict:
     if variant is None:
         raise HTTPException(404, "That version is gone.")
 
-    k = group.get("paragraph", -1)
-    if not 0 <= k < len(blocks):
+    if not 0 <= group.get("paragraph", -1) < len(blocks):
         raise HTTPException(409, "That paragraph is no longer where it was.")
 
     out_path = cfg.paths.output_dir / chapter_filename(index, total)
     with file_lock(out_path):
+        # Re-read INSIDE the lock and re-anchor against what is on disk NOW. The copy
+        # fetched at the top of this request was taken before the lock was held, so a
+        # translation, AI resolve, pronoun fix or manual save landing in between would
+        # have been silently thrown away when this splice wrote the stale text back.
+        fresh = current_translation(cfg, index, total)
+        if not (fresh or "").strip():
+            raise HTTPException(
+                409, "That chapter's translation is no longer there. Reload and try again.")
+        fresh_blocks = split_blocks(fresh)
+        variants_mod.relocate(doc, [b.text for b in fresh_blocks])
+        if group.get("stale"):
+            raise HTTPException(
+                409, "That paragraph changed while you were choosing. Reload and try again.")
+        k = group.get("paragraph", -1)
+        if not 0 <= k < len(fresh_blocks):
+            raise HTTPException(409, "That paragraph is no longer where it was.")
+
         # A needs-review chapter lives only in audit/. Materialize it first — exactly
         # as accepting one does — or the splice would write a file the reader can see
         # while chapters/ stays empty.
         if not out_path.exists():
-            write_chapter_file(cfg.paths.output_dir, index, total, text)
+            write_chapter_file(cfg.paths.output_dir, index, total, fresh)
         try:
-            updated = splice_block(text, k, variant.get("text", ""))
+            updated = splice_block(fresh, k, variant.get("text", ""))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         # snapshot=False: this edit keeps its own history in variants/, and letting

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .atomic import atomic_write_text
 from .config import Config
+from .locks import file_lock
 from .docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
 from .glossary import Glossary, queue_new_terms
 from .google_auth import build_docs_service, get_credentials
@@ -65,6 +66,18 @@ def write_chapter_file(output_dir: Path, index: int, total: int, prose: str,
                        *, snapshot: bool = True) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / chapter_filename(index, total)
+    # Guarded here rather than at each call site, because there are seven of them
+    # (translate, repair, pronoun fix, manual save, auto-fix, accept, consistency
+    # rename) and one that forgets silently loses a whole translation: two writers
+    # each read, each apply their own change, and the last os.replace wins. The lock
+    # is re-entrant, so a caller doing read-modify-write can hold it across all three
+    # steps and still call in here.
+    with file_lock(path):
+        return _write_chapter_locked(path, output_dir, index, total, prose, snapshot)
+
+
+def _write_chapter_locked(path: Path, output_dir: Path, index: int, total: int,
+                          prose: str, snapshot: bool) -> Path:
     # Before overwriting an existing translation, snapshot it to a sibling ``previous/``
     # folder so the reader can show old-vs-new and offer a one-click revert. Kept OUTSIDE
     # ``chapters/`` so it never matches the ``chapter-*.md`` globs used by scans/exports.
