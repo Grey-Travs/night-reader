@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { api } from '../api'
+import { reorderIds } from '../reorder'
 import { useToast } from '../toast'
 import { useConfirm } from '../confirm'
 import { Modal, PageBadge, SkeletonRows } from '../components/ui'
@@ -34,6 +35,7 @@ export default function PagesPage() {
   const confirm = useConfirm()
 
   const [rail, setRail] = useState(null)
+  const [railError, setRailError] = useState(null)
   const [selectedId, setSelectedId] = useState(null)
   const [current, setCurrent] = useState(null)
   const [draft, setDraft] = useState('')
@@ -43,21 +45,42 @@ export default function PagesPage() {
   const [showBuild, setShowBuild] = useState(false)
   const fileRef = useRef(null)
   const saveTimer = useRef(null)
+  // The edit waiting on the debounce, so it can be FLUSHED rather than dropped when
+  // the reader navigates away inside the 700ms window.
+  const pendingSave = useRef(null)
 
   const pages = rail?.pages || []
   const counts = rail?.counts || {}
 
-  const loadRail = useCallback(async () => {
-    try { setRail(await api.pages(pid)) } catch (e) { showError(e, { context: 'loading the pages' }) }
+  // `quiet` refreshes never open the modal. The background poll used to call
+  // showError on every failure, so a backend that died mid-run reopened an
+  // undismissable dialog every 2.5 seconds — the scrim blocked the sidebar, so the
+  // only way out was reloading the browser. Poll failures show inline instead.
+  const loadRail = useCallback(async ({ quiet = false } = {}) => {
+    try {
+      setRail(await api.pages(pid))
+      setRailError(null)
+      return true
+    } catch (e) {
+      setRailError(e)
+      if (!quiet) showError(e, { context: 'loading the pages' })
+      return false
+    }
   }, [pid, showError])
 
   useEffect(() => { loadRail() }, [loadRail])
 
   // While the worker is reading pages, keep the rail honest without a stream of its
-  // own — the SSE console already shows the detail.
+  // own — the SSE console already shows the detail. Give up after a few consecutive
+  // failures rather than hammering a backend that is plainly gone.
   useEffect(() => {
     if (!running) return undefined
-    const id = setInterval(loadRail, 2500)
+    let misses = 0
+    const id = setInterval(async () => {
+      const ok = await loadRail({ quiet: true })
+      misses = ok ? 0 : misses + 1
+      if (misses >= 3) clearInterval(id)
+    }, 2500)
     return () => clearInterval(id)
   }, [running, loadRail])
 
@@ -85,15 +108,30 @@ export default function PagesPage() {
   }
 
   // ---- saving --------------------------------------------------------------
-  async function persist(fields, { quiet = false } = {}) {
-    if (!selectedId) return
+  async function persist(fields, { quiet = false, pageId = null } = {}) {
+    const target = pageId || selectedId
+    if (!target) return
     try {
-      const updated = await api.savePage(pid, selectedId, fields)
-      setCurrent(updated)
+      const updated = await api.savePage(pid, target, fields)
+      // Only touch the editor if that page is STILL the one on screen. A debounced
+      // save can land after the reader has moved on, and applying it then put page
+      // A's confidence, notes and verify issues beside page B's photo.
+      setCurrent((cur) => (cur && cur.id === updated.id ? updated : cur))
       setRail((r) => r && {
         ...r,
         pages: r.pages.map((p) => (p.id === updated.id
-          ? { ...p, ...updated, text: undefined, raw_text: undefined, chars: (updated.text || '').length }
+          ? {
+            ...p,
+            ...updated,
+            // The rail row and the detail record are different shapes: `has_text`
+            // exists only on the row, so the spread leaves it STALE. Recompute it
+            // with `chars`, or a page that just gained text keeps has_text false
+            // and the Build / Work-out-the-joins buttons stay hidden.
+            text: undefined,
+            raw_text: undefined,
+            chars: (updated.text || '').length,
+            has_text: Boolean((updated.text || '').trim()),
+          }
           : p)),
       })
       if (!quiet) toast('Saved ✓')
@@ -102,12 +140,25 @@ export default function PagesPage() {
 
   function onDraft(value) {
     setDraft(value)
+    pendingSave.current = { pageId: selectedId, text: value }
     clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(() => persist({ text: value }, { quiet: true }), 700)
+    saveTimer.current = setTimeout(() => {
+      pendingSave.current = null
+      persist({ text: value, pageId: selectedId }, { quiet: true })
+    }, 700)
   }
 
-  // Flush a pending autosave before navigating away from the page being edited.
-  useEffect(() => () => clearTimeout(saveTimer.current), [])
+  // FLUSH a pending autosave, don't cancel it — on unmount, when the novel changes,
+  // and when the reader moves to another page. This cleanup used to call
+  // clearTimeout despite claiming to flush, so a correction typed within the 700ms
+  // window and then navigated away from was discarded silently: no toast, no
+  // warning, no dirty indicator, and the typo was still there on return.
+  useEffect(() => () => {
+    clearTimeout(saveTimer.current)
+    const p = pendingSave.current
+    pendingSave.current = null
+    if (p) api.savePage(pid, p.pageId, { text: p.text }).catch(() => {})
+  }, [pid, selectedId])
 
   // ---- uploading -----------------------------------------------------------
   async function upload(files) {
@@ -231,10 +282,24 @@ export default function PagesPage() {
     const from = dragId.current
     dragId.current = null
     if (!from || from === targetId) return
-    const ids = pages.map((p) => p.id)
-    const next = ids.filter((i) => i !== from)
-    next.splice(next.indexOf(targetId), 0, from)
-    setRail((r) => r && { ...r, pages: next.map((i) => r.pages.find((p) => p.id === i)) })
+
+    // Built from the list as it stands NOW. Deriving the order from the render
+    // closure and then resolving ids against fresh state was a mismatch: the 2.5s
+    // poll can add or drop a page mid-drag, and the stale id list then produced
+    // `undefined` rows — a page silently missing from the rail, or a crash on
+    // page.id, and a reorder request that omitted a real page.
+    const next = reorderIds(pages.map((p) => p.id), from, targetId)
+    if (!next) return
+
+    setRail((r) => {
+      if (!r) return r
+      const byId = new Map(r.pages.map((p) => [p.id, p]))
+      const rows = next.map((i) => byId.get(i)).filter(Boolean)
+      // If a poll changed the set underneath us, skip the optimistic update and let
+      // the server's answer settle it rather than rendering a rail with holes.
+      return rows.length === r.pages.length ? { ...r, pages: rows } : r
+    })
+
     try { await api.reorderPages(pid, next) } catch (e) {
       showError(e, { context: 'reordering the pages' })
       loadRail()
@@ -249,7 +314,8 @@ export default function PagesPage() {
         <div>
           <h1 className="font-reading text-2xl font-medium">Pages</h1>
           <p className="text-sm text-hint">
-            {rail == null ? 'Loading…'
+            {rail == null && railError ? "Couldn't load this novel's pages."
+              : rail == null ? 'Loading…'
               : pages.length === 0 ? 'Add photos or screenshots of the pages, and Claude reads the Korean out of them.'
               : `${counts.total} page${counts.total === 1 ? '' : 's'} · ${counts.ok || 0} good · ${flagged} to check · ${counts.new || 0} not read yet`}
           </p>
@@ -291,7 +357,21 @@ export default function PagesPage() {
         </div>
       )}
 
-      {rail == null ? (
+      {rail == null && railError ? (
+        // Without this the screen sat on a skeleton forever while an error dialog
+        // reopened behind it. An inline message with a retry is dismissable.
+        <div className="rounded-card border border-dashed border-line p-10 text-center">
+          <p className="text-sm pill-review mx-auto inline-block rounded-card px-3 py-2">
+            {railError.message || String(railError)}
+          </p>
+          <p className="mt-3 text-xs text-hint">
+            The app may have stopped. Check the window it started in, then try again.
+          </p>
+          <button className="btn btn-primary mt-3 px-4 py-2 text-sm" onClick={() => loadRail()}>
+            Try again
+          </button>
+        </div>
+      ) : rail == null ? (
         <SkeletonRows rows={8} />
       ) : pages.length === 0 ? (
         <div
@@ -524,7 +604,12 @@ function PageEditor({ page, draft, onDraft, onPersist, busy, running,
 
       <label className="mt-3 block text-xs text-hint">
         Note for a re-read (optional)
+        {/* key={page.id} remounts the input when the reader picks another page.
+            defaultValue is read once on mount, and PageEditor is NOT remounted by a
+            prop change — so without this the box still held page A's note, and
+            clicking into the textarea blurred it straight onto page B. */}
         <input
+          key={page.id}
           className="input mt-1 w-full text-xs"
           placeholder="e.g. the bottom two lines are cut off"
           defaultValue={page.hint || ''}

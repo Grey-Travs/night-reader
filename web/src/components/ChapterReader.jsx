@@ -188,9 +188,20 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     setTimeout(() => setCopied(false), 1500)
   }
 
+  // A monotonic token, not an `alive` flag: this component stays MOUNTED across an
+  // :idx change, so there is no unmount to hang a flag on. Holding the arrow key to
+  // skim returns responses out of order, and the last one to arrive used to win —
+  // the URL said chapter 12 while the prose, and `blocks`, were chapter 9's. A
+  // rewrite then POSTed chapter 9's paragraph text against chapter 12.
+  const loadToken = useRef(0)
+
   const load = useCallback(() => {
+    const mine = ++loadToken.current
     setData(null)
-    api.chapter(pid, index).then(setData).catch((e) => setError(String(e.message || e)))
+    setError(null)  // otherwise a failed chapter's banner outlived it for the session
+    api.chapter(pid, index)
+      .then((d) => { if (mine === loadToken.current) setData(d) })
+      .catch((e) => { if (mine === loadToken.current) setError(String(e.message || e)) })
   }, [pid, index])
 
   useEffect(() => { setEditing(false); setShowCompare(false); setPrevText(null); load() }, [load])

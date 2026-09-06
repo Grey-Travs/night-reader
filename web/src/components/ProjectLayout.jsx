@@ -72,23 +72,32 @@ export default function ProjectLayout() {
   // stream start) reads the CURRENT project, not the null it closed over at attach.
   useEffect(() => { dataRef.current = data }, [data])
 
-  async function load(refresh = false) {
+  // `stillWanted` is the [pid] effect's `alive` flag. Without it a slow novel's
+  // response landed in whichever novel was open by the time it arrived: novel A's
+  // title, chapter table and glossary rendered under novel B, and clicking a row
+  // navigated to /novel/B/chapter/<A's index>. Calls from sub-pages pass nothing,
+  // because those always concern the novel already on screen.
+  async function load(refresh = false, stillWanted = null) {
+    const wanted = () => (stillWanted ? stillWanted() : true)
     setLoading(true)
     setError(null)
     try {
-      setData(await api.chapters(pid, refresh))
+      const fetched = await api.chapters(pid, refresh)
+      if (!wanted()) return
+      setData(fetched)
     } catch (e) {
-      setError(e)
+      if (wanted()) setError(e)
     } finally {
-      setLoading(false)
+      if (wanted()) setLoading(false)
     }
   }
-  async function loadPending() {
+  async function loadPending(stillWanted = null) {
     try {
       const g = await api.glossary(pid)
+      if (stillWanted && !stillWanted()) return
       setPendingCount((g.pending || []).length)
       setGlossary(g.locked || [])
-    } catch { /* ignore */ }
+    } catch { /* a missing glossary just means no tips and no badge */ }
   }
 
   // Reset everything and re-attach when the novel changes (or on first mount). The
@@ -99,7 +108,8 @@ export default function ProjectLayout() {
   useEffect(() => {
     let alive = true
     setData(null); setLog([]); setLive(null); setTotals(null); setPaused(null); setWaiting(null); setQueue({ current: null, kind: 'translate', pending: [] }); setRunning(false); setGlossary([])
-    load(); loadPending()
+    const alive_ = () => alive
+    load(false, alive_); loadPending(alive_)
     api.activeJob(pid).then((j) => {
       if (!alive) return
       if (j.job_id) {
