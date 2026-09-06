@@ -1038,6 +1038,32 @@ class PageWork(BaseModel):
     only_new: bool = False
 
 
+def _release_queued_pages(pid: str, seqs: set[int] | None = None) -> int:
+    """Put pages back to "not read yet" when their queued work will never run.
+
+    A page is marked ``queued`` when work is accepted for it. If that work is then
+    dropped — Stop, a rate-limit give-up, or a worker that died — nothing used to
+    reset it, and the default sweep only selects ``new``/``failed``. The page showed
+    "Queued" forever and "Read N pages" answered *"There are no pages to do that to"*,
+    leaving hand-selecting every stranded page as the only way out.
+
+    Reads before opening the manifest for writing, so a novel with no pages at all
+    never gets a ``pages.json`` created as a side effect of pressing Stop.
+    """
+    doc = pages_mod.load_pages(pid)
+    stranded = [p for p in doc.get("pages", [])
+                if p.get("status") == pages_mod.STATUS_QUEUED
+                and (seqs is None or int(p.get("seq") or -1) in seqs)]
+    if not stranded:
+        return 0
+    wanted = {p.get("id") for p in stranded}
+    with pages_mod.mutate_pages(pid) as live:
+        for rec in live.get("pages", []):
+            if rec.get("id") in wanted:
+                rec["status"] = pages_mod.STATUS_NEW
+    return len(stranded)
+
+
 def _queue_page_work(pid: str, body: PageWork, kind: str) -> dict:
     project = require_images_project(pid)
     cfg = pj.project_config(load_global_config(), project)
@@ -1059,12 +1085,29 @@ def _queue_page_work(pid: str, body: PageWork, kind: str) -> dict:
         raise HTTPException(400, "There are no pages to do that to.")
 
     items = [(int(p["seq"]), True, kind) for p in wanted]
-    with pages_mod.mutate_pages(pid) as live:
-        for page in wanted:
-            rec = pages_mod.find_page(live, page["id"])
-            if rec is not None:
-                rec["status"] = pages_mod.STATUS_QUEUED
-    return _enqueue_task(pid, cfg, items)
+    result = _enqueue_task(pid, cfg, items)
+    accepted = {int(i) for i in (result.get("queued") or [])}
+
+    # Mark ONLY what the queue actually took. Marking everything up front stranded
+    # every page the dedup rejected: it read "Queued" forever while nothing was
+    # coming for it, and the default sweep skips that status.
+    if accepted:
+        with pages_mod.mutate_pages(pid) as live:
+            for page in wanted:
+                if int(page.get("seq") or -1) in accepted:
+                    rec = pages_mod.find_page(live, page["id"])
+                    if rec is not None:
+                        rec["status"] = pages_mod.STATUS_QUEUED
+    elif wanted:
+        # One operation per page at a time is deliberate (it stops two model calls
+        # racing on one page), but silently answering 200 with an empty queue looked
+        # like the button was broken.
+        raise HTTPException(
+            409, "Those pages are already queued or being read. Wait for the current "
+                 "run to finish, or press Stop first.")
+
+    result["skipped_busy"] = len(wanted) - len(accepted)
+    return result
 
 
 @app.post("/api/projects/{pid}/pages/ocr")
@@ -1883,7 +1926,8 @@ def _worker_owns_chapter(pid: str, index: int) -> bool:
         return False
     if job.current == index and job.kind not in PAGE_TASK_KINDS:
         return True
-    return any(i == index and k not in PAGE_TASK_KINDS for i, _f, k in job.pending)
+    return any(i == index and k not in PAGE_TASK_KINDS
+               for i, _f, k in job.snapshot_pending())
 
 
 def _alignment_for(pid: str, ch: Chapter, blocks, k: int):
@@ -2980,27 +3024,57 @@ class Job:
         # window to refresh: {resume_at, resets_at, message, since}. None otherwise.
         self.waiting: dict | None = None
         self.wake = asyncio.Event()            # cancel/resume-now interrupts the sleep
+        # The worker mutates `pending` on the event loop while request THREADS read it
+        # (/api/queue polls every few seconds, and Apply checks whether this chapter is
+        # busy). Iterating a deque that changes size raises RuntimeError, which surfaced
+        # as intermittent 500s that blanked the dashboard. Every touch of `pending` goes
+        # through the helpers below.
+        self._pending_lock = threading.Lock()
 
+    # ---- queue access (always under _pending_lock) ----
     def enqueue(self, items: list[tuple[int, bool, str]]) -> list[int]:
         """Append (index, force, kind) triples, skipping ones already queued/in-flight."""
         added = []
-        for idx, force, kind in items:
-            key = _queue_key(idx, kind)
-            if key in self.queued:
-                continue
-            self.queued.add(key)
-            self.pending.append((idx, force, kind))
-            added.append(idx)
+        with self._pending_lock:
+            for idx, force, kind in items:
+                key = _queue_key(idx, kind)
+                if key in self.queued:
+                    continue
+                self.queued.add(key)
+                self.pending.append((idx, force, kind))
+                added.append(idx)
         return added
 
+    def snapshot_pending(self) -> list[tuple[int, bool, str]]:
+        """A stable copy, safe to iterate from any thread."""
+        with self._pending_lock:
+            return list(self.pending)
+
+    def take_next(self) -> tuple[int, bool, str] | None:
+        with self._pending_lock:
+            return self.pending.popleft() if self.pending else None
+
+    def put_back(self, item: tuple[int, bool, str]) -> None:
+        """Return an interrupted item to the head so it is retried first."""
+        with self._pending_lock:
+            self.pending.appendleft(item)
+
+    def drain(self) -> list[tuple[int, bool, str]]:
+        """Remove and return everything still waiting."""
+        with self._pending_lock:
+            dropped = list(self.pending)
+            self.pending.clear()
+            return dropped
+
     def queue_state(self) -> dict:
+        pending = self.snapshot_pending()
         # Before anything starts, `kind` is the default and would mislabel a queued
         # repair as "Translating" until its start event lands — so fall back to what
         # is at the head of the queue.
         kind = self.kind if self.current is not None else (
-            self.pending[0][2] if self.pending else self.kind)
+            pending[0][2] if pending else self.kind)
         return {"current": self.current, "kind": kind,
-                "pending": [i for i, _, _ in self.pending],
+                "pending": [i for i, _, _ in pending],
                 "waiting": self.waiting}
 
     def publish(self, ev: dict) -> None:
@@ -3332,7 +3406,7 @@ async def _run_page_item(job: Job, cfg: Config, idx: int, force: bool, kind: str
         # Nothing was written, so the page simply goes back to what it was and is
         # re-queued at the head to be retried when the window refreshes.
         _set_page_status(job.pid, page_id, prior_status)
-        job.pending.appendleft((idx, force, kind))
+        job.put_back((idx, force, kind))
         job.current = None
         strikes += 1
         resume_at, resets_at = _rate_limit_resume_at(exc, strikes)
@@ -3340,7 +3414,7 @@ async def _run_page_item(job: Job, cfg: Config, idx: int, force: bool, kind: str
             job.done = True
             job.publish({"type": "paused", "index": idx, "message": str(exc),
                          "resets_at": resets_at, "current": None,
-                         "pending": [i for i, _, _ in job.pending]})
+                         "pending": [i for i, _, _ in job.snapshot_pending()]})
             return strikes, "return"
         job.waiting = {"resume_at": resume_at, "resets_at": resets_at,
                        "message": str(exc), "since": time.time()}
@@ -3389,8 +3463,11 @@ async def _run_worker(job: Job, cfg: Config) -> None:
     # an enqueue arriving mid-flight is always observed on a later iteration (no lost
     # work — start_translation keeps appending to this job while it waits).
     strikes = 0  # consecutive rate-limit hits; any completed chapter resets it
-    while job.pending and not job.cancelled:
-        idx, force, kind = job.pending.popleft()
+    while not job.cancelled:
+        item = job.take_next()
+        if item is None:
+            break
+        idx, force, kind = item
         job.current = idx
         job.kind = kind
         # A page item's index is a page sequence number, so it must NOT be looked up
@@ -3481,14 +3558,14 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             # Put the interrupted chapter back at the head (it stays in job.queued)
             # and ride out the limit HERE — the worker stays alive and resumes by
             # itself when the plan's window refreshes, no browser needed.
-            job.pending.appendleft((idx, force, kind))
+            job.put_back((idx, force, kind))
             job.current = None
             strikes += 1
             resume_at, resets_at = _rate_limit_resume_at(exc, strikes)
             if strikes >= _MAX_STRIKES:
                 # Something is off (limit hit right back N times in a row) — stop
                 # burning retries and hand resumption to the user/client instead.
-                remaining = [i for i, _, _ in job.pending]
+                remaining = [i for i, _, _ in job.snapshot_pending()]
                 job.done = True
                 job.publish({"type": "paused", "index": idx, "message": str(exc),
                              "resets_at": resets_at,
@@ -3557,6 +3634,46 @@ async def _run_worker(job: Job, cfg: Config) -> None:
                  "current": None, "pending": []})
 
 
+async def _run_worker_guarded(job: Job, cfg: Config) -> None:
+    """Run the worker, guaranteeing it always terminates VISIBLY.
+
+    ``_run_worker`` handles errors per item, but a few steps sit outside that try —
+    persisting chapter state, applying a page result. An OSError there (on Windows,
+    an antivirus holding pages.json for a moment is the realistic one) escaped and
+    killed the asyncio task outright. Nothing then published a terminal event, so
+    every open SSE stream sat on keep-alives forever still showing "translating"; the
+    page stayed "ocr-running"; and because ``job.done`` was never set, the job could
+    not be evicted either, so its history leaked for the life of the process.
+
+    Whatever happens, this leaves the job finished, says so on the stream, and hands
+    back any pages whose work will now never run.
+    """
+    try:
+        await _run_worker(job, cfg)
+    except asyncio.CancelledError:
+        raise  # shutdown, not a failure — let it propagate
+    except Exception as exc:  # noqa: BLE001 — a worker must never die silently
+        explained = errors.explain(exc)
+        errors.log_error(explained, where=f"worker/{job.pid}")
+        job.publish({"type": "chapter", "index": job.current, "kind": job.kind,
+                     "status": "failed", "title": "",
+                     "error": str(exc), "explain": errors.as_dict(explained)})
+    finally:
+        job.live = None
+        job.current = None
+        stranded = {i for i, _f, k in job.drain() if k in PAGE_TASK_KINDS}
+        if stranded:
+            try:
+                _release_queued_pages(job.pid, stranded)
+            except Exception:  # noqa: BLE001 — cleanup must not mask the real error
+                pass
+        job.done = True
+        if job.terminal is None:
+            # A normal finish and the rate-limit give-up both publish their own
+            # terminal event; this only fires when the worker died on the way there.
+            job.publish({"type": "done", "totals": None, "current": None, "pending": []})
+
+
 def _spawn_worker(pid: str, cfg: Config, job: Job) -> None:
     # Bound memory: a long-lived server accrues a Job per run. Drop old finished jobs,
     # keeping the active ones plus the few most recent for a late stream's replay.
@@ -3566,7 +3683,7 @@ def _spawn_worker(pid: str, cfg: Config, job: Job) -> None:
             _jobs.pop(jid, None)
     _jobs[job.id] = job
     _active_job_by_project[pid] = job.id
-    task = asyncio.create_task(_run_worker(job, cfg))
+    task = asyncio.create_task(_run_worker_guarded(job, cfg))
     _running_tasks.add(task)  # strong ref so the task isn't garbage-collected
 
     def _cleanup(t: asyncio.Task) -> None:
@@ -3661,7 +3778,11 @@ def cancel_queue(pid: str, req: CancelRequest = CancelRequest()) -> dict:
     jid = _active_job_by_project.get(pid)
     if jid and jid in _jobs and not _jobs[jid].done:
         job = _jobs[jid]
-        job.pending.clear()
+        # Pages whose work is about to be dropped have to come off "Queued", or they
+        # sit there forever and the default sweep can't see them again.
+        dropped_pages = {i for i, _f, k in job.drain() if k in PAGE_TASK_KINDS}
+        if dropped_pages:
+            _release_queued_pages(pid, dropped_pages)
         stopped = None
         if req.stop_current:
             stopped = job.current

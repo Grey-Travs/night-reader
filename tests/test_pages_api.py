@@ -354,6 +354,87 @@ def test_a_missing_page_is_a_clean_404(client):
     assert client.get(f"/api/projects/{pid}/pages/deadbeef/image").status_code == 404
 
 
+# ---- pages must never be stranded in "Queued" --------------------------------
+# A page is marked `queued` when work is accepted for it. Nothing used to put it back
+# when that work was dropped (Stop, a rate-limit give-up, a dead worker), and the
+# default sweep only selects new/failed - so the page read "Queued" forever and
+# "Read N pages" answered "There are no pages to do that to".
+
+def test_releasing_puts_stranded_pages_back(client):
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _set(client, pid, page["id"], status=P.STATUS_QUEUED)
+
+    assert A._release_queued_pages(pid) == 1
+    rail = client.get(f"/api/projects/{pid}/pages").json()["pages"]
+    assert rail[0]["status"] == P.STATUS_NEW, "a released page must be readable again"
+
+
+def test_releasing_only_touches_queued_pages(client):
+    pid = _novel(client)
+    a = _upload(client, pid, data=JPEG).json()["page"]
+    b = _upload(client, pid, data=JPEG2).json()["page"]
+    _set(client, pid, a["id"], status=P.STATUS_QUEUED)
+    _set(client, pid, b["id"], text="본문", status=P.STATUS_OK)
+
+    A._release_queued_pages(pid)
+    by_id = {p["id"]: p for p in client.get(f"/api/projects/{pid}/pages").json()["pages"]}
+    assert by_id[a["id"]]["status"] == P.STATUS_NEW
+    assert by_id[b["id"]]["status"] == P.STATUS_OK, "an accepted page must be left alone"
+
+
+def test_releasing_can_be_limited_to_specific_pages(client):
+    pid = _novel(client)
+    a = _upload(client, pid, data=JPEG).json()["page"]
+    b = _upload(client, pid, data=JPEG2).json()["page"]
+    for p in (a, b):
+        _set(client, pid, p["id"], status=P.STATUS_QUEUED)
+
+    assert A._release_queued_pages(pid, {a["seq"]}) == 1
+    by_id = {p["id"]: p for p in client.get(f"/api/projects/{pid}/pages").json()["pages"]}
+    assert by_id[a["id"]]["status"] == P.STATUS_NEW
+    assert by_id[b["id"]]["status"] == P.STATUS_QUEUED
+
+
+def test_releasing_never_creates_a_manifest_for_a_novel_with_no_pages(client):
+    """Pressing Stop on a Google-Doc novel must not leave a pages.json behind."""
+    text = client.post("/api/projects/text",
+                       json={"name": "Pasted", "text": "본문", "split_mode": "single"})
+    pid = text.json()["id"]
+    assert A._release_queued_pages(pid) == 0
+    assert not P.pages_file(pid).exists()
+
+
+def test_only_pages_the_queue_accepted_are_marked_queued(client, monkeypatch):
+    """Marking before enqueuing stranded every page the dedup rejected."""
+    pid = _novel(client)
+    a = _upload(client, pid, data=JPEG).json()["page"]
+    b = _upload(client, pid, data=JPEG2).json()["page"]
+
+    # Pretend the queue already held page b, so only a is accepted.
+    monkeypatch.setattr(A, "_enqueue_task",
+                        lambda _pid, _cfg, items: {"job_id": "j", "queued": [a["seq"]]})
+    res = client.post(f"/api/projects/{pid}/pages/ocr", json={"ids": [a["id"], b["id"]]})
+    assert res.status_code == 200, res.text
+    assert res.json()["skipped_busy"] == 1
+
+    by_id = {p["id"]: p for p in client.get(f"/api/projects/{pid}/pages").json()["pages"]}
+    assert by_id[a["id"]]["status"] == P.STATUS_QUEUED
+    assert by_id[b["id"]]["status"] == P.STATUS_NEW, \
+        "a page the queue refused must stay readable, not sit at Queued forever"
+
+
+def test_queueing_work_that_is_all_already_busy_says_so(client, monkeypatch):
+    """Silently answering 200 with an empty queue looked like a broken button."""
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    monkeypatch.setattr(A, "_enqueue_task",
+                        lambda _pid, _cfg, _items: {"job_id": "j", "queued": []})
+    res = client.post(f"/api/projects/{pid}/pages/ocr", json={"ids": [page["id"]]})
+    assert res.status_code == 409
+    assert "already queued" in res.text
+
+
 # ---- the cross-novel index ---------------------------------------------------
 
 def test_the_scans_index_lists_only_photographed_novels(client):

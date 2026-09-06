@@ -144,6 +144,82 @@ def test_queue_keys_are_namespaced_by_kind():
         "every chapter operation shares one key so they cannot run at once"
 
 
+# ---- the queue is read from request THREADS while the worker mutates it -----
+# /api/queue polls every few seconds and Apply checks whether a chapter is busy, both
+# on threadpool threads, while the worker pops and re-queues on the event loop.
+# Iterating a deque that changes size raises RuntimeError, which surfaced as
+# intermittent 500s that blanked the dashboard. Every access goes through helpers now.
+
+def test_snapshot_is_a_copy_not_a_live_view():
+    job = _job()
+    job.enqueue([(1, False, A.TASK_TRANSLATE), (2, False, A.TASK_TRANSLATE)])
+    snap = job.snapshot_pending()
+    job.take_next()
+    assert len(snap) == 2, "a snapshot must not change under the caller's feet"
+
+
+def test_queue_state_survives_the_queue_emptying_underneath_it():
+    job = _job()
+    job.enqueue([(i, False, A.TASK_TRANSLATE) for i in range(50)])
+    for _ in range(50):
+        job.take_next()
+    assert job.queue_state()["pending"] == []
+
+
+def test_take_next_returns_none_when_empty_instead_of_raising():
+    assert _job().take_next() is None
+
+
+def test_take_next_is_fifo_and_put_back_goes_to_the_head():
+    job = _job()
+    job.enqueue([(1, False, A.TASK_TRANSLATE), (2, False, A.TASK_TRANSLATE)])
+    first = job.take_next()
+    assert first[0] == 1
+    job.put_back(first)
+    assert job.take_next()[0] == 1, "an interrupted item must be retried first"
+
+
+def test_drain_empties_and_returns_everything_waiting():
+    job = _job()
+    job.enqueue([(1, False, A.TASK_TRANSLATE), (7, False, A.TASK_OCR)])
+    dropped = job.drain()
+    assert [i for i, _f, _k in dropped] == [1, 7]
+    assert job.queue_state()["pending"] == []
+
+
+def test_concurrent_readers_never_see_a_torn_queue():
+    """The actual failure: RuntimeError: deque mutated during iteration."""
+    import threading
+
+    job = _job()
+    job.enqueue([(i, False, A.TASK_TRANSLATE) for i in range(200)])
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def drain():
+        try:
+            while not stop.is_set() and job.take_next() is not None:
+                pass
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def poll():
+        try:
+            while not stop.is_set():
+                job.queue_state()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=drain), threading.Thread(target=poll)]
+    for t in threads:
+        t.start()
+    threads[0].join(timeout=10)
+    stop.set()
+    for t in threads:
+        t.join(timeout=10)
+    assert not errors, f"reading the queue while it drained raised: {errors!r}"
+
+
 if __name__ == "__main__":
     import pytest
 
