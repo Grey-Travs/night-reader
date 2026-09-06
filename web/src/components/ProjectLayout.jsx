@@ -18,8 +18,16 @@ function notify(title, body) {
   try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body }) } catch { /* ignore */ }
 }
 
-// What the worker is doing to a chapter, for log lines. Mirrors TASK_LABEL in app.py.
-const TASK_VERB = { translate: 'Translating', resolve: 'AI resolve on', pronouns: 'Fixing pronouns in' }
+// What the worker is doing, for log lines. Mirrors TASK_LABEL in app.py. The noun
+// ("chapter" / "page") is appended separately, because scanned-page work rides the
+// same queue and its index is a PAGE number, not a chapter number.
+const TASK_VERB = {
+  translate: 'Translating', resolve: 'AI resolve on', pronouns: 'Fixing pronouns in',
+  ocr: 'Reading', 'ocr-verify': 'Double-checking',
+}
+// Events for a page carry page_id; chapter events never do.
+const noun = (e) => (e.page_id ? 'page' : 'chapter')
+const Noun = (e) => (e.page_id ? 'Page' : 'Chapter')
 
 const subClass = ({ isActive }) => `subtab ${isActive ? 'subtab-active' : ''}`
 
@@ -154,14 +162,16 @@ export default function ProjectLayout() {
       if ('pending' in e) setQueue({ current: e.current ?? null, kind: e.kind || 'translate', pending: e.pending || [] })
       if ('waiting' in e) setWaiting(e.waiting ?? null)
       if (e.type === 'start') {
-        setRowStatus(e.index, 'translating')
+        // A page event must never restyle the chapter row that happens to share its
+        // number — after a build, page 5 and chapter 5 both exist.
+        if (!e.page_id) setRowStatus(e.index, 'translating')
         setLive({
           index: e.index, title: e.title, chars: e.chars, model: e.model, effort: e.effort,
           task: e.kind || 'translate',
           source: [], english: '', committed: '', chunk: [1, 1],
           started_at: e.started_at || Date.now() / 1000,
         })
-        setLog((l) => [...l, { kind: 'info', text: `${TASK_VERB[e.kind] || TASK_VERB.translate} chapter ${e.index}…` }])
+        setLog((l) => [...l, { kind: 'info', text: `${TASK_VERB[e.kind] || TASK_VERB.translate} ${noun(e)} ${e.index}…` }])
       } else if (e.type === 'live') {
         // Catch-up frame for a stream that connected mid-chapter (reload, second tab).
         setLive({
@@ -183,7 +193,7 @@ export default function ProjectLayout() {
         setLive((v) => (v && v.index === e.index ? { ...v, english: e.english || '' } : v))
         setLog((l) => [...l, { kind: 'warn', text: `Restarting (${e.reason})…` }])
       } else if (e.type === 'chapter') {
-        setRowStatus(e.index, e.status)
+        if (!e.page_id) setRowStatus(e.index, e.status)
         setLive(null)
         if (e.totals) setTotals(e.totals)
         // `refused` means a repair declined to write anything — the chapter is exactly
@@ -193,14 +203,16 @@ export default function ProjectLayout() {
         setLog((l) => [...l, {
           kind: e.status === 'failed' ? 'error' : e.refused ? 'warn'
             : e.status === 'validated' ? 'good' : 'info',
-          text: `Chapter ${e.index}: ${what}${e.error ? ` — ${e.error}` : ''}`,
+          text: `${Noun(e)} ${e.index}: ${what}${e.error ? ` — ${e.error}` : ''}`,
         }])
         // A mid-queue failure carries the same explanation the HTTP layer produces, so
         // surface it the same way rather than leaving it as one grey log line.
         if (e.status === 'failed' && e.explain) {
           showErrorRef.current?.(e.explain, {
-            context: `translating chapter ${e.index}`,
-            onRetry: () => enqueueRef.current?.([e.index], true),
+            context: e.page_id ? `reading page ${e.index}` : `translating chapter ${e.index}`,
+            // Retrying is chapter work; a failed page is retried from the Pages tab,
+            // where re-reading it is one button next to the photo.
+            onRetry: e.page_id ? undefined : () => enqueueRef.current?.([e.index], true),
           })
         }
       } else if (e.type === 'queued') {
@@ -395,7 +407,12 @@ export default function ProjectLayout() {
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <h1 className="truncate font-reading text-xl font-medium leading-tight">{data?.project?.name || 'Novel'}</h1>
-              <p className="text-xs text-hint">{data?.total ?? '—'} tabs{data?.project?.source_type === 'text' ? ' · pasted text' : ''}</p>
+              <p className="text-xs text-hint">
+                {data?.total ?? '—'}{' '}
+                {data?.project?.source_type === 'images' ? 'chapters' : 'tabs'}
+                {data?.project?.source_type === 'text' ? ' · pasted text' : ''}
+                {data?.project?.source_type === 'images' ? ' · from photos' : ''}
+              </p>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
               {lastRead != null && (
@@ -422,6 +439,9 @@ export default function ProjectLayout() {
           {/* sub-navigation within the novel */}
           <nav className="mt-3 flex items-center gap-5 overflow-x-auto">
             <NavLink to={`/novel/${pid}`} end className={subClass}>Chapters</NavLink>
+            {data?.project?.source_type === 'images' && (
+              <NavLink to={`/novel/${pid}/pages`} className={subClass}>Pages</NavLink>
+            )}
             <NavLink to={`/novel/${pid}/activity`} className={subClass}>
               Activity {running && <span className="inline-block h-1.5 w-1.5 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />}
             </NavLink>

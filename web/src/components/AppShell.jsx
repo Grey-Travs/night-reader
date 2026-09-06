@@ -12,6 +12,7 @@ const NAV = [
   { to: '/', end: true, icon: '📚', label: 'Library' },
   { to: '/activity', icon: '⚡', label: 'Activity' },
   { to: '/review', icon: '🚩', label: 'Review' },
+  { to: '/scans', icon: '📷', label: 'Scans' },
   { to: '/upkeep', icon: '🧹', label: 'Upkeep', badge: 'upkeep' },
   { to: '/archive', icon: '📦', label: 'Archive' },
   { to: '/guide', icon: '❓', label: 'Guide' },

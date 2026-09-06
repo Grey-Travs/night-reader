@@ -1,8 +1,10 @@
 import { Children, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api'
+import { blockIndexAt, isPlainParagraph, splitBlocks } from '../blocks'
 import { Badge } from './ui'
 import Hint from './Hint'
+import ParagraphPanel from './ParagraphPanel'
 import ShortcutsHelp from './ShortcutsHelp'
 import { useHints } from '../hints'
 import { getReadingPrefs, getScrollPos, markChapterRead, setLastRead, setReadingPrefs, setScrollPos } from '../prefs'
@@ -131,6 +133,10 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [showSource, setShowSource] = useState(false)
+  // For a scanned novel the truest source is the photograph itself, so it leads.
+  const [sourceMode, setSourceMode] = useState('photo')
+  // Which paragraph the rewrite drawer is open on, if any.
+  const [paraPanel, setParaPanel] = useState(null)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
@@ -260,6 +266,9 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
       if (e.key === 'Escape') {
         if (showShortcuts) { setShowShortcuts(false); return }
         if (showType) { setShowType(false); return }
+        // Inserted, not appended: Esc from inside the rewrite drawer must close the
+        // drawer, not the whole reader.
+        if (paraPanel) { setParaPanel(null); return }
         if (editing) { setEditing(false); return }
         onClose()
         return
@@ -267,12 +276,29 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
       const t = e.target.tagName
       if (editing || t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return
       if (e.key === '?') { setShowShortcuts((v) => !v); return }
+      // `r` rewrites whatever you're actually looking at — the paragraph nearest the
+      // middle of the viewport.
+      if (e.key === 'r' || e.key === 'R') {
+        const nodes = [...document.querySelectorAll('.reading p.para[data-para]')]
+        if (!nodes.length) return
+        const middle = window.innerHeight / 2
+        let best = null
+        let bestDist = Infinity
+        for (const node of nodes) {
+          const box = node.getBoundingClientRect()
+          const dist = Math.abs((box.top + box.bottom) / 2 - middle)
+          if (dist < bestDist) { bestDist = dist; best = node }
+        }
+        if (best) openParagraph(Number(best.dataset.para))
+        return
+      }
       if (e.key === 'ArrowLeft' && prevIndex != null) onNavigate(prevIndex)
       if (e.key === 'ArrowRight' && nextIndex != null) onNavigate(nextIndex)
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose, onNavigate, prevIndex, nextIndex, editing, showType, showShortcuts])
+  }, [onClose, onNavigate, prevIndex, nextIndex, editing, showType, showShortcuts,
+      paraPanel, openParagraph])
 
   function updatePrefs(patch) {
     const next = { ...prefs, ...patch }
@@ -305,7 +331,9 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     const ratio = el.scrollTop / max
     const now = Date.now()
     if (now - lastSave.current > 350) { lastSave.current = now; setScrollPos(pid, index, ratio) }
-    if (prefs.autoAdvance && !editing && nextIndex != null && !advancedRef.current && ratio >= 0.992) {
+    // `!paraPanel`: applying a shorter version can push the ratio past the threshold,
+    // which would flip to the next chapter out from under an open rewrite.
+    if (prefs.autoAdvance && !editing && !paraPanel && nextIndex != null && !advancedRef.current && ratio >= 0.992) {
       advancedRef.current = true
       onNavigate(nextIndex)
     }
@@ -386,15 +414,60 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
   const fontFam = FONT[prefs.font] || FONT.serif
   // Glossary-name highlighting for the rendered translation (toggleable).
   const glossLookup = useMemo(() => buildGlossLookup(glossary), [glossary])
-  const glossComponents = useMemo(() => {
-    if (!prefs.glossaryTips || glossLookup.size === 0) return undefined
+  // A scanned chapter knows which photos it was built from (batch builds only — a
+  // whole-novel split can't attribute pages to a chapter, so it sends none).
+  const hasPhotos = (data?.page_ids || []).length > 0
+  const sourceParas = useMemo(
+    () => (data?.source || '').split(/\n{2,}/).map((p) => p.trim()).filter(Boolean),
+    [data?.source],
+  )
+
+  // Paragraph spans of the translation as it currently stands. The server addresses a
+  // rewrite by this same ordinal (see web/src/blocks.js — it mirrors paragraphs.py).
+  const blocks = useMemo(() => splitBlocks(data?.translation || ''), [data?.translation])
+
+  const openParagraph = useCallback((k) => {
+    const block = blocks[k]
+    if (block) setParaPanel({ paragraph: k, text: block.text })
+  }, [blocks])
+
+  const glossRegex = useMemo(() => {
+    if (!prefs.glossaryTips || glossLookup.size === 0) return null
     const names = [...glossLookup.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp)
-    const regex = new RegExp(`(${names.join('|')})`, 'g')
-    const wrap = (Tag) => function GlossTag({ node, children, ...props }) {
-      return <Tag {...props}>{highlightChildren(children, regex, glossLookup)}</Tag>
-    }
-    return { p: wrap('p'), li: wrap('li'), em: wrap('em'), strong: wrap('strong') }
+    return new RegExp(`(${names.join('|')})`, 'g')
   }, [prefs.glossaryTips, glossLookup])
+
+  // One components object doing two jobs: glossary tooltips, and a rewrite handle in
+  // the margin. It must ALWAYS exist — it used to be undefined when glossary tips
+  // were switched off, which would have silently disabled rewriting with them.
+  const glossComponents = useMemo(() => {
+    const decorate = glossRegex
+      ? (kids) => highlightChildren(kids, glossRegex, glossLookup)
+      : (kids) => kids
+    const wrap = (Tag) => function GlossTag({ node, children, ...props }) {
+      return <Tag {...props}>{decorate(children)}</Tag>
+    }
+    const Paragraph = function ReaderParagraph({ node, children, ...props }) {
+      const k = blockIndexAt(blocks, node?.position?.start?.offset)
+      // Only offer the handle where a Markdown paragraph and a blank-line block are
+      // the same thing — they disagree for rules, headings, quotes and part markers,
+      // and the address is always block-based.
+      const plain = k != null && isPlainParagraph(blocks[k]?.text)
+      return (
+        <p {...props} data-para={k ?? undefined}
+           className={`para${paraPanel?.paragraph === k ? ' para-active' : ''}`}>
+          {decorate(children)}
+          {plain && !editing && (
+            <button type="button" className="para-handle" tabIndex={-1}
+                    title="Rewrite this paragraph (r)"
+                    aria-label={`Rewrite paragraph ${k + 1}`}
+                    onClick={() => openParagraph(k)}>✎</button>
+          )}
+        </p>
+      )
+    }
+    return { p: Paragraph, li: wrap('li'), em: wrap('em'), strong: wrap('strong') }
+  }, [glossRegex, glossLookup, blocks, paraPanel, editing, openParagraph])
   const readStyle = { fontSize: prefs.fontSize, maxWidth: `${prefs.width}ch`, color: th.ink }
   // Side-by-side columns: honour font size + theme ink, but let the grid govern width.
   const dualStyle = { fontSize: prefs.fontSize, color: th.ink }
@@ -617,10 +690,45 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
           hasTranslation ? (
             showSource ? (
               <div className="grid gap-8 md:grid-cols-2 md:divide-x md:divide-line">
-                <article className="korean md:pr-8" style={dualStyle}>
-                  <div className="mb-3 font-ui text-xs font-medium uppercase tracking-wide text-hint">Korean</div>
-                  {data.source}
-                </article>
+                <div className="md:pr-8">
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <span className="font-ui text-xs font-medium uppercase tracking-wide text-hint">
+                      {hasPhotos && sourceMode === 'photo' ? 'The page' : 'Korean'}
+                    </span>
+                    {/* A scanned chapter can show the actual photograph, which makes
+                        any translation error traceable back to the page it came from. */}
+                    {hasPhotos && (
+                      <div className="flex gap-1">
+                        {['photo', 'text'].map((mode) => (
+                          <button
+                            key={mode}
+                            onClick={() => setSourceMode(mode)}
+                            className={`btn px-2 py-0.5 text-[11px] ${sourceMode === mode ? 'btn-primary' : 'btn-ghost'}`}
+                          >
+                            {mode === 'photo' ? 'Photo' : 'Text'}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {hasPhotos && sourceMode === 'photo' ? (
+                    <div className="space-y-3">
+                      {data.page_ids.map((id) => (
+                        <img
+                          key={id} src={api.pageImageUrl(pid, id)} alt=""
+                          loading="lazy" decoding="async"
+                          className="w-full rounded-card border border-line"
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <article className="korean" style={dualStyle}>
+                      {sourceParas.length
+                        ? sourceParas.map((p, i) => <p key={i} className="mb-4">{p}</p>)
+                        : <div className="sunken p-4 font-ui text-sm text-muted">No source text.</div>}
+                    </article>
+                  )}
+                </div>
                 <article className="reading md:pl-8" style={{ ...dualStyle, fontFamily: fontFam }}>
                   <div className="mb-3 font-ui text-xs font-medium uppercase tracking-wide text-hint">English</div>
                   <ReactMarkdown components={glossComponents}>{data.translation}</ReactMarkdown>
@@ -646,6 +754,30 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
             </>
           )
         ) : null}
+
+        {paraPanel && (
+          <ParagraphPanel
+            pid={pid}
+            index={index}
+            paragraph={paraPanel.paragraph}
+            expectedText={paraPanel.text}
+            components={glossComponents}
+            onClose={() => setParaPanel(null)}
+            onApplied={(res) => {
+              // Patch in place rather than reloading: a remount re-fires the
+              // scroll-restore effect and jumps to a stale saved position.
+              setData((d) => d && {
+                ...d,
+                translation: res.translation,
+                status: res.status ?? d.status,
+                validation: res.validation ?? d.validation,
+              })
+              setParaPanel((p) => p && { ...p, text: res.group?.variants?.find(
+                (v) => v.id === res.group.current_id)?.text ?? p.text })
+              onChanged?.()
+            }}
+          />
+        )}
 
         {/* Bottom navigation — so you don't have to scroll back up to flip chapters. */}
         {data && !editing && (

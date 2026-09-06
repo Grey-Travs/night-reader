@@ -38,13 +38,44 @@ export const api = {
   listProjects: () => get('/api/projects'),
   createProject: (url, name) => post('/api/projects', { url, name }),
   createTextProject: (body) => post('/api/projects/text', body),
+  createImagesProject: (name) => post('/api/projects/images', { name }),
   getProject: (pid) => get(`/api/projects/${pid}`),
   updateProject: (pid, body) => post(`/api/projects/${pid}`, body),
   deleteProject: (pid) => del(`/api/projects/${pid}`),
 
+  // Scanned pages (photographed / screenshotted novels).
+  // One image per request as a raw body, like importBundle — it keeps the backend
+  // free of a multipart dependency and gives per-file progress and per-file failure.
+  // Thread the `batch` returned by the first upload through the rest of one drop:
+  // a batch is how the reader says "these photos are one chapter".
+  scans: () => get('/api/scans'),
+  pages: (pid) => get(`/api/projects/${pid}/pages`),
+  page: (pid, pageId) => get(`/api/projects/${pid}/pages/${pageId}`),
+  pageImageUrl: (pid, pageId) => `/api/projects/${pid}/pages/${pageId}/image`,
+  uploadPage: (pid, file, { batch = '', label = '', name = '' } = {}) => {
+    const q = new URLSearchParams({ batch, label, name: name || file.name || '' })
+    return req(`/api/projects/${pid}/pages?${q}`, {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    })
+  },
+  savePage: (pid, pageId, body) => post(`/api/projects/${pid}/pages/${pageId}`, body),
+  reorderPages: (pid, ids) => post(`/api/projects/${pid}/pages/reorder`, { ids }),
+  deletePages: (pid, ids) => post(`/api/projects/${pid}/pages/delete`, { ids }),
+  // readPages / verifyPages QUEUE work on the novel's worker (like resolveChapter),
+  // so they stream to the live console and honour Stop and the rate-limit resume.
+  readPages: (pid, ids) => post(`/api/projects/${pid}/pages/ocr`, { ids: ids || [] }),
+  verifyPages: (pid, ids) => post(`/api/projects/${pid}/pages/verify`, { ids: ids || [] }),
+  stitchPages: (pid, body) => post(`/api/projects/${pid}/pages/stitch`, body || {}),
+  buildChapters: (pid, body) => post(`/api/projects/${pid}/pages/build`, body || {}),
+
   // Move / back up novels between devices (portable .zip bundles).
-  bundleUrl: (pid) => `/api/projects/${pid}/bundle`,
-  backupAllUrl: () => '/api/backup',
+  // `images` also packs a scanned novel's original photos — off by default, because
+  // a photographed library runs to gigabytes and the text alone keeps it usable.
+  bundleUrl: (pid, images = false) =>
+    `/api/projects/${pid}/bundle${images ? '?images=true' : ''}`,
+  backupAllUrl: (images = false) => `/api/backup${images ? '?images=true' : ''}`,
   importBundle: (file) =>
     req('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: file }),
   searchAll: (q) => get(`/api/search?q=${encodeURIComponent(q)}`),
@@ -74,6 +105,16 @@ export const api = {
   acceptChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/accept`),
   searchChapters: (pid, q) => get(`/api/projects/${pid}/search?q=${encodeURIComponent(q)}`),
   exportUrl: (pid, format) => `/api/projects/${pid}/export?format=${format}`,
+
+  // Per-paragraph rewrites. Generating writes only to the variant history — nothing
+  // reaches the chapter until applyParagraph — so these run inline rather than
+  // queueing behind a translation.
+  chapterVariants: (pid, i) => get(`/api/projects/${pid}/chapters/${i}/variants`),
+  paragraphSource: (pid, i, body) => post(`/api/projects/${pid}/chapters/${i}/paragraph/source`, body),
+  retranslateParagraph: (pid, i, body) => post(`/api/projects/${pid}/chapters/${i}/paragraph/retranslate`, body),
+  rephraseParagraph: (pid, i, body) => post(`/api/projects/${pid}/chapters/${i}/paragraph/rephrase`, body),
+  applyParagraph: (pid, i, body) => post(`/api/projects/${pid}/chapters/${i}/paragraph/apply`, body),
+  discardParagraph: (pid, i, body) => post(`/api/projects/${pid}/chapters/${i}/paragraph/discard`, body),
 
   consistencyScan: (pid) => get(`/api/projects/${pid}/consistency`),
   consistencyReplace: (pid, body) => post(`/api/projects/${pid}/consistency/replace`, body),

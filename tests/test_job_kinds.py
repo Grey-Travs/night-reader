@@ -101,6 +101,49 @@ def test_publish_stamps_queue_state_onto_non_terminal_events():
     assert job.history[-1]["kind"] == A.TASK_RESOLVE
 
 
+# ---- pages and chapters share the worker, not the number space --------------
+# Scanned-page work rides the same Job so Stop, the live console, the Activity view
+# and the rate-limit auto-resume all apply to it unchanged. But a page item's index
+# is a PAGE sequence number: once a scanned novel has been built, page 5 and
+# chapter 5 both exist and are different things.
+
+def test_a_page_and_a_chapter_with_the_same_number_do_not_collide():
+    """Deduping on the bare index made queueing a page silently drop a chapter."""
+    job = _job()
+    assert job.enqueue([(5, False, A.TASK_TRANSLATE)]) == [5]
+    assert job.enqueue([(5, False, A.TASK_OCR)]) == [5], \
+        "page 5 is not chapter 5 — queueing it must not be swallowed as a duplicate"
+    assert len(job.pending) == 2
+
+
+def test_page_work_still_dedups_against_itself():
+    job = _job()
+    assert job.enqueue([(5, False, A.TASK_OCR)]) == [5]
+    assert job.enqueue([(5, False, A.TASK_OCR_VERIFY)]) == [], \
+        "one operation per page at a time, same as chapters"
+    assert len(job.pending) == 1
+
+
+def test_queue_state_still_reports_plain_indices_for_pages():
+    """The Activity views and /api/queue read this; namespacing is internal."""
+    job = _job()
+    job.enqueue([(3, False, A.TASK_OCR), (4, False, A.TASK_TRANSLATE)])
+    assert job.queue_state()["pending"] == [3, 4]
+
+
+def test_page_kinds_are_registered_as_page_kinds():
+    for kind in (A.TASK_OCR, A.TASK_OCR_VERIFY):
+        assert kind in A.PAGE_TASK_KINDS, f"{kind} would be looked up in the chapter map"
+    for kind in (A.TASK_TRANSLATE, A.TASK_RESOLVE, A.TASK_PRONOUNS):
+        assert kind not in A.PAGE_TASK_KINDS
+
+
+def test_queue_keys_are_namespaced_by_kind():
+    assert A._queue_key(5, A.TASK_TRANSLATE) != A._queue_key(5, A.TASK_OCR)
+    assert A._queue_key(5, A.TASK_TRANSLATE) == A._queue_key(5, A.TASK_RESOLVE), \
+        "every chapter operation shares one key so they cannot run at once"
+
+
 if __name__ == "__main__":
     import pytest
 

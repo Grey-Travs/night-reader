@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
+import tempfile
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -144,15 +146,41 @@ def create_text_project(name: str, chapters: list[Chapter], *, pid: str | None =
     pdir = PROJECTS_DIR / pid
     (pdir / "chapters").mkdir(parents=True, exist_ok=True)
     (pdir / "audit").mkdir(parents=True, exist_ok=True)
-    (pdir / "source.json").write_text(
-        json.dumps(chapters_to_records(chapters), ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # Atomic, like every other persisted file — a crash mid-write must never leave a
+    # half-written source snapshot behind.
+    cache_source(pid, chapters)
     project = {
         "id": pid,
         "name": name.strip() or "Untitled novel",
         "source_type": "text",
         "source_doc_id": "",
         "chapter_count": len(chapters),
+        "created_at": _now(),
+    }
+    return _write_project(project)
+
+
+# ---- image-source projects (photographed / scanned pages) --------------------
+def create_images_project(name: str, *, pid: str | None = None) -> dict:
+    """Create an empty novel whose source is page images.
+
+    It starts with no chapters: pages are uploaded and transcribed first, then built
+    into ``source.json``. From that point it is an ordinary project — glossary,
+    translation, validation, reader and export all work unchanged.
+    """
+    pid = pid or uuid.uuid4().hex[:12]
+    if not _PROJECT_ID_RE.match(pid):
+        raise ValueError("invalid project id")
+    pdir = PROJECTS_DIR / pid
+    (pdir / "chapters").mkdir(parents=True, exist_ok=True)
+    (pdir / "audit").mkdir(parents=True, exist_ok=True)
+    (pdir / "pages").mkdir(parents=True, exist_ok=True)
+    project = {
+        "id": pid,
+        "name": name.strip() or "Untitled novel",
+        "source_type": "images",
+        "source_doc_id": "",
+        "chapter_count": 0,
         "created_at": _now(),
     }
     return _write_project(project)
@@ -191,17 +219,35 @@ def load_cached_source(pid: str) -> list[Chapter]:
 # Files and folders that make up a portable copy of a novel. Tokens/configs are
 # deliberately excluded — a bundle carries the novel, never the user's logins.
 _BUNDLE_FILES = (
-    "project.json", "state.json", "source.json",
+    "project.json", "state.json", "source.json", "pages.json",
     "glossary.json", "glossary.md", "glossary_pending.json",
 )
-_BUNDLE_DIRS = ("chapters", "audit")
+_BUNDLE_DIRS = ("chapters", "audit", "variants")
+# Page images travel only on request. A photographed novel is hundreds of megabytes,
+# so including them by default would make an ordinary library backup unusable. The
+# extracted text always travels (in ``pages.json``), so an image novel stays readable
+# and translatable after a move even when its photos stayed behind.
+_BUNDLE_IMAGE_DIRS = ("pages",)
 
 
-def export_bundle(pids: list[str]) -> bytes:
-    """Zip one or more whole projects into a portable bundle. Each project's files
-    live under its own ``<id>/`` folder so a single bundle can hold many novels."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+def export_bundle(pids: list[str], *, include_images: bool = False,
+                  dest: Path | None = None) -> Path:
+    """Zip one or more whole projects into a portable bundle, returning its path.
+
+    Each project's files live under its own ``<id>/`` folder so a single bundle can
+    hold many novels.
+
+    Written straight to disk rather than assembled in memory: an image novel carries
+    hundreds of page photos, and a whole-library backup would otherwise have to hold
+    the entire archive in RAM before a single byte reached the browser. The caller
+    owns the returned file and is responsible for deleting it.
+    """
+    if dest is None:
+        handle, name = tempfile.mkstemp(prefix="night-reader-bundle-", suffix=".zip")
+        os.close(handle)
+        dest = Path(name)
+    dirs = _BUNDLE_DIRS + (_BUNDLE_IMAGE_DIRS if include_images else ())
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
         for pid in pids:
             if not _PROJECT_ID_RE.match(pid or ""):
                 continue
@@ -212,13 +258,28 @@ def export_bundle(pids: list[str]) -> bytes:
                 f = pdir / name
                 if f.is_file():
                     z.write(f, arcname=f"{pid}/{name}")
-            for sub in _BUNDLE_DIRS:
+            for sub in dirs:
                 d = pdir / sub
                 if d.is_dir():
+                    # JPEG/PNG are already compressed; deflating them again burns CPU
+                    # on hundreds of files to save almost nothing.
+                    stored = sub in _BUNDLE_IMAGE_DIRS
                     for f in sorted(d.rglob("*")):
                         if f.is_file():
-                            z.write(f, arcname=f"{pid}/{f.relative_to(pdir).as_posix()}")
-    return buf.getvalue()
+                            z.write(f, arcname=f"{pid}/{f.relative_to(pdir).as_posix()}",
+                                    compress_type=(zipfile.ZIP_STORED if stored else None))
+    return dest
+
+
+def bundle_has_images(pids: list[str]) -> bool:
+    """Whether any of these novels has page images to offer in an export."""
+    for pid in pids:
+        if not _PROJECT_ID_RE.match(pid or ""):
+            continue
+        pages = PROJECTS_DIR / pid / "pages"
+        if pages.is_dir() and any(f.is_file() for f in pages.iterdir()):
+            return True
+    return False
 
 
 def import_bundle(data: bytes) -> list[dict]:

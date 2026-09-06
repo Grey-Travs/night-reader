@@ -25,6 +25,39 @@ export const STATUS_LABEL = {
   'english-source': 'Already English',
 }
 
+// Scanned-page statuses. Deliberately reusing the same pill vocabulary as chapters
+// rather than inventing a second one: "still to do", "working", "fine", "look at
+// this" mean the same thing to a reader whether the row is a page or a chapter.
+export const PAGE_STATUS_STYLES = {
+  new: 'pill-queued',
+  queued: 'pill-queued',
+  'ocr-running': 'pill-translating',
+  ok: 'pill-translated',
+  'needs-check': 'pill-review',
+  edited: 'pill-english',
+  skipped: 'pill-muted',
+  failed: 'pill-review',
+}
+
+export const PAGE_STATUS_LABEL = {
+  new: 'Not read yet',
+  queued: 'Queued',
+  'ocr-running': 'Reading',
+  ok: 'Looks good',
+  'needs-check': 'Needs a check',
+  edited: 'Edited',
+  skipped: 'Skipped',
+  failed: 'Failed',
+}
+
+export function PageBadge({ status }) {
+  return (
+    <span className={`pill ${PAGE_STATUS_STYLES[status] || 'pill-muted'} ${status === 'ocr-running' ? 'animate-pulse' : ''}`}>
+      {PAGE_STATUS_LABEL[status] || status}
+    </span>
+  )
+}
+
 export function Badge({ status }) {
   return (
     <span className={`pill ${STATUS_STYLES[status] || 'pill-muted'} ${status === 'translating' ? 'animate-pulse' : ''}`}>

@@ -9,6 +9,30 @@ from __future__ import annotations
 
 NEW_TERMS_DELIMITER = "===NEW_TERMS==="
 
+# Separates a transcribed page from its machine-readable metadata, mirroring the
+# ``===NEW_TERMS===`` contract. The page text is emitted as raw prose rather than
+# inside JSON: escaping a couple of thousand Korean characters invites truncation
+# and escaping bugs, and models emit raw prose far more reliably.
+PAGE_META_DELIMITER = "===PAGE_META==="
+
+# What the model must emit. Kept OUT of the main template so a caller can swap it
+# without forking the prompt — which is the point: a single rewritten paragraph then
+# inherits the entire voice contract above it (glossary, canonical names, pronoun
+# rules, style note, honorifics, quote style) and comes back indistinguishable in
+# register from its neighbours.
+NEW_TERMS_OUTPUT_CONTRACT = f"""\
+**Output contract:**
+1. First, the translated chapter as clean Markdown prose only — no translator's notes, no glossary inside the prose.
+2. Then a line containing only `{NEW_TERMS_DELIMITER}`, followed by a JSON array of names/terms newly encountered in this chapter that are not already in the glossary: `[{{"korean": "...", "english": "...", "type": "name|place|skill|term|other", "note": "...", "pronoun": "he|she|they|unknown"}}]`. For `name` entries set `"pronoun"` to the character's gender as evidenced in THIS chapter (honorifics, titles, descriptions) and mention the evidence in `note`; use `"unknown"` when the chapter gives no evidence. For non-name entries use `""`. If none, output `[]`. Output nothing after this block."""
+
+PARAGRAPH_OUTPUT_CONTRACT = """\
+**Output contract — ONE paragraph:**
+Output ONLY the rewritten paragraph, as clean Markdown. Exactly one paragraph: no
+blank line anywhere inside it, no heading, no list, no code fence, and no block quote
+unless the original was one. No preamble ("Here is…"), no notes, no alternatives, no
+explanation — nothing before it and nothing after it. Do not echo the Korean, and do
+not output a new-terms block."""
+
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert literary translator who adapts web novels into dynamic, natural, native-English web-novel prose. You are translating a Korean web novel into high-quality English. Output clean Markdown.
 {style_note_line}
@@ -39,9 +63,7 @@ You are an expert literary translator who adapts web novels into dynamic, natura
 **Glossary — locked reference, do not change these spellings:**
 {glossary_block}
 {names_section}
-**Output contract:**
-1. First, the translated chapter as clean Markdown prose only — no translator's notes, no glossary inside the prose.
-2. Then a line containing only `{delimiter}`, followed by a JSON array of names/terms newly encountered in this chapter that are not already in the glossary: `[{{"korean": "...", "english": "...", "type": "name|place|skill|term|other", "note": "...", "pronoun": "he|she|they|unknown"}}]`. For `name` entries set `"pronoun"` to the character's gender as evidenced in THIS chapter (honorifics, titles, descriptions) and mention the evidence in `note`; use `"unknown"` when the chapter gives no evidence. For non-name entries use `""`. If none, output `[]`. Output nothing after this block.
+{output_contract}
 
 **CRITICAL — no thinking in the output.** Do all reasoning, name-checking, and self-correction silently (in your private thinking), never in the answer. The prose section must contain ONLY the finished translated chapter. Never write meta-commentary such as "Wait", "Let me redo", "Let me re-read", "Actually the name is…", "the narrator is…", "the glossary says…", or a first draft followed by a corrected one. If you change your mind about a name or wording, output only the final corrected text — no drafts, no notes, no "---" separating attempts.
 {web_access_line}\
@@ -150,6 +172,138 @@ Output ONLY a JSON array with one object per input name, spelling kept EXACTLY a
 """
 
 
+OCR_SYSTEM_PROMPT_TEMPLATE = """\
+You transcribe photographed and scanned pages of Korean novels into plain text. You
+are given the absolute path of ONE page image. Read that file, then output what is
+printed on it.
+
+**You are a transcriber, not a translator.** Output the Korean exactly as printed.
+Never translate, summarize, modernize, correct the author's spelling, or "improve"
+anything. English that is genuinely printed on the page stays in English.
+
+**Line breaks vs paragraph breaks — this is the part that matters most:**
+- A line ending because the column ran out is NOT a paragraph break. Join those lines
+  into one continuous paragraph.
+- A real paragraph break (an indent, or a blank line in the printed text) becomes one
+  blank line in your output.
+- If a word is split across a printed line break, rejoin it with no space and no
+  hyphen.
+
+**Leave out everything that is not the story:** running headers and footers, the book
+or chapter title repeated at the top or bottom of every page, page numbers, publisher
+marks and watermarks. For screenshots also drop the reading app's interface — status
+bar, clock, battery, scroll and progress bars, 이전화/다음화 buttons, comment counts,
+banners and advertisements.
+
+**Keep** a chapter heading that is part of the story itself (`제3화`, `3화`, `프롤로그`,
+`Chapter 7`). Put it on its own first line, and repeat it in `heading` below.
+
+**Damaged, skewed, or unreadable pages:** transcribe everything legible. Mark each
+spot you cannot read with `[?]` and describe it in `notes`. NEVER invent, guess, or
+fill in text that you cannot actually see — a gap marked `[?]` is useful, invented
+text is worse than nothing. Glare, shadow, curvature near the spine, a finger over
+the text, and a cut-off edge are all normal; just report what they cost you.
+
+**A page with no prose** (cover, blank page, full-page illustration, a photo that
+failed) gets an empty transcription, `"confidence": "low"`, and a note saying which.
+
+**Output contract:**
+1. First, the transcribed page text and nothing else — no preamble, no "Here is the
+   transcription", no commentary, no code fences.
+2. Then a line containing only `{delimiter}`, followed by a single JSON object:
+   `{{"confidence": "high|medium|low", "heading": "..." or null,
+     "starts_mid_sentence": true|false, "ends_mid_sentence": true|false,
+     "ends_mid_word": true|false, "notes": ["..."]}}`
+   Output nothing after this object.
+
+**The three booleans are load-bearing** — they are how the pages are stitched back
+into flowing chapters, so judge them from the image honestly:
+- `starts_mid_sentence`: the first line continues a sentence begun on an earlier page
+  (it opens mid-clause, with no capital or opening quote and no indent).
+- `ends_mid_sentence`: the last line stops before the sentence is finished — no
+  closing punctuation, or a quotation still open.
+- `ends_mid_word`: the last line stops in the middle of a word, so the next page's
+  first characters belong to it.
+
+`confidence` is `high` for clean, fully legible text; `medium` when you had to work at
+it but are confident; `low` when the page is substantially damaged, cut off, or empty.
+"""
+
+
+OCR_VERIFY_PROMPT = """\
+You proofread a Korean page transcription against the photograph it came from. You are
+given the absolute path of the page image and the current transcription. Read the
+image and compare it to the text line by line.
+
+Report ONLY real discrepancies:
+- `missing` — text is printed on the page but absent from the transcription (a dropped
+  line at the top or bottom of the page is the most common and most damaging case).
+- `extra`   — text appears in the transcription but is not on the page.
+- `wrong`   — characters that differ in a way that changes the meaning, or wrong/missing
+  quotation marks.
+- `leak`    — a running header, footer, page number, or app interface text that was not
+  filtered out.
+
+Ignore anything that does not change what the page says: spacing, line-wrap positions,
+ellipsis length, and the difference between straight and curly quotes.
+
+Do NOT rewrite the page, do not translate, and do not improve the prose. You are only
+reporting differences from the image.
+
+Output ONLY a JSON array:
+[{"kind": "missing|extra|wrong|leak",
+  "where": "<the exact snippet from the transcription this concerns, copied verbatim, or \\"\\" if the text is absent entirely>",
+  "page_says": "<what the image actually shows>",
+  "suggest": "<the corrected snippet to replace `where` with>"}]
+
+`where` must be copied character-for-character from the transcription you were given,
+so it can be found and replaced automatically. If the transcription matches the page,
+output exactly `[]`.
+"""
+
+
+OCR_STITCH_PROMPT = """\
+You are reassembling a novel from photographs of its pages. Consecutive photos are
+joined back together, and you decide what happens at each seam.
+
+You are given numbered boundaries. Each shows the END of one page and the START of the
+next. For every boundary, choose exactly one:
+- `sentence`  — the sentence runs straight across the break. The two halves must be
+                glued into one continuous paragraph with no break between them.
+- `paragraph` — the previous page finished a paragraph and a new one begins.
+- `chapter`   — a new chapter starts on the next page.
+- `gap`       — text is clearly MISSING between the two pages: the second does not
+                follow from the first, a sentence ends unfinished and the next starts
+                something unrelated, or the thread of the scene jumps. This usually
+                means a page was never photographed. Only say `gap` when the text
+                genuinely does not connect — not merely because the topic changes.
+
+For `sentence`, also set `glue`: `none` when the break falls inside a word, so the
+halves join directly; `space` when it falls between words.
+
+Judge only from the text shown. When a seam is genuinely unclear, choose the reading
+that keeps the prose flowing (`sentence` or `paragraph`) and say so in `note`.
+
+Output ONLY a JSON array, one object per boundary, in the order given:
+[{"i": 1, "join": "sentence|paragraph|chapter|gap", "glue": "none|space", "note": "..."}]
+"""
+
+
+def build_ocr_prompt(*, hint: str | None = None) -> str:
+    """Render the page-transcription system prompt.
+
+    ``hint`` is an optional per-page note from the user when re-reading a page that
+    came out badly ("the bottom two lines are cut off", "the page is upside down").
+    """
+    prompt = OCR_SYSTEM_PROMPT_TEMPLATE.format(delimiter=PAGE_META_DELIMITER)
+    if hint and hint.strip():
+        prompt += (
+            "\n**Note from the reader about THIS page — take it into account:**\n"
+            f"{hint.strip()}\n"
+        )
+    return prompt
+
+
 def build_system_prompt(
     glossary_block: str,
     *,
@@ -157,8 +311,15 @@ def build_system_prompt(
     honorific_note: str | None = None,
     style_note: str | None = None,
     names_block: str | None = None,
+    output_contract: str | None = None,
 ) -> str:
     """Render the system prompt with the per-chapter glossary injected.
+
+    ``output_contract`` swaps only what the model must EMIT, leaving the whole voice
+    contract intact. Defaulting to the chapter contract keeps ``translate_chapter``
+    byte-identical; the paragraph rewrites pass
+    :data:`PARAGRAPH_OUTPUT_CONTRACT` so a regenerated paragraph carries the same
+    glossary, names, pronouns and quote style as the ones around it.
 
     ``glossary_block`` is the formatted list of relevant glossary entries (or a
     placeholder when none apply). ``style_note`` is the per-novel framing (genre,
@@ -185,7 +346,7 @@ def build_system_prompt(
         )
     return SYSTEM_PROMPT_TEMPLATE.format(
         glossary_block=glossary_block,
-        delimiter=NEW_TERMS_DELIMITER,
+        output_contract=(output_contract or NEW_TERMS_OUTPUT_CONTRACT),
         web_access_line=web_access_line,
         honorific_note_line=honorific_note_line,
         style_note_line=style_note_line,

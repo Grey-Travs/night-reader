@@ -145,8 +145,41 @@
   .reading blockquote { border-left: 2px solid var(--border-strong); padding-left: 1em; color: var(--muted); margin: 0 0 1.15em; }
   .reading hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
 
+  /* Per-paragraph rewrite affordance. The handle sits in the margin so it never
+     reflows the prose, and stays invisible until the paragraph is hovered or
+     focused — reading must not look like editing. */
+  .reading p.para { position: relative; }
+  .reading p.para > .para-handle {
+    position: absolute; left: -1.9rem; top: .15em;
+    width: 1.4rem; line-height: 1.4rem; text-align: center;
+    font-family: var(--font-ui); font-size: 13px; color: var(--hint);
+    border-radius: var(--radius-btn);
+    opacity: 0; user-select: none; cursor: pointer;
+    transition: opacity .12s ease, color .12s ease;
+  }
+  .reading p.para:hover > .para-handle,
+  .reading p.para:focus-within > .para-handle { opacity: .55; }
+  .reading p.para > .para-handle:hover { opacity: 1; color: var(--accent-text); }
+  .reading p.para-active {
+    background: color-mix(in oklab, var(--accent) 12%, transparent);
+    border-radius: 6px;
+    box-shadow: 0 0 0 .35rem color-mix(in oklab, var(--accent) 12%, transparent);
+  }
+  /* The reading column is centred inside a wider shell, but that gutter disappears
+     in side-by-side mode and on narrow screens — put the handle inside the text
+     block there rather than off the edge of it. */
+  @media (max-width: 1100px) {
+    .reading p.para > .para-handle { left: auto; right: -.2rem; top: -1.2em; }
+  }
+  /* No hover on touch: show it faintly all the time instead. */
+  @media (hover: none) {
+    .reading p.para > .para-handle { opacity: .35; }
+  }
+
   /* Korean source column. */
   .korean { font-family: var(--font-korean); font-size: 17px; line-height: 1.8; color: var(--muted); white-space: pre-wrap; }
+  /* Inside the rewrite drawer the Korean is already split into <p>. */
+  .korean p { margin: 0 0 .6em; }
 
   /* Table row hover (subtle ink wash). */
   .rowhover { transition: background .12s ease; }

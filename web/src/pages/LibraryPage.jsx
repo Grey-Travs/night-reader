@@ -18,7 +18,8 @@ export default function LibraryPage() {
   const open = (id, chapter) => navigate(chapter != null ? `/novel/${id}/chapter/${chapter}` : `/novel/${id}`)
 
   const [projects, setProjects] = useState([])
-  const [tab, setTab] = useState('gdoc') // gdoc | text
+  const [tab, setTab] = useState('gdoc') // gdoc | text | photos
+  const [photoName, setPhotoName] = useState('')
   const [url, setUrl] = useState('')
   const [text, setText] = useState('')
   const [textName, setTextName] = useState('')
@@ -122,6 +123,20 @@ export default function LibraryPage() {
     } finally { setBusy(false) }
   }
 
+  async function addImages(e) {
+    e.preventDefault()
+    setBusy(true); setError(null)
+    try {
+      // The novel starts empty; the photos themselves are added on its Pages tab,
+      // where each one can be checked against what was read out of it.
+      const project = await api.createImagesProject(photoName.trim())
+      setPhotoName(''); await load()
+      navigate(`/novel/${project.id}/pages`)
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally { setBusy(false) }
+  }
+
   async function onFile(e) {
     const file = e.target.files?.[0]
     e.target.value = ''
@@ -220,6 +235,7 @@ export default function LibraryPage() {
           <div className="ml-auto flex gap-1">
             <button onClick={() => setTab('gdoc')} className={`btn px-3 py-1 text-xs ${tab === 'gdoc' ? 'btn-primary' : 'btn-ghost'}`}>Google Doc</button>
             <button onClick={() => setTab('text')} className={`btn px-3 py-1 text-xs ${tab === 'text' ? 'btn-primary' : 'btn-ghost'}`}>Paste / .txt</button>
+            <button onClick={() => setTab('photos')} className={`btn px-3 py-1 text-xs ${tab === 'photos' ? 'btn-primary' : 'btn-ghost'}`}>Photos</button>
           </div>
         </div>
 
@@ -231,6 +247,24 @@ export default function LibraryPage() {
               <button type="submit" disabled={busy} className="btn btn-primary px-5 py-2">{busy ? 'Reading…' : 'Add novel'}</button>
             </form>
           </>
+        ) : tab === 'photos' ? (
+          <form onSubmit={addImages} className="mt-1">
+            <p className="text-sm text-muted">
+              Photos of printed pages, screenshots from a novel site, or scans. Claude
+              reads the Korean out of each one, you check it, and then it translates
+              exactly like any other novel.
+            </p>
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+              <input value={photoName} onChange={(e) => setPhotoName(e.target.value)} placeholder="Novel name" className="input flex-1" />
+              <button type="submit" disabled={busy} className="btn btn-primary px-5 py-2">
+                {busy ? 'Creating…' : 'Add photos →'}
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-hint">
+              You'll add the images on the next screen, where each page sits beside the
+              text read from it.
+            </p>
+          </form>
         ) : (
           <form onSubmit={addText} className="mt-1">
             <p className="text-sm text-muted">Paste the novel text, or load a .txt file — no Google account needed.</p>

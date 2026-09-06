@@ -31,14 +31,25 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from translation_bot import ocr
 from translation_bot import state as state_mod
 from translation_bot.config import Config
 from translation_bot.docs_extract import (
     Chapter, ChapterMetrics, extract_chapters, fetch_document, hangul_fraction,
 )
 from translation_bot.epub import build_epub
+from translation_bot.ocr_join import propose_join
+from translation_bot.paragraphs import (
+    align_korean,
+    check_paragraph_result,
+    korean_window,
+    locate_block,
+    splice_block,
+    split_blocks,
+)
 from translation_bot.glossary import (
     VALID_TYPES,
     Glossary,
@@ -76,7 +87,11 @@ from translation_bot.validate import validate_translation
 
 from . import console
 from . import errors
+from .locks import file_lock
+from . import ocr_build
+from . import pages as pages_mod
 from . import projects as pj
+from . import variants as variants_mod
 from .bulk import MAX_ROWS, MAX_UNTYPED, prepare_bulk_rows, split_flat
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -130,17 +145,11 @@ _jobs: dict[str, "Job"] = {}
 _active_job_by_project: dict[str, str] = {}     # pid -> job_id of the in-flight job
 _running_tasks: set[asyncio.Task] = set()        # strong refs so tasks aren't GC'd
 
-# One lock per state.json. Every writer runs on a THREAD — sync endpoints and
-# run_in_threadpool alike — never on the event loop, so threading.Lock is the right
-# primitive. Keyed by resolved path so the same file always maps to the same lock.
-_state_locks: dict[str, threading.Lock] = {}
-_state_locks_guard = threading.Lock()
-
-
-def _state_lock(path: str | Path) -> threading.Lock:
-    key = str(Path(path).resolve())
-    with _state_locks_guard:
-        return _state_locks.setdefault(key, threading.Lock())
+# One lock per file, from the shared registry in server.locks — the SAME registry
+# server.pages and server.variants use, so two modules locking the same path can
+# never end up holding two different locks. Kept under the old name because every
+# state.json writer already calls it.
+_state_lock = file_lock
 
 
 @contextmanager
@@ -258,8 +267,10 @@ def _local_chapters(pid: str) -> list[Chapter]:
 def get_chapters(pid: str, cfg: Config, refresh: bool = False) -> list[Chapter]:
     if refresh or pid not in _chapter_cache:
         project = pj.get_project(pid) or {}
-        if project.get("source_type") == "text":
-            # Pasted / uploaded text — read from the stored source, no network.
+        if project.get("source_type") in ("text", "images"):
+            # Pasted/uploaded text, or chapters built from transcribed page images —
+            # read from the stored source, no network. This one branch is the whole
+            # integration: from here on an image novel is an ordinary novel.
             _chapter_cache[pid] = pj.load_text_chapters(pid)
             _offline_projects.discard(pid)
         else:
@@ -709,15 +720,32 @@ def review_inbox() -> dict:
 
 
 # ----------------------------------------------------------------------------- backup / move
+def _unlink_quietly(path: str | Path) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass  # a leftover temp file is harmless; a failed download is not
+
+
+def _bundle_response(path: Path, filename: str) -> Response:
+    """Stream a bundle from disk, removing the temp file once it has been sent."""
+    return FileResponse(path, media_type="application/zip", filename=filename,
+                        background=BackgroundTask(_unlink_quietly, path))
+
+
 @app.get("/api/backup")
-def export_all_bundle() -> Response:
-    """Download every novel as one portable .zip (a full library backup)."""
+def export_all_bundle(images: bool = False) -> Response:
+    """Download every novel as one portable .zip (a full library backup).
+
+    Page images are left out unless asked for: a photographed library runs to
+    gigabytes, and the extracted text (which is what makes a novel readable and
+    translatable) always travels regardless.
+    """
     pids = [p["id"] for p in pj.list_projects()]
     if not pids:
         raise HTTPException(400, "No novels to back up yet.")
-    data = pj.export_bundle(pids)
-    return Response(content=data, media_type="application/zip",
-                    headers={"Content-Disposition": 'attachment; filename="night-reader-backup.zip"'})
+    path = pj.export_bundle(pids, include_images=images)
+    return _bundle_response(path, "night-reader-backup.zip")
 
 
 @app.post("/api/import")
@@ -842,6 +870,409 @@ def create_text_project(body: CreateTextProject) -> dict:
     return project_summary(project)
 
 
+class CreateImagesProject(BaseModel):
+    name: str = ""
+
+
+@app.get("/api/scans")
+def scans_overview() -> dict:
+    """Every photographed novel and how much of it still wants attention.
+
+    Cheap: one small JSON read per image novel, the same shape the Review inbox uses.
+    """
+    novels = []
+    for project in pj.list_projects():
+        if project.get("source_type") != "images" or project.get("archived"):
+            continue
+        doc = pages_mod.load_pages(project["id"])
+        novels.append({
+            "id": project["id"],
+            "name": project.get("name", "Untitled novel"),
+            "counts": pages_mod.counts(doc),
+            "built": bool(doc.get("build")),
+            "chapter_count": project.get("chapter_count", 0),
+            "cost_usd": (doc.get("totals") or {}).get("cost_usd", 0.0),
+        })
+    novels.sort(key=lambda n: (-(n["counts"]["needs-check"] + n["counts"]["new"]), n["name"]))
+    return {"novels": novels}
+
+
+@app.post("/api/projects/images")
+def create_images_project(body: CreateImagesProject) -> dict:
+    """Create an empty novel whose source is photographed or scanned pages.
+
+    It has no chapters yet: pages are uploaded and transcribed first, then built.
+    """
+    project = pj.create_images_project(body.name or "Untitled novel")
+    _chapter_cache[project["id"]] = []
+    return project_summary(project)
+
+
+# ----------------------------------------------------------------------------- scanned pages
+# NOTE ON ROUTE ORDER: every literal path below (/pages/reorder, /pages/build, ...)
+# MUST stay declared before /pages/{page_id}, or FastAPI captures "reorder" as a
+# page id and the action silently 404s.
+
+def require_images_project(pid: str) -> dict:
+    project = require_project(pid)
+    if project.get("source_type") != "images":
+        raise HTTPException(400, "That novel doesn't use page images.")
+    return project
+
+
+def _page_by_id(pid: str, page_id: str) -> tuple[dict, dict]:
+    doc = pages_mod.load_pages(pid)
+    page = pages_mod.find_page(doc, page_id)
+    if page is None:
+        raise HTTPException(404, "That page isn't in this novel.")
+    return doc, page
+
+
+@app.post("/api/projects/{pid}/pages")
+async def upload_page(pid: str, request: Request, batch: str = "",
+                      label: str = "", name: str = "") -> dict:
+    """Add one page image, sent as the raw request body.
+
+    One image per request rather than a multipart batch: it keeps the app free of the
+    python-multipart dependency (the same reasoning as /api/import), gives per-file
+    progress for free, and means one unreadable photo fails on its own instead of
+    taking a sixty-file drop down with it.
+    """
+    require_images_project(pid)
+
+    # Read incrementally so an oversized upload is refused before it is all resident.
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > pages_mod.MAX_IMAGE_BYTES:
+            raise HTTPException(
+                413, f"That image is bigger than "
+                     f"{pages_mod.MAX_IMAGE_BYTES // (1024 * 1024)} MB.")
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    if not data:
+        raise HTTPException(400, "No image was uploaded.")
+
+    # The BYTES decide what this is — the Content-Type header is only advisory, and
+    # the client's filename is never trusted for anything but a display label.
+    ext = pages_mod.sniff_image(data[:32])
+    if ext is None:
+        raise HTTPException(400, pages_mod.unsupported_reason(data[:32]))
+    digest = pages_mod.sha256_of(data)
+
+    with pages_mod.mutate_pages(pid) as doc:
+        existing = pages_mod.find_by_hash(doc, digest)
+        if existing is not None:
+            # Re-dropping the same folder is a no-op, not a doubled novel.
+            return {"page": existing, "duplicate": True,
+                    "total": len(doc.get("pages", []))}
+        if len(doc.get("pages", [])) >= pages_mod.MAX_PAGES_PER_PROJECT:
+            raise HTTPException(
+                400, f"This novel already has {pages_mod.MAX_PAGES_PER_PROJECT} pages.")
+
+        known = {b.get("id") for b in doc.get("batches", [])}
+        batch_id = batch if (batch and batch in known) else pages_mod.new_batch(doc, label)
+
+        page = pages_mod.add_page(doc, ext=ext, data_len=len(data), digest=digest,
+                                  batch=batch_id, name=name)
+        target = pages_mod.pages_dir(pid) / page["file"]
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        except OSError as exc:
+            # Never leave a manifest entry pointing at a file that isn't there.
+            doc["pages"].remove(page)
+            raise HTTPException(500, f"Couldn't save that image: {exc}")
+        return {"page": dict(page), "duplicate": False, "batch": batch_id,
+                "total": len(doc["pages"])}
+
+
+@app.get("/api/projects/{pid}/pages")
+def list_pages(pid: str) -> dict:
+    """The page rail's payload. Page text is omitted — a few hundred pages of Korean
+    would be several megabytes on every tab switch."""
+    require_project(pid)
+    return pages_mod.summary(pages_mod.load_pages(pid))
+
+
+class ReorderPages(BaseModel):
+    ids: list[str]
+
+
+@app.post("/api/projects/{pid}/pages/reorder")
+def reorder_pages(pid: str, body: ReorderPages) -> dict:
+    require_images_project(pid)
+    with pages_mod.mutate_pages(pid) as doc:
+        if not pages_mod.reorder(doc, body.ids):
+            raise HTTPException(400, "That page order doesn't match this novel's pages.")
+    return {"ok": True}
+
+
+class DeletePages(BaseModel):
+    ids: list[str]
+
+
+@app.post("/api/projects/{pid}/pages/delete")
+def delete_pages(pid: str, body: DeletePages) -> dict:
+    require_images_project(pid)
+    with pages_mod.mutate_pages(pid) as doc:
+        removed = pages_mod.delete_pages(doc, body.ids)
+    folder = pages_mod.pages_dir(pid)
+    for page in removed:
+        try:
+            (folder / str(page.get("file") or "")).unlink(missing_ok=True)
+        except OSError:
+            pass  # the manifest entry is gone; a stray file is harmless
+    return {"ok": True, "removed": len(removed)}
+
+
+class PageWork(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    only_new: bool = False
+
+
+def _queue_page_work(pid: str, body: PageWork, kind: str) -> dict:
+    project = require_images_project(pid)
+    cfg = pj.project_config(load_global_config(), project)
+    doc = pages_mod.load_pages(pid)
+
+    if body.ids:
+        wanted = [p for p in doc.get("pages", []) if p.get("id") in set(body.ids)]
+    elif kind == TASK_OCR:
+        wanted = [p for p in doc.get("pages", [])
+                  if p.get("status") in (pages_mod.STATUS_NEW, pages_mod.STATUS_FAILED)]
+    else:
+        # Verifying every page of a long novel roughly doubles the spend, so the
+        # default sweep only re-reads the pages the model was unsure about.
+        wanted = [p for p in doc.get("pages", [])
+                  if p.get("status") == pages_mod.STATUS_NEEDS_CHECK]
+
+    wanted = [p for p in wanted if p.get("status") != pages_mod.STATUS_SKIPPED]
+    if not wanted:
+        raise HTTPException(400, "There are no pages to do that to.")
+
+    items = [(int(p["seq"]), True, kind) for p in wanted]
+    with pages_mod.mutate_pages(pid) as live:
+        for page in wanted:
+            rec = pages_mod.find_page(live, page["id"])
+            if rec is not None:
+                rec["status"] = pages_mod.STATUS_QUEUED
+    return _enqueue_task(pid, cfg, items)
+
+
+@app.post("/api/projects/{pid}/pages/ocr")
+async def run_page_ocr(pid: str, body: PageWork) -> dict:
+    """Read the Korean out of the selected pages (or every unread page)."""
+    return _queue_page_work(pid, body, TASK_OCR)
+
+
+@app.post("/api/projects/{pid}/pages/verify")
+async def run_page_verify(pid: str, body: PageWork) -> dict:
+    """Proof-read the selected pages against their photos (or every flagged page)."""
+    return _queue_page_work(pid, body, TASK_OCR_VERIFY)
+
+
+class StitchRequest(BaseModel):
+    use_model: bool = True
+    max_model_seams: int = 25
+
+
+@app.post("/api/projects/{pid}/pages/stitch")
+async def stitch_pages(pid: str, body: StitchRequest) -> dict:
+    """Work out how each page joins to the one before it.
+
+    Cheapest first: deterministic rules settle most seams for free, and only the
+    genuinely ambiguous ones are batched into a single text-only model call. A seam
+    the reader has decided by hand is never revisited.
+    """
+    project = require_images_project(pid)
+    cfg = pj.project_config(load_global_config(), project)
+    doc = pages_mod.load_pages(pid)
+    pages = [p for p in doc.get("pages", [])
+             if p.get("status") != pages_mod.STATUS_SKIPPED]
+
+    decided: dict[str, dict] = {}
+    unsure: list[tuple[str, str, str]] = []
+    for prev, cur in zip(pages, pages[1:]):
+        if cur.get("join_prev_source") == "user":
+            continue  # the reader's own decision stands
+        join = propose_join(prev.get("text") or "", cur.get("text") or "", prev, cur)
+        decided[cur["id"]] = {"join_prev": join.kind, "join_glue": join.glue,
+                              "join_prev_source": "auto", "join_reason": join.reason}
+        if join.needs_model:
+            unsure.append((cur["id"], prev.get("text") or "", cur.get("text") or ""))
+
+    usage, cost, asked = {}, 0.0, 0
+    if body.use_model and unsure:
+        batch = unsure[:max(1, body.max_model_seams)]
+        asked = len(batch)
+        translator = Translator(cfg.anthropic, cfg.translation)
+        decisions, usage, cost = await run_in_threadpool(
+            ocr.stitch_boundaries, translator, [(a, b) for _id, a, b in batch])
+        for decision in decisions:
+            page_id = batch[decision.i - 1][0]
+            decided[page_id] = {"join_prev": decision.join, "join_glue": decision.glue,
+                                "join_prev_source": "model",
+                                "join_reason": decision.note or "decided by reading both pages"}
+
+    with pages_mod.mutate_pages(pid) as live:
+        for page_id, fields in decided.items():
+            rec = pages_mod.find_page(live, page_id)
+            if rec is not None:
+                rec.update(fields)
+        totals = live.setdefault("totals", {})
+        totals["cost_usd"] = round(float(totals.get("cost_usd") or 0.0) + cost, 6)
+
+    gaps = sum(1 for f in decided.values() if f["join_prev"] == "gap")
+    return {"ok": True, "seams": len(decided), "asked_model": asked,
+            "gaps": gaps, "cost_usd": cost, "usage": usage,
+            "pages": pages_mod.summary(pages_mod.load_pages(pid))}
+
+
+class BuildChapters(BaseModel):
+    mode: str = "batch"           # batch | heading | separator | single
+    separator: str = "---"
+    include: str = "approved"     # approved | all
+    append: bool = True
+    force: bool = False
+
+
+@app.post("/api/projects/{pid}/pages/build")
+def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
+    """Turn the transcribed pages into chapters (source.json).
+
+    After this the novel is ordinary: translate, validate, read and export all work
+    unchanged. Appending is the default so photographing chapter 13 never renumbers
+    chapters 1-12 or orphans their finished translations.
+    """
+    project = require_images_project(pid)
+    cfg = pj.project_config(load_global_config(), project)
+    doc = pages_mod.load_pages(pid)
+
+    existing = pj.load_text_chapters(pid)
+    state = State.load(cfg.paths.state_file)
+    if body.append:
+        built_ids = set((doc.get("build") or {}).get("used_page_ids") or [])
+        if built_ids:
+            doc = {**doc, "pages": [p for p in doc.get("pages", [])
+                                    if p.get("id") not in built_ids]}
+        start_index = len(existing) + 1
+    else:
+        finished = [i for i in range(1, len(existing) + 1)
+                    if (state.get(i) or {}).get("status") in state_mod.DONE_STATUSES]
+        if finished and not body.force:
+            raise HTTPException(
+                400, f"Rebuilding would renumber {len(finished)} chapter(s) you've "
+                     f"already translated. Add new pages as an append instead, or "
+                     f"confirm the rebuild to redo them.")
+        start_index = 1
+
+    try:
+        chapters, warnings, page_map = ocr_build.build_chapters(
+            doc, mode=body.mode, separator=body.separator,
+            include=body.include, start_index=start_index)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    if not chapters:
+        raise HTTPException(
+            400, "No pages are ready to build. Read the pages first, then accept the "
+                 "ones that look right.")
+
+    combined = (existing[:start_index - 1] + chapters) if body.append else chapters
+    for i, chapter in enumerate(combined, start=1):
+        chapter.index = i
+
+    pj.cache_source(pid, combined)
+    project["chapter_count"] = len(combined)
+    pj._atomic_write_json(pj.PROJECTS_DIR / pid / "project.json", project)
+    # A stale cache would translate the PREVIOUS build's chapters.
+    _chapter_cache.pop(pid, None)
+    _normalize_chapter_padding(pid, len(combined))
+    _invalidate_consistency(pid)
+
+    used = [p.get("id") for p in ocr_build.usable_pages(doc, include=body.include)]
+    with pages_mod.mutate_pages(pid) as live:
+        prior = set((live.get("build") or {}).get("used_page_ids") or []) if body.append else set()
+        live["build"] = {"mode": body.mode, "at": pages_mod.now_iso(),
+                         "chapters": len(combined), "warnings": warnings,
+                         "page_map": page_map,
+                         "used_page_ids": sorted(prior | set(used))}
+
+    return {"ok": True, "chapters": len(combined), "added": len(chapters),
+            "warnings": warnings, "project": project_summary(project)}
+
+
+@app.get("/api/projects/{pid}/pages/{page_id}")
+def get_page(pid: str, page_id: str) -> dict:
+    require_project(pid)
+    _doc, page = _page_by_id(pid, page_id)
+    return page
+
+
+@app.get("/api/projects/{pid}/pages/{page_id}/image")
+def get_page_image(pid: str, page_id: str) -> Response:
+    """Serve one page photo.
+
+    The path comes from the manifest, never from the URL — a page id is only ever a
+    lookup key. File bytes are never rewritten, so the response is immutable.
+    """
+    require_project(pid)
+    path = pages_mod.resolve_page_file(pid, page_id)
+    if path is None:
+        raise HTTPException(404, "That page image isn't here.")
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+class PageUpdate(BaseModel):
+    text: str | None = None
+    status: str | None = None
+    join_prev: str | None = None
+    join_glue: str | None = None
+    heading: str | None = None
+    hint: str | None = None
+
+
+@app.post("/api/projects/{pid}/pages/{page_id}")
+def update_page(pid: str, page_id: str, body: PageUpdate) -> dict:
+    """Save a reader's corrections to one page."""
+    require_images_project(pid)
+    _page_by_id(pid, page_id)
+
+    if body.status is not None and body.status not in pages_mod.STATUSES:
+        raise HTTPException(400, "Unknown page status.")
+    if body.join_prev is not None and body.join_prev not in pages_mod.JOIN_KINDS:
+        raise HTTPException(400, "Unknown page join.")
+
+    with pages_mod.mutate_pages(pid) as doc:
+        rec = pages_mod.find_page(doc, page_id)
+        if rec is None:
+            raise HTTPException(404, "That page isn't in this novel.")
+        if body.text is not None:
+            rec["text"] = body.text
+            rec["chars"] = len(body.text)
+            rec["hangul_fraction"] = round(hangul_fraction(body.text), 3)
+            # A hand-edited page is the reader's word, so it stops being "needs check"
+            # unless they explicitly said otherwise in the same request.
+            if body.status is None:
+                rec["status"] = pages_mod.STATUS_EDITED
+        if body.status is not None:
+            rec["status"] = body.status
+        if body.join_prev is not None:
+            rec["join_prev"] = body.join_prev
+            rec["join_prev_source"] = "user"  # never overwritten by a later re-run
+            rec["join_reason"] = "set by you"
+        if body.join_glue is not None:
+            rec["join_glue"] = body.join_glue
+        if body.heading is not None:
+            rec["heading"] = body.heading.strip() or None
+        if body.hint is not None:
+            rec["hint"] = body.hint[:500]
+        updated = dict(rec)
+    return updated
+
+
 class ProjectUpdate(BaseModel):
     name: str | None = None
     style_note: str | None = None
@@ -964,14 +1395,17 @@ def export_novel(pid: str, format: str = "md") -> Response:
 
 
 @app.get("/api/projects/{pid}/bundle")
-def export_project_bundle(pid: str) -> Response:
+def export_project_bundle(pid: str, images: bool = False) -> Response:
     """Download this one novel as a portable .zip (chapters, glossary, progress,
-    and the cached source) — move it to another device or keep it as a backup."""
+    and the cached source) — move it to another device or keep it as a backup.
+
+    ``images=1`` also packs the original page photos of a scanned novel, so the
+    copy can be re-read and re-checked against its sources on the other device.
+    """
     project = require_project(pid)
-    data = pj.export_bundle([pid])
+    path = pj.export_bundle([pid], include_images=images)
     name = _safe_name(project.get("name", "novel"))
-    return Response(content=data, media_type="application/zip",
-                    headers={"Content-Disposition": f'attachment; filename="{name}.novel.zip"'})
+    return _bundle_response(path, f"{name}.novel.zip")
 
 
 @app.get("/api/projects/{pid}/chapters")
@@ -1030,7 +1464,19 @@ def chapter_detail(pid: str, index: int) -> dict:
         "manual_edit": rec.get("manual_edit", False),
         "has_previous": previous_chapter_path(cfg.paths.output_dir, index, total).exists(),
         "offline": pid in _offline_projects,
+        # For a scanned novel, the photos this chapter was built from — the truest
+        # source there is, and what makes a translation traceable back to the page.
+        # Only batch builds attribute pages to a specific chapter; a whole-novel
+        # split genuinely can't, so it returns nothing rather than guessing.
+        "page_ids": _chapter_page_ids(project, index),
     }
+
+
+def _chapter_page_ids(project: dict, index: int) -> list[str]:
+    if project.get("source_type") != "images":
+        return []
+    build = pages_mod.load_pages(project["id"]).get("build") or {}
+    return list((build.get("page_map") or {}).get(str(index)) or [])
 
 
 @app.get("/api/projects/{pid}/chapters/{index}/previous")
@@ -1358,6 +1804,311 @@ def accept_chapter(pid: str, index: int) -> dict:
         state.update(index, status=state_mod.STATUS_VALIDATED, title=ch.title,
                      source_hash=ch.metrics.content_hash, failures=[], manual_edit=True)
     return {"ok": True, "status": state_mod.STATUS_VALIDATED}
+
+
+# ------------------------------------------------------------------- paragraph rewrites
+# Retranslate or rephrase ONE paragraph of a finished chapter, keeping every version so
+# the reader can compare and pick.
+#
+# Two design points carry the rest:
+#   1. A paragraph is addressed by ordinal and PROVED by its exact text. The chapter
+#      file stays the single source of truth, so nothing here can drift out of sync
+#      with a whole-chapter edit, an AI resolve or a consistency rename.
+#   2. Generating writes only to variants/. Only the reader's pick touches the chapter.
+#      With no file to race, generation runs inline instead of queueing behind a
+#      40-chapter translation — which would make an interactive action unusable.
+
+MIN_ALIGNMENT_CONFIDENCE = 0.4
+
+
+class ParagraphRef(BaseModel):
+    paragraph: int
+    expected_text: str
+    group_id: str | None = None
+
+
+class ParagraphRephrase(ParagraphRef):
+    instruction: str = ""
+
+
+class ParagraphPick(BaseModel):
+    group_id: str
+    variant_id: str
+
+
+class ParagraphDiscard(BaseModel):
+    group_id: str
+    variant_id: str | None = None   # None discards the whole group's history
+
+
+def _paragraph_context(pid: str, index: int):
+    """(project, cfg, chapter, total, translation, blocks) or the right HTTP error."""
+    project, cfg = project_cfg(pid)
+    chapters = get_chapters(pid, cfg)
+    total = _output_total(pid, chapters)
+    ch = next((c for c in chapters if c.index == index), None)
+    if ch is None:
+        raise HTTPException(404, f"chapter {index} not found")
+    # Resolves chapters/ first, then audit/ — a needs-review chapter's translation
+    # lives only in audit/, and it is exactly the kind you want to fix a line of.
+    text = current_translation(cfg, index, total)
+    if not (text or "").strip():
+        raise HTTPException(400, "That chapter hasn't been translated yet.")
+    return project, cfg, ch, total, text, split_blocks(text)
+
+
+def _require_block(blocks, paragraph: int, expected: str) -> int:
+    k = locate_block(blocks, expected, paragraph)
+    if k is None:
+        raise HTTPException(
+            409, "This chapter has changed since you opened it. Reload and try again.")
+    return k
+
+
+def _worker_owns_chapter(pid: str, index: int) -> bool:
+    """Whether the novel's worker is about to rewrite this whole chapter.
+
+    Not a file race — generating writes nothing to the chapter — but rewriting one
+    paragraph of a chapter that is about to be replaced wholesale is wasted spend and
+    instantly stale.
+    """
+    job = _jobs.get(_active_job_by_project.get(pid) or "")
+    if job is None or job.done:
+        return False
+    if job.current == index and job.kind not in PAGE_TASK_KINDS:
+        return True
+    return any(i == index and k not in PAGE_TASK_KINDS for i, _f, k in job.pending)
+
+
+def _alignment_for(pid: str, ch: Chapter, blocks, k: int):
+    """(alignment, reason-it-is-unavailable). Rephrase never needs this."""
+    if pid in _offline_projects:
+        return None, ("This novel is open as a saved copy, so its Korean source isn't "
+                      "available here. You can still rephrase the English.")
+    korean = stripped_chapter(ch).paragraphs
+    if not korean:
+        return None, "There's no Korean source stored for this chapter."
+    if hangul_fraction(ch.text) < 0.15:
+        return None, "This chapter's source is already English."
+    alignment = align_korean([b.text for b in blocks], k, korean)
+    if alignment.index < 0 or alignment.confidence < MIN_ALIGNMENT_CONFIDENCE:
+        return alignment, ("No reliable Korean match for this paragraph — the chapter's "
+                           "paragraphs don't line up with the source. You can still "
+                           "rephrase the English.")
+    return alignment, None
+
+
+@app.get("/api/projects/{pid}/chapters/{index}/variants")
+def chapter_variants(pid: str, index: int) -> dict:
+    """This chapter's paragraph history, re-anchored to the text as it stands now."""
+    _project, cfg, ch, total, _text, blocks = _paragraph_context(pid, index)
+    path = variants_mod.variants_path(pid, index, total)
+    with variants_mod.mutate_variants(path, index) as doc:
+        # A whole-chapter edit may have moved paragraphs since these were written.
+        variants_mod.relocate(doc, [b.text for b in blocks])
+        groups = [dict(g) for g in doc.get("groups", [])]
+    _alignment, reason = _alignment_for(pid, ch, blocks, 0)
+    return {"index": index, "paragraph_count": len(blocks), "groups": groups,
+            "retranslate_available": reason is None, "retranslate_reason": reason}
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/paragraph/source")
+def paragraph_source(pid: str, index: int, body: ParagraphRef) -> dict:
+    """The Korean this paragraph probably came from, as a window around the best guess."""
+    _project, _cfg, ch, _total, _text, blocks = _paragraph_context(pid, index)
+    k = _require_block(blocks, body.paragraph, body.expected_text)
+    alignment, reason = _alignment_for(pid, ch, blocks, k)
+    if reason:
+        return {"paragraph": k, "korean": [], "focus": 0, "alignment": None,
+                "available": False, "reason": reason}
+    window, focus = korean_window(stripped_chapter(ch).paragraphs, alignment)
+    return {"paragraph": k, "korean": window, "focus": focus,
+            "alignment": vars(alignment), "available": True, "reason": None}
+
+
+async def _generate_paragraph(pid: str, index: int, body: ParagraphRef, mode: str) -> dict:
+    _project, cfg, ch, total, _text, blocks = _paragraph_context(pid, index)
+    if _worker_owns_chapter(pid, index):
+        raise HTTPException(
+            409, "That chapter is being worked on right now — try again when it finishes.")
+    k = _require_block(blocks, body.paragraph, body.expected_text)
+    before = blocks[k].text
+
+    path = variants_mod.variants_path(pid, index, total)
+    doc = variants_mod.load_variants(path, index)
+    variants_mod.relocate(doc, [b.text for b in blocks])
+    group = (variants_mod.find_group(doc, body.group_id) if body.group_id
+             else variants_mod.group_for_paragraph(doc, k))
+    # Everything already produced, so the model is told not to repeat itself. Without
+    # this a regenerate returns near-identical text and the whole point is lost.
+    prior = variants_mod.prior_texts(group) if group else [before]
+
+    glossary = Glossary.load(cfg.paths.glossary_json)
+    entries = glossary.relevant_to(ch.text)
+    translator = Translator(cfg.anthropic, cfg.translation,
+                            canonical_names=glossary.canonical())
+
+    context_before = blocks[k - 1].text if k > 0 else ""
+    context_after = blocks[k + 1].text if k + 1 < len(blocks) else ""
+
+    alignment = None
+    source_ko = None
+    try:
+        if mode == variants_mod.KIND_RETRANSLATE:
+            alignment, reason = _alignment_for(pid, ch, blocks, k)
+            if reason:
+                raise HTTPException(400, reason)
+            korean = stripped_chapter(ch).paragraphs
+            window, focus = korean_window(korean, alignment)
+            source_ko = korean[alignment.index]
+            raw, usage, cost = await run_in_threadpool(
+                translator.retranslate_paragraph,
+                english=before, korean_window=window, focus=focus,
+                context_before=context_before, context_after=context_after,
+                glossary_entries=entries, avoid=prior,
+                extra_instruction=cfg.translation.extra_instruction or "")
+        else:
+            raw, usage, cost = await run_in_threadpool(
+                translator.rephrase_paragraph,
+                english=before, instruction=getattr(body, "instruction", ""),
+                context_before=context_before, context_after=context_after,
+                glossary_entries=entries, avoid=prior)
+    except RateLimitedError as exc:
+        raise HTTPException(429, f"{exc} (this used your plan's allowance — try again later)")
+    except TranslatorError as exc:
+        raise HTTPException(502, f"Couldn't rewrite that paragraph: {exc}")
+
+    # The attempt was billed whether or not the reply is usable, so record it either
+    # way rather than dropping it from the novel's totals.
+    with mutate_state(cfg.paths.state_file) as state:
+        state.add_usage(index, usage, cost)
+
+    check = check_paragraph_result(before, raw, mode=mode, source_ko=source_ko,
+                                   glossary=entries, prior=tuple(prior))
+    if not check.ok:
+        # A malformed reply is a normal outcome, not an error dialog.
+        return {"ok": False, "reasons": check.reasons, "usage": usage, "cost_usd": cost}
+
+    with variants_mod.mutate_variants(path, index) as live:
+        variants_mod.relocate(live, [b.text for b in blocks])
+        target = (variants_mod.find_group(live, group["id"]) if group else None)
+        if target is None:
+            target = variants_mod.new_group(
+                live, k, before, source_ko=source_ko,
+                alignment=(vars(alignment) if alignment else None))
+        variant = variants_mod.add_variant(
+            target, kind=mode, text=check.text,
+            instruction=(getattr(body, "instruction", "") or None
+                         if mode == variants_mod.KIND_REPHRASE else None),
+            usage=usage, cost=cost, warnings=tuple(check.warnings))
+        variants_mod.prune(live)
+        out_group = dict(target)
+
+    return {"ok": True, "group": out_group, "variant_id": variant["id"],
+            "duplicate": check.duplicate, "warnings": check.warnings,
+            "alignment": (vars(alignment) if alignment else None),
+            "usage": usage, "cost_usd": cost}
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/paragraph/retranslate")
+async def retranslate_paragraph(pid: str, index: int, body: ParagraphRef) -> dict:
+    """Translate this paragraph again from the Korean."""
+    return await _generate_paragraph(pid, index, body, variants_mod.KIND_RETRANSLATE)
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/paragraph/rephrase")
+async def rephrase_paragraph(pid: str, index: int, body: ParagraphRephrase) -> dict:
+    """Reword this paragraph in English. Never needs the Korean, so it keeps working
+    on saved-copy novels and chapters whose source doesn't line up."""
+    return await _generate_paragraph(pid, index, body, variants_mod.KIND_REPHRASE)
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/paragraph/apply")
+def apply_paragraph(pid: str, index: int, body: ParagraphPick) -> dict:
+    """Put one version into the chapter. Picking v0 is revert-to-original."""
+    _project, cfg, ch, total, text, blocks = _paragraph_context(pid, index)
+    if _worker_owns_chapter(pid, index):
+        raise HTTPException(
+            409, "That chapter is being worked on right now — try again when it finishes.")
+
+    path = variants_mod.variants_path(pid, index, total)
+    doc = variants_mod.load_variants(path, index)
+    variants_mod.relocate(doc, [b.text for b in blocks])
+    group = variants_mod.find_group(doc, body.group_id)
+    if group is None:
+        raise HTTPException(404, "That paragraph's history is gone.")
+    if group.get("stale"):
+        raise HTTPException(409, "That paragraph has changed since these versions were made.")
+    variant = variants_mod.find_variant(group, body.variant_id)
+    if variant is None:
+        raise HTTPException(404, "That version is gone.")
+
+    k = group.get("paragraph", -1)
+    if not 0 <= k < len(blocks):
+        raise HTTPException(409, "That paragraph is no longer where it was.")
+
+    out_path = cfg.paths.output_dir / chapter_filename(index, total)
+    with file_lock(out_path):
+        # A needs-review chapter lives only in audit/. Materialize it first — exactly
+        # as accepting one does — or the splice would write a file the reader can see
+        # while chapters/ stays empty.
+        if not out_path.exists():
+            write_chapter_file(cfg.paths.output_dir, index, total, text)
+        try:
+            updated = splice_block(text, k, variant.get("text", ""))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        # snapshot=False: this edit keeps its own history in variants/, and letting
+        # every pick overwrite the single previous/ slot would destroy the
+        # whole-chapter snapshot after one click.
+        write_chapter_file(cfg.paths.output_dir, index, total, updated, snapshot=False)
+
+    # Re-judge OUTSIDE the state lock (the mutate_state body must stay short), then
+    # persist — the same order _recheck_saved uses.
+    verdict = validate_translation(stripped_chapter(ch), updated, cfg.validation,
+                                   glossary_for(cfg, ch))
+    with mutate_state(cfg.paths.state_file) as state:
+        rec = state.get(index) or {}
+        # A pick is a user-approved edit, like saving the chapter by hand. It does NOT
+        # clear a needs-review flag (that stays "Mark as fine"'s job), and it does not
+        # touch source_hash: that fingerprints the KOREAN, which hasn't changed.
+        state.update(index, manual_edit=True, validation=verdict.metrics)
+    _invalidate_consistency(pid)
+
+    with variants_mod.mutate_variants(path, index) as live:
+        target = variants_mod.find_group(live, body.group_id)
+        if target is not None:
+            target["current_id"] = body.variant_id
+            target["updated_at"] = variants_mod.now_iso()
+            variants_mod.relocate(live, [b.text for b in split_blocks(updated)])
+            out_group = dict(target)
+        else:
+            out_group = dict(group)
+
+    return {"ok": True, "translation": updated, "group": out_group,
+            "status": rec.get("status"), "validation": verdict.metrics}
+
+
+@app.post("/api/projects/{pid}/chapters/{index}/paragraph/discard")
+def discard_paragraph_history(pid: str, index: int, body: ParagraphDiscard) -> dict:
+    """Throw away one version, or a paragraph's whole history. Never automatic."""
+    _project, _cfg, _ch, total, _text, _blocks = _paragraph_context(pid, index)
+    path = variants_mod.variants_path(pid, index, total)
+    with variants_mod.mutate_variants(path, index) as doc:
+        group = variants_mod.find_group(doc, body.group_id)
+        if group is None:
+            raise HTTPException(404, "That paragraph's history is gone.")
+        if body.variant_id is None:
+            doc["groups"] = [g for g in doc["groups"] if g.get("id") != body.group_id]
+        else:
+            if body.variant_id in ("v0", group.get("current_id")):
+                raise HTTPException(
+                    400, "That version is either the original or the one currently in "
+                         "the chapter, so it can't be discarded.")
+            group["variants"] = [v for v in group.get("variants", [])
+                                 if v.get("id") != body.variant_id]
+        groups = [dict(g) for g in doc.get("groups", [])]
+    return {"ok": True, "groups": groups}
 
 
 # --------------------------------------------------------------------- name consistency
@@ -2097,20 +2848,39 @@ class TranslateRequest(BaseModel):
     force: bool = False
 
 
-# What a queued item asks the worker to do. All three run through the same Job so
+# What a queued item asks the worker to do. All of these run through the same Job so
 # they show up in the Activity view, stream to the live console, and honour Stop and
 # the rate-limit auto-resume without any of that being reimplemented per operation.
 TASK_TRANSLATE = "translate"   # translate the Korean source (the original behaviour)
 TASK_RESOLVE = "resolve"       # AI resolve: re-translate, corrected for what failed
 TASK_PRONOUNS = "pronouns"     # rewrite only the pronouns of mis-gendered characters
-TASK_KINDS = (TASK_TRANSLATE, TASK_RESOLVE, TASK_PRONOUNS)
+TASK_OCR = "ocr"               # read Korean text out of one scanned page image
+TASK_OCR_VERIFY = "ocr-verify"  # proof-read one page's text against its photo
+TASK_KINDS = (TASK_TRANSLATE, TASK_RESOLVE, TASK_PRONOUNS, TASK_OCR, TASK_OCR_VERIFY)
+
+# Kinds whose index is a PAGE sequence number rather than a chapter index.
+PAGE_TASK_KINDS = (TASK_OCR, TASK_OCR_VERIFY)
 
 # How each kind is described in the UI and the terminal.
 TASK_LABEL = {
     TASK_TRANSLATE: "Translating",
     TASK_RESOLVE: "AI resolve on",
     TASK_PRONOUNS: "Fixing pronouns in",
+    TASK_OCR: "Reading page",
+    TASK_OCR_VERIFY: "Double-checking page",
 }
+
+
+def _queue_key(idx: int, kind: str) -> str:
+    """Dedup key for the pending set.
+
+    Pages and chapters share one worker but NOT one number space: once a scanned
+    novel has been built, page 5 and chapter 5 both exist and are different things.
+    Deduping on the bare index would make queueing a page silently drop a chapter (or
+    the reverse). ``queue_state()`` still reports plain integer indices, so the
+    Activity views and /api/queue are unaffected.
+    """
+    return f"{'pg' if kind in PAGE_TASK_KINDS else 'ch'}:{idx}"
 
 
 class TaskRefused(Exception):
@@ -2165,7 +2935,9 @@ class Job:
         # through this one queue is what puts them in the Activity view for free, and
         # keeps one worker per novel so writes to state.json stay serialized.
         self.pending: deque[tuple[int, bool, str]] = deque()
-        self.queued: set[int] = set()        # indices pending or in-flight (for dedup)
+        # Namespaced "ch:<i>" / "pg:<i>" keys pending or in-flight (for dedup) — see
+        # _queue_key: a page and a chapter can share a number.
+        self.queued: set[str] = set()
         self.current: int | None = None       # chapter being worked on right now
         self.kind: str = TASK_TRANSLATE       # what is being done to it
         self.history: list[dict] = []         # every event so far, replayed on (re)connect
@@ -2189,9 +2961,10 @@ class Job:
         """Append (index, force, kind) triples, skipping ones already queued/in-flight."""
         added = []
         for idx, force, kind in items:
-            if idx in self.queued:
+            key = _queue_key(idx, kind)
+            if key in self.queued:
                 continue
-            self.queued.add(idx)
+            self.queued.add(key)
             self.pending.append((idx, force, kind))
             added.append(idx)
         return added
@@ -2381,6 +3154,204 @@ def _paragraph_count(text: str) -> int:
     return len([p for p in re.split(r"\n\s*\n", text) if p.strip()])
 
 
+def _rate_limit_resume_at(exc: Exception, strikes: int) -> tuple[float, float | None]:
+    """When to resume after a rate limit, plus the plan's own reset time if known.
+
+    One copy of the policy, so the chapter and page paths can never drift on how long
+    they wait out a limit.
+    """
+    resets_at = getattr(getattr(exc, "info", None), "resets_at", None)
+    now = time.time()
+    if resets_at and now < resets_at <= now + _MAX_WAIT:
+        return resets_at + _RATE_LIMIT_BUFFER, resets_at
+    # No or stale reset time (e.g. a bare 429): back off instead.
+    return now + min(_FALLBACK_WAIT * (2 ** (strikes - 1)), _FALLBACK_WAIT_MAX), resets_at
+
+
+def _run_page_task(kind: str, pid: str, page: dict, cfg: Config,
+                   translator: Translator, hooks: StreamHooks) -> dict:
+    """Run one queued page item. Blocking — always called via run_in_threadpool.
+
+    Returns the fields to merge into the page's record in pages.json.
+    """
+    image = pages_mod.resolve_page_file(pid, page.get("id", ""))
+    if image is None:
+        raise TaskRefused("that page's image file is missing")
+
+    if kind == TASK_OCR_VERIFY:
+        text = (page.get("text") or "").strip()
+        if not text:
+            raise TaskRefused("there is nothing transcribed on that page to check yet")
+        result = ocr.verify_page(translator, image, text, hooks)
+        return {
+            "verify": {
+                "at": pages_mod.now_iso(),
+                "verdict": result.verdict,
+                "issues": [vars(i) for i in result.issues],
+                "cost_usd": result.cost_usd,
+            },
+            "status": (pages_mod.STATUS_NEEDS_CHECK if result.verdict == "discrepancies"
+                       else pages_mod.STATUS_OK),
+            "_usage": result.usage,
+            "_cost": result.cost_usd,
+        }
+
+    result = ocr.transcribe_page(translator, image, hint=page.get("hint") or None,
+                                 hooks=hooks)
+    text = result.text
+    attempts = int(((page.get("ocr") or {}).get("attempts") or 0)) + 1
+    return {
+        "text": text,
+        "raw_text": text,
+        "confidence": result.confidence,
+        "notes": result.notes,
+        "heading": result.heading,
+        "starts_mid_sentence": result.starts_mid_sentence,
+        "ends_mid_sentence": result.ends_mid_sentence,
+        "ends_mid_word": result.ends_mid_word,
+        "hangul_fraction": round(hangul_fraction(text), 3),
+        "chars": len(text),
+        "hint": "",
+        "verify": None,
+        "error": None,
+        # A page the model itself was unsure about goes to the reader, not straight
+        # into the novel. Everything else is provisionally fine.
+        "status": (pages_mod.STATUS_OK if result.confidence == "high"
+                   else pages_mod.STATUS_NEEDS_CHECK),
+        "ocr": {"at": pages_mod.now_iso(), "attempts": attempts,
+                "usage": result.usage, "cost_usd": result.cost_usd},
+        "_usage": result.usage,
+        "_cost": result.cost_usd,
+    }
+
+
+def _apply_page_result(pid: str, page_id: str, fields: dict) -> dict:
+    """Merge a finished page result into pages.json and return the updated record.
+
+    OCR spend is accumulated HERE rather than in state.json: that file is keyed by
+    chapter index, and a page sequence number would corrupt a real chapter's totals.
+    """
+    usage = fields.pop("_usage", {}) or {}
+    cost = float(fields.pop("_cost", 0.0) or 0.0)
+    with pages_mod.mutate_pages(pid) as doc:
+        rec = pages_mod.find_page(doc, page_id)
+        if rec is None:
+            return {}
+        rec.update(fields)
+        totals = doc.setdefault("totals", {})
+        totals["cost_usd"] = round(float(totals.get("cost_usd") or 0.0) + cost, 6)
+        for key, value in (usage or {}).items():
+            if isinstance(value, (int, float)):
+                totals[key] = (totals.get(key) or 0) + value
+        return dict(rec)
+
+
+def _set_page_status(pid: str, page_id: str, status: str, **fields) -> None:
+    with pages_mod.mutate_pages(pid) as doc:
+        rec = pages_mod.find_page(doc, page_id)
+        if rec is not None:
+            rec["status"] = status
+            rec.update(fields)
+
+
+async def _run_page_item(job: Job, cfg: Config, idx: int, force: bool, kind: str,
+                         translator: Translator, loop, strikes: int) -> tuple[int, str]:
+    """Run one queued PAGE item on the shared worker.
+
+    Pages ride the same Job as chapters so Stop, the live console, the Activity view
+    and the rate-limit auto-resume all work without being reimplemented — but their
+    bookkeeping lives in pages.json, and ``idx`` is a page sequence number, not a
+    chapter index. Returns ``(strikes, outcome)`` with outcome
+    ``"continue" | "break" | "return"``.
+    """
+    key = _queue_key(idx, kind)
+    doc = pages_mod.load_pages(job.pid)
+    page = next((p for p in doc.get("pages", []) if p.get("seq") == idx), None)
+    if page is None:
+        job.queued.discard(key)
+        job.current = None
+        return strikes, "continue"
+
+    page_id = page.get("id", "")
+    prior_status = page.get("status") or pages_mod.STATUS_NEW
+    label = page.get("name") or f"Page {idx}"
+
+    job.abort.clear()
+    job.live = {"index": idx, "title": label, "chars": 0, "source": [], "english": "",
+                "committed": "", "chunk": [1, 1], "started_at": time.time(),
+                "page_id": page_id}
+    hooks, flush_live = _build_hooks(job, loop)
+    _set_page_status(job.pid, page_id, pages_mod.STATUS_RUNNING)
+    job.publish({"type": "start", "index": idx, "title": label, "chars": 0,
+                 "kind": kind, "page_id": page_id,
+                 "started_at": job.live["started_at"],
+                 "model": cfg.anthropic.model, "effort": cfg.anthropic.effort})
+
+    def done(status: str, **extra) -> None:
+        job.live = None
+        job.current = None
+        job.publish({"type": "chapter", "index": idx, "kind": kind,
+                     "page_id": page_id, "title": label, "status": status, **extra})
+
+    try:
+        fields = await run_in_threadpool(
+            _run_page_task, kind, job.pid, page, cfg, translator, hooks)
+    except TranslationAborted:
+        flush_live()
+        _set_page_status(job.pid, page_id, prior_status)
+        job.queued.discard(key)
+        done(prior_status, aborted=True)
+        return strikes, ("break" if job.cancelled else "continue")
+    except RateLimitedError as exc:
+        flush_live()
+        job.live = None
+        # Nothing was written, so the page simply goes back to what it was and is
+        # re-queued at the head to be retried when the window refreshes.
+        _set_page_status(job.pid, page_id, prior_status)
+        job.pending.appendleft((idx, force, kind))
+        job.current = None
+        strikes += 1
+        resume_at, resets_at = _rate_limit_resume_at(exc, strikes)
+        if strikes >= _MAX_STRIKES:
+            job.done = True
+            job.publish({"type": "paused", "index": idx, "message": str(exc),
+                         "resets_at": resets_at, "current": None,
+                         "pending": [i for i, _, _ in job.pending]})
+            return strikes, "return"
+        job.waiting = {"resume_at": resume_at, "resets_at": resets_at,
+                       "message": str(exc), "since": time.time()}
+        job.publish({"type": "waiting", "index": idx, "message": str(exc),
+                     "resets_at": resets_at, "resume_at": resume_at})
+        await _sleep_until(job, resume_at)
+        job.waiting = None
+        if job.cancelled or not job.pending:
+            return strikes, "break"
+        job.publish({"type": "resumed"})
+        return strikes, "continue"
+    except TaskRefused as exc:
+        flush_live()
+        _set_page_status(job.pid, page_id, prior_status)
+        job.queued.discard(key)
+        done(prior_status, refused=True, error=str(exc))
+        return 0, "continue"
+    except Exception as exc:  # isolation: one bad page never kills the queue
+        flush_live()
+        _set_page_status(job.pid, page_id, pages_mod.STATUS_FAILED,
+                         error=f"{type(exc).__name__}: {exc}")
+        job.queued.discard(key)
+        done(pages_mod.STATUS_FAILED, error=str(exc),
+             explain=errors.as_dict(errors.explain(exc)))
+        return 0, "continue"
+
+    flush_live()
+    rec = _apply_page_result(job.pid, page_id, fields)
+    job.queued.discard(key)
+    done(rec.get("status", pages_mod.STATUS_NEEDS_CHECK),
+         confidence=rec.get("confidence", ""), notes=rec.get("notes", []),
+         chars=rec.get("chars", 0))
+    return 0, "continue"
+
+
 async def _run_worker(job: Job, cfg: Config) -> None:
     loop = asyncio.get_running_loop()
     chapters = get_chapters(job.pid, cfg)
@@ -2398,6 +3369,16 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         idx, force, kind = job.pending.popleft()
         job.current = idx
         job.kind = kind
+        # A page item's index is a page sequence number, so it must NOT be looked up
+        # in the chapter map below — after a build, page 5 and chapter 5 both exist.
+        if kind in PAGE_TASK_KINDS:
+            strikes, outcome = await _run_page_item(
+                job, cfg, idx, force, kind, translator, loop, strikes)
+            if outcome == "return":
+                return
+            if outcome == "break":
+                break
+            continue
         ch = by_index.get(idx)
         if ch is None or kind != TASK_TRANSLATE:
             # by_index is captured once when the worker starts; a repair queued later
@@ -2408,7 +3389,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             by_index = {c.index: c for c in chapters}
             ch = by_index.get(idx)
         if ch is None:
-            job.queued.discard(idx)
+            job.queued.discard(_queue_key(idx, kind))
             job.current = None
             continue
         # Whether this chapter was ALREADY validated on disk before this attempt. Used
@@ -2419,7 +3400,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         # pronoun fix is explicitly requested ON an already-translated chapter, so
         # skipping it there would silently do nothing.
         if kind == TASK_TRANSLATE and not force and already_done:
-            job.queued.discard(idx)
+            job.queued.discard(_queue_key(idx, kind))
             job.current = None
             job.publish({"type": "chapter", "index": idx, "kind": kind,
                          "status": "validated",
@@ -2451,7 +3432,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             if kind == TASK_TRANSLATE and not already_done:
                 state.update(idx, status=state_mod.STATUS_PENDING, title=ch.title)
                 state = _persist_chapter_state(state, cfg.paths.state_file, idx)
-            job.queued.discard(idx)
+            job.queued.discard(_queue_key(idx, kind))
             job.current = None
             job.live = None
             rec = state.get(idx) or {}
@@ -2479,7 +3460,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             job.pending.appendleft((idx, force, kind))
             job.current = None
             strikes += 1
-            resets_at = getattr(getattr(exc, "info", None), "resets_at", None)
+            resume_at, resets_at = _rate_limit_resume_at(exc, strikes)
             if strikes >= _MAX_STRIKES:
                 # Something is off (limit hit right back N times in a row) — stop
                 # burning retries and hand resumption to the user/client instead.
@@ -2489,13 +3470,8 @@ async def _run_worker(job: Job, cfg: Config) -> None:
                              "resets_at": resets_at,
                              "current": None, "pending": remaining})
                 return
-            now = time.time()
-            if resets_at and now < resets_at <= now + _MAX_WAIT:
-                resume_at = resets_at + _RATE_LIMIT_BUFFER
-            else:  # no/stale reset time (e.g. bare 429): retry on a backoff instead
-                resume_at = now + min(_FALLBACK_WAIT * (2 ** (strikes - 1)), _FALLBACK_WAIT_MAX)
             job.waiting = {"resume_at": resume_at, "resets_at": resets_at,
-                           "message": str(exc), "since": now}
+                           "message": str(exc), "since": time.time()}
             job.publish({"type": "waiting", "index": idx, "message": str(exc),
                          "resets_at": resets_at, "resume_at": resume_at})
             await _sleep_until(job, resume_at)
@@ -2510,7 +3486,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             flush_live()
             job.live = None
             strikes = 0
-            job.queued.discard(idx)
+            job.queued.discard(_queue_key(idx, kind))
             job.current = None
             # The attempt was still billed even though nothing was written, so persist
             # the usage rather than silently dropping it from the novel's totals.
@@ -2528,7 +3504,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             state.update(idx, status=state_mod.STATUS_FAILED, title=ch.title,
                          error=f"{type(exc).__name__}: {exc}")
             state = _persist_chapter_state(state, cfg.paths.state_file, idx)
-            job.queued.discard(idx)
+            job.queued.discard(_queue_key(idx, kind))
             job.current = None
             # Carry the same plain-English explanation the HTTP layer produces, so a
             # mid-queue failure opens the identical "what went wrong / how to fix it"
@@ -2543,7 +3519,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         strikes = 0
         state = _persist_chapter_state(state, cfg.paths.state_file, idx)
         rec = state.get(idx) or {}
-        job.queued.discard(idx)
+        job.queued.discard(_queue_key(idx, kind))
         job.current = None
         totals = state.totals()
         job.publish({"type": "chapter", "index": idx, "kind": kind,
@@ -2669,7 +3645,8 @@ def cancel_queue(pid: str, req: CancelRequest = CancelRequest()) -> dict:
             job.abort.set()          # cooperative stop inside the in-flight agent call
             job.queued.clear()
         else:
-            job.queued = {job.current} if job.current is not None else set()
+            job.queued = ({_queue_key(job.current, job.kind)}
+                          if job.current is not None else set())
         job.wake.set()  # a worker waiting out a rate limit exits promptly
         return {"ok": True, "current": None if req.stop_current else job.current,
                 "pending": [], "stopped": stopped}

@@ -13,6 +13,7 @@ import shutil
 import traceback
 from pathlib import Path
 
+from .atomic import atomic_write_text
 from .config import Config
 from .docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
 from .glossary import Glossary, queue_new_terms
@@ -60,21 +61,28 @@ def stripped_chapter(chapter: Chapter) -> Chapter:
                    paragraphs=[p for p in re.split(r"\n\s*\n", clean) if p.strip()])
 
 
-def write_chapter_file(output_dir: Path, index: int, total: int, prose: str) -> Path:
+def write_chapter_file(output_dir: Path, index: int, total: int, prose: str,
+                       *, snapshot: bool = True) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / chapter_filename(index, total)
     # Before overwriting an existing translation, snapshot it to a sibling ``previous/``
     # folder so the reader can show old-vs-new and offer a one-click revert. Kept OUTSIDE
     # ``chapters/`` so it never matches the ``chapter-*.md`` globs used by scans/exports.
-    if path.exists():
+    #
+    # ``snapshot=False`` is for edits that keep their OWN history — a per-paragraph
+    # rewrite stores every version in ``variants/``, and letting each pick overwrite
+    # the single ``previous/`` slot would destroy the whole-chapter snapshot taken
+    # before the last translation or AI resolve after just one click.
+    if snapshot and path.exists():
         prev_dir = output_dir.parent / "previous"
         prev_dir.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(path, prev_dir / chapter_filename(index, total))
         except OSError:
             pass  # a missing backup must never block writing the real translation
-    # Preserve curly quotes — no smart-quote normalization anywhere.
-    path.write_text(prose.rstrip() + "\n", encoding="utf-8")
+    # Preserve curly quotes — no smart-quote normalization anywhere. Written atomically
+    # so a crash or a concurrent reader never observes a half-written chapter.
+    atomic_write_text(path, prose.rstrip() + "\n")
     return path
 
 

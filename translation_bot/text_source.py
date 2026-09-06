@@ -138,6 +138,21 @@ def _reindex(chapters: list[Chapter]) -> list[Chapter]:
     return chapters
 
 
+def paragraphs_of(block: str) -> list[str]:
+    """Split a block into paragraphs on blank lines.
+
+    Public alias of the splitter the chapter builders use, so callers outside this
+    module (the scanned-page builder) share the exact same rule rather than growing a
+    second copy of it that can drift.
+    """
+    return _paragraphs(block)
+
+
+def make_chapter(index: int, title: str, body: str) -> Chapter | None:
+    """Build one chapter from a title and a body, or None when the body is empty."""
+    return _make(index, title, body)
+
+
 def chapters_to_records(chapters: list[Chapter]) -> list[dict]:
     """Serialize chapters for on-disk storage (source.json)."""
     return [{"title": c.title, "paragraphs": c.paragraphs} for c in chapters]

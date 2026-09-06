@@ -11,6 +11,8 @@ import ReviewPage from './pages/ReviewPage'
 import GuidePage from './pages/GuidePage'
 import SettingsPage from './pages/SettingsPage'
 import ChaptersPage from './pages/ChaptersPage'
+import PagesPage from './pages/PagesPage'
+import ScansPage from './pages/ScansPage'
 import ProjectActivityPage from './pages/ProjectActivityPage'
 import GlossaryPage from './pages/GlossaryPage'
 import ConsistencyPage from './pages/ConsistencyPage'
@@ -23,6 +25,17 @@ import { HintsContext } from './hints'
 import { ToastProvider } from './toast'
 import { ConfirmProvider } from './confirm'
 import { getGuideSeen, getHintsOn, setGuideSeen, setHintsOn } from './prefs'
+
+// What the app genuinely needs before it can do anything: its config, and Claude.
+//
+// Google is deliberately NOT in here. It is only ever used to READ a Google Doc — a
+// novel from pasted text or from page photos never touches it. Gating the whole app
+// on it walled OCR-only users behind an OAuth consent screen they had no use for.
+// The sidebar still shows a grey Google dot, and Setup is one click away, so anyone
+// who does want Google Docs can still see that it isn't connected.
+function isReady(status) {
+  return Boolean(status.config_present && status.claude_logged_in)
+}
 
 export default function App() {
   const [status, setStatus] = useState(undefined) // undefined = still loading
@@ -38,9 +51,7 @@ export default function App() {
   // Send the user to the guide the very first time (then never again unless asked).
   useEffect(() => {
     if (status === undefined) return
-    const isReady = status.config_present && status.claude_logged_in &&
-      status.google_client_secret_present && status.google_logged_in
-    if (isReady && !getGuideSeen()) { setGuideSeen(); navigate('/guide') }
+    if (isReady(status) && !getGuideSeen()) { setGuideSeen(); navigate('/guide') }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status])
 
@@ -48,8 +59,7 @@ export default function App() {
     return <div className="flex min-h-screen items-center justify-center bg-page text-hint">Loading…</div>
   }
 
-  const ready = status.config_present && status.claude_logged_in &&
-    status.google_client_secret_present && status.google_logged_in
+  const ready = isReady(status)
 
   const hints = { on: hintsOn, setOn: toggleHints }
 
@@ -66,12 +76,14 @@ export default function App() {
           <Route index element={<LibraryPage />} />
           <Route path="activity" element={<ActivityPage />} />
           <Route path="review" element={<ReviewPage />} />
+          <Route path="scans" element={<ScansPage />} />
           <Route path="upkeep" element={<UpkeepPage />} />
           <Route path="archive" element={<ArchivePage />} />
           <Route path="guide" element={<GuidePage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="novel/:pid" element={<ProjectLayout />}>
             <Route index element={<ChaptersPage />} />
+            <Route path="pages" element={<PagesPage />} />
             <Route path="activity" element={<ProjectActivityPage />} />
             <Route path="glossary" element={<GlossaryPage />} />
             <Route path="consistency" element={<ConsistencyPage />} />

@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 
 from claude_agent_sdk import (
@@ -48,6 +49,7 @@ from .prompts import (
     META_SCAN_PROMPT,
     NAME_EXTRACTION_PROMPT,
     NEW_TERMS_DELIMITER,
+    PARAGRAPH_OUTPUT_CONTRACT,
     PRONOUN_DETECT_PROMPT,
     PRONOUN_FIX_PROMPT,
     TERM_CLASSIFY_PROMPT,
@@ -289,32 +291,45 @@ class Translator:
         # chapters) injected into every chapter so new translations match them.
         self.canonical_names = canonical_names or []
 
-    def _options(self, system_text: str, max_turns: int = 1) -> ClaudeAgentOptions:
+    def _options(self, system_text: str, max_turns: int = 1, *,
+                 tools: list[str] | None = None,
+                 cwd: str | Path | None = None,
+                 add_dirs: list[str | Path] | None = None) -> ClaudeAgentOptions:
         web = self.cfg.web_access
         # Fable 5 has thinking always on; {"type": "disabled"} is rejected with a 400.
         fable = "fable" in (self.cfg.model or "").lower()
+        # Tools a *specific* call opts into — e.g. OCR needs Read, because the only way
+        # to hand the agent an image is a path it reads off disk. Everything not named
+        # here stays blocked, so the default call is unchanged: clean text in, text out.
+        # ``cwd``/``add_dirs`` scope that Read to one folder (the project's pages/).
+        allowed = list(tools or []) + (["WebSearch"] if web else [])
         return ClaudeAgentOptions(
             system_prompt=system_text,           # fully replaces the default agent prompt
-            allowed_tools=(["WebSearch"] if web else []),
-            disallowed_tools=([t for t in _BLOCKED_TOOLS if t != "WebSearch"] if web
-                              else _BLOCKED_TOOLS),
+            allowed_tools=allowed,
+            disallowed_tools=[t for t in _BLOCKED_TOOLS if t not in allowed],
             permission_mode="bypassPermissions",  # headless: never prompt for approval
             setting_sources=[],                    # ignore project .claude/ skills + config
             max_turns=max_turns,                   # 1 for translation; more for aux checks
             model=_agent_model(self.cfg.model),
             effort=(self.cfg.effort if self.cfg.effort in _VALID_EFFORT else "high"),
             thinking={"type": "adaptive"} if (self.cfg.thinking or fable) else {"type": "disabled"},
+            cwd=str(cwd) if cwd else None,
+            add_dirs=[str(d) for d in (add_dirs or [])],
         )
 
     async def _aquery(self, system_text: str, user_text: str, max_turns: int = 1,
-                      hooks: StreamHooks | None = None) -> tuple[str, dict, float]:
+                      hooks: StreamHooks | None = None, *,
+                      tools: list[str] | None = None,
+                      cwd: str | Path | None = None,
+                      add_dirs: list[str | Path] | None = None) -> tuple[str, dict, float]:
         texts: list[str] = []
         usage: dict = {}
         cost = 0.0
         rate_limited = None
         last_info = None  # latest rate-limit info seen, even non-rejected warnings
         got_result = False
-        async for msg in query(prompt=user_text, options=self._options(system_text, max_turns)):
+        options = self._options(system_text, max_turns, tools=tools, cwd=cwd, add_dirs=add_dirs)
+        async for msg in query(prompt=user_text, options=options):
             # Cooperative stop: a threadpool thread can't be killed, so the only way
             # to end an in-flight chapter is to check between streamed messages and
             # break out — which closes the generator and tears the CLI subprocess down.
@@ -357,13 +372,22 @@ class Translator:
         return "".join(texts).strip(), usage, cost
 
     def _call(self, system_text: str, user_text: str, max_turns: int = 1,
-              hooks: StreamHooks | None = None) -> tuple[str, dict, float]:
-        """One agent call -> (text, usage dict, plan-equivalent cost)."""
+              hooks: StreamHooks | None = None, *,
+              tools: list[str] | None = None,
+              cwd: str | Path | None = None,
+              add_dirs: list[str | Path] | None = None) -> tuple[str, dict, float]:
+        """One agent call -> (text, usage dict, plan-equivalent cost).
+
+        ``tools``/``cwd``/``add_dirs`` let one call opt into a normally-blocked tool
+        (OCR needs ``Read``); omitting them keeps every tool blocked.
+        """
         last: Exception | None = None
         attempts = max(1, self.cfg.api_retry_count)
         for attempt in range(attempts):
             try:
-                return asyncio.run(self._aquery(system_text, user_text, max_turns, hooks))
+                return asyncio.run(self._aquery(
+                    system_text, user_text, max_turns, hooks,
+                    tools=tools, cwd=cwd, add_dirs=add_dirs))
             except (RateLimitedError, TranslatorError, CLINotFoundError, TranslationAborted):
                 raise  # don't retry hard limits / config errors / a deliberate stop
             except (CLIConnectionError, ProcessError) as exc:
@@ -580,3 +604,136 @@ class Translator:
         text, usage, cost = self._call(PRONOUN_FIX_PROMPT, user_text, hooks=hooks)
         cleaned, _removed = strip_reasoning(text)
         return (cleaned.strip() or prose), usage, cost
+
+    # ---- single-paragraph rewrites -------------------------------------------
+    # Both inherit the full chapter system prompt — glossary, canonical names,
+    # pronoun rules, style note, honorifics, quote style — and swap only what the
+    # model must emit. That inheritance is the point: a regenerated paragraph has to
+    # be indistinguishable in register from the ones on either side of it.
+
+    def _paragraph_system(self, glossary_entries: list[GlossaryEntry]) -> str:
+        return build_system_prompt(
+            format_injection(glossary_entries),
+            web_access=self.cfg.web_access,
+            honorific_note=self.tcfg.honorific_note,
+            style_note=self.tcfg.style_note,
+            names_block=format_names(self.canonical_names) if self.canonical_names else None,
+            output_contract=PARAGRAPH_OUTPUT_CONTRACT,
+        )
+
+    @staticmethod
+    def _neighbours(before: str, after: str, verb: str) -> str:
+        if not (before or "").strip() and not (after or "").strip():
+            return ""
+        lines = [f"Neighbouring English, for context only — do NOT {verb} or output these:\n"]
+        if (before or "").strip():
+            lines.append(f"  {before.strip()}\n")
+        lines.append("  [the paragraph in question]\n")
+        if (after or "").strip():
+            lines.append(f"  {after.strip()}\n")
+        lines.append("\n")
+        return "".join(lines)
+
+    @staticmethod
+    def _avoid_clause(avoid: list[str] | None) -> str:
+        """Tell the model what it has already produced.
+
+        Load-bearing: without it a regenerate comes back near-identical to the last
+        attempt, and offering the reader a choice between versions is pointless.
+        """
+        lines = "\n".join(f"- {a.strip()}" for a in (avoid or []) if (a or "").strip())
+        if not lines:
+            return ""
+        return ("\n\nYou have already produced the versions below. Do NOT reproduce any "
+                "of them — this attempt must be meaningfully different:\n" + lines)
+
+    def retranslate_paragraph(
+        self,
+        *,
+        english: str,
+        korean_window: list[str],
+        focus: int,
+        context_before: str = "",
+        context_after: str = "",
+        glossary_entries: list[GlossaryEntry] | None = None,
+        avoid: list[str] | None = None,
+        extra_instruction: str = "",
+        hooks: StreamHooks | None = None,
+    ) -> tuple[str, dict, float]:
+        """Translate one Korean paragraph again, in the voice of its neighbours.
+
+        ``korean_window`` is a few source paragraphs with ``focus`` marking the target.
+        A window rather than a single paragraph on purpose: the alignment between
+        English and Korean paragraphs is an estimate, and a wrong point estimate
+        produces a confidently wrong translation, whereas a window containing the
+        right paragraph produces a right one — and lets the model resolve referents.
+        """
+        if not korean_window:
+            raise TranslatorError("no Korean source could be matched to that paragraph")
+
+        marked = "".join(
+            f"{'  ▶ ' if i == focus else '    '}{para}\n"
+            for i, para in enumerate(korean_window)
+        )
+        user_text = (
+            self._neighbours(context_before, context_after, "translate")
+            + "Korean source. Translate ONLY the paragraph marked ▶. The others are "
+              "its neighbours, given so you can resolve pronouns and referents — do "
+              "NOT translate them:\n\n"
+            + marked
+            + "\nThe current English rendering you are replacing:\n\n"
+            + f"  {(english or '').strip()}\n"
+            + "\nTranslate the ▶ paragraph freshly into English. Match the voice, "
+              "tense, and formatting of the surrounding English exactly. "
+              "Output ONE paragraph."
+            + self._avoid_clause(avoid)
+            + (extra_instruction or "")
+        )
+        if hooks is not None:
+            hooks.chunk(1, 1)
+        text, usage, cost = self._call(
+            self._paragraph_system(glossary_entries or []), user_text, hooks=hooks)
+        cleaned, _removed = strip_reasoning(text)
+        return cleaned.strip(), usage, cost
+
+    def rephrase_paragraph(
+        self,
+        *,
+        english: str,
+        instruction: str = "",
+        context_before: str = "",
+        context_after: str = "",
+        glossary_entries: list[GlossaryEntry] | None = None,
+        avoid: list[str] | None = None,
+        hooks: StreamHooks | None = None,
+    ) -> tuple[str, dict, float]:
+        """Restyle one already-translated paragraph. Never consults the Korean.
+
+        Because it works purely in English it stays available on novels whose source
+        can't be reached, on chapters that were already English, and wherever the
+        Korean alignment is too uncertain to retranslate from.
+        """
+        if not (english or "").strip():
+            raise TranslatorError("there is no paragraph to rewrite")
+
+        # Reader-supplied text: bounded and stripped of control characters so a stray
+        # paste can't blow up the call or smuggle in formatting.
+        wanted = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ",
+                        (instruction or "").strip())[:500]
+
+        user_text = (
+            self._neighbours(context_before, context_after, "rewrite")
+            + "Paragraph to rewrite:\n\n"
+            + f"  {english.strip()}\n\n"
+            + f"How to rewrite it: {wanted or 'make it read more naturally in English'}\n\n"
+            + "Keep the same meaning, the same events, the same information, and the "
+              "same speaker, with every proper name spelled exactly as it is. Do not "
+              "add or remove content. Output ONE paragraph."
+            + self._avoid_clause(avoid)
+        )
+        if hooks is not None:
+            hooks.chunk(1, 1)
+        text, usage, cost = self._call(
+            self._paragraph_system(glossary_entries or []), user_text, hooks=hooks)
+        cleaned, _removed = strip_reasoning(text)
+        return cleaned.strip(), usage, cost

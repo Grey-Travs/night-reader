@@ -3,8 +3,9 @@ import { Modal } from './ui'
 // Keyboard cheatsheet for the reader (and the global palette). Opened with `?`.
 const KEYS = [
   ['←  /  →', 'Previous / next chapter'],
+  ['r', 'Rewrite the paragraph you’re reading'],
   ['?', 'Show this shortcuts list'],
-  ['Esc', 'Back out (popover → edit → close)'],
+  ['Esc', 'Back out (popover → rewrite → edit → close)'],
   ['Ctrl / ⌘ + K', 'Command palette — jump anywhere'],
   ['Aa', 'Reading options (size, width, theme, font)'],
 ]
