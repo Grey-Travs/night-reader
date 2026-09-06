@@ -228,6 +228,12 @@ _BUNDLE_DIRS = ("chapters", "previous", "audit", "variants")
 # extracted text always travels (in ``pages.json``), so an image novel stays readable
 # and translatable after a move even when its photos stayed behind.
 _BUNDLE_IMAGE_DIRS = ("pages",)
+# ``tools/repair_library.py`` parks superseded chapter files (an older generation
+# stranded at a stale pad width) in a ``.superseded`` folder beside the live ones,
+# rather than deleting them. They stay on the user's disk so the repair is reversible,
+# but they are a repair artifact, not part of the novel — carrying a dead second copy
+# of every chapter in every backup and every move to another device is not.
+_BUNDLE_SKIP_DIRS = (".superseded",)
 
 
 def export_bundle(pids: list[str], *, include_images: bool = False,
@@ -265,9 +271,13 @@ def export_bundle(pids: list[str], *, include_images: bool = False,
                     # on hundreds of files to save almost nothing.
                     stored = sub in _BUNDLE_IMAGE_DIRS
                     for f in sorted(d.rglob("*")):
-                        if f.is_file():
-                            z.write(f, arcname=f"{pid}/{f.relative_to(pdir).as_posix()}",
-                                    compress_type=(zipfile.ZIP_STORED if stored else None))
+                        if not f.is_file():
+                            continue
+                        rel = f.relative_to(pdir)
+                        if any(part in _BUNDLE_SKIP_DIRS for part in rel.parts):
+                            continue
+                        z.write(f, arcname=f"{pid}/{rel.as_posix()}",
+                                compress_type=(zipfile.ZIP_STORED if stored else None))
     return dest
 
 

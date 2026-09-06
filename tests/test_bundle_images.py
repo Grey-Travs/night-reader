@@ -99,6 +99,22 @@ def test_previous_translations_travel(library):
     assert f"{PID}/previous/chapter-01.md" in names
 
 
+def test_superseded_repair_artifacts_do_not_travel(library):
+    """tools/repair_library.py parks an older, stranded generation of a chapter in
+    ``.superseded/`` rather than deleting it. Those files stay on disk so the repair
+    is reversible — but a dead second copy of every chapter has no business riding
+    along in every backup and every move to another device."""
+    aside = library / PID / "chapters" / ".superseded"
+    aside.mkdir(parents=True)
+    (aside / "chapter-01.md").write_text("a superseded translation", encoding="utf-8")
+    (library / PID / "chapters" / "chapter-001.md").write_text("the live one",
+                                                               encoding="utf-8")
+
+    names = _names(pj.export_bundle([PID]))
+    assert f"{PID}/chapters/chapter-001.md" in names, "the live chapter still travels"
+    assert not any(".superseded" in n for n in names)
+
+
 def test_a_google_doc_novel_round_trips(library):
     """Every bundle test used an images-only fixture, so nothing covered the shape all
     52 real novels actually have: a source_doc_id, chapters, and no pages at all."""
