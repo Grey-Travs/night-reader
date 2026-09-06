@@ -17,6 +17,8 @@ import json
 import re
 import threading
 import time
+import unicodedata
+import urllib.parse
 import uuid
 import zipfile
 from collections import Counter, defaultdict, deque
@@ -1381,6 +1383,25 @@ def _safe_name(name: str) -> str:
     return base[:60] or "novel"
 
 
+def _attachment(filename: str) -> str:
+    """A Content-Disposition value that survives a non-latin-1 filename.
+
+    HTTP headers are latin-1. ``_safe_name`` uses ``\\w``, which in Python is
+    Unicode-aware and therefore KEEPS Hangul — so a hand-built
+    ``filename="밥만_했는데.epub"`` raised UnicodeEncodeError inside the server and the
+    download returned 500. That is most of this library: nearly every novel here has
+    a Korean title.
+
+    RFC 5987's ``filename*`` carries the real name, with a plain ASCII ``filename``
+    as the fallback for anything that doesn't understand it. (FileResponse already
+    does this for the epub and bundle downloads; these hand-built headers didn't.)
+    """
+    ascii_fallback = (unicodedata.normalize("NFKD", filename)
+                      .encode("ascii", "ignore").decode("ascii").strip("_- ") or "novel")
+    return (f'attachment; filename="{ascii_fallback}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}")
+
+
 def _translated_chapters(pid: str, cfg: Config) -> list[tuple[int, str, str]]:
     """(index, title, markdown) for every chapter that has a written translation."""
     chapters = get_chapters(pid, cfg)
@@ -1452,7 +1473,7 @@ def export_novel(pid: str, format: str = "md") -> Response:
         parts = [f"# {t}\n\n{body.strip()}\n" for _i, t, body in items]
         content, media, ext = "\n\n".join(parts) + "\n", "text/markdown; charset=utf-8", "md"
     return Response(content=content, media_type=media,
-                    headers={"Content-Disposition": f'attachment; filename="{_safe_name(name)}.{ext}"'})
+                    headers={"Content-Disposition": _attachment(f"{_safe_name(name)}.{ext}")})
 
 
 @app.get("/api/projects/{pid}/bundle")
@@ -2924,14 +2945,14 @@ def export_glossary(pid: str, format: str = "csv") -> Response:
     if (format or "csv").lower() == "json":
         content = json.dumps([asdict(e) for e in entries], ensure_ascii=False, indent=2)
         return Response(content, media_type="application/json",
-                        headers={"Content-Disposition": f'attachment; filename="{name}-glossary.json"'})
+                        headers={"Content-Disposition": _attachment(f"{name}-glossary.json")})
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["korean", "english", "type", "pronoun", "register", "note"])
     for e in entries:
         writer.writerow([e.korean, e.english, e.type, e.pronoun, e.register, e.note])
     return Response(buf.getvalue(), media_type="text/csv; charset=utf-8",
-                    headers={"Content-Disposition": f'attachment; filename="{name}-glossary.csv"'})
+                    headers={"Content-Disposition": _attachment(f"{name}-glossary.csv")})
 
 
 # ----------------------------------------------------------------------------- translation jobs

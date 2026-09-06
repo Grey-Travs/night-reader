@@ -218,7 +218,11 @@ _BUNDLE_FILES = (
     "project.json", "state.json", "source.json", "pages.json",
     "glossary.json", "glossary.md", "glossary_pending.json",
 )
-_BUNDLE_DIRS = ("chapters", "audit", "variants")
+# ``previous`` holds the one-click-revert copy taken before each overwrite — 2120
+# files across the library, ~21 MB against 167 MB total. It was missing, so moving a
+# novel to another device or restoring a backup silently dropped every revert point
+# it had, and "Compare previous" then reported there was nothing to compare.
+_BUNDLE_DIRS = ("chapters", "previous", "audit", "variants")
 # Page images travel only on request. A photographed novel is hundreds of megabytes,
 # so including them by default would make an ordinary library backup unusable. The
 # extracted text always travels (in ``pages.json``), so an image novel stays readable

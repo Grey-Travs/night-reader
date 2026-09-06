@@ -29,6 +29,41 @@ Runs under pytest (``pytest tests/``) and standalone
 import os
 import sys
 
+# ---- a Korean novel title must not 500 the download -------------------------
+# HTTP headers are latin-1, and _safe_name uses \w, which in Python is Unicode-aware
+# and therefore KEEPS Hangul. A hand-built filename="밥만_했는데.epub" raised
+# UnicodeEncodeError inside the server and the export returned 500 — which is nearly
+# every novel in this library.
+
+
+def test_attachment_header_survives_a_korean_title():
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import server.app as A
+
+    header = A._attachment(f"{A._safe_name('밥만 했는데 주인공들한테 고백받았다')}.epub")
+    header.encode("latin-1")  # raises if the bug is back
+    assert "filename*=UTF-8''" in header, "the real name must still reach the browser"
+    assert "%" in header.split("filename*=UTF-8''", 1)[1], "it should be percent-encoded"
+
+
+def test_attachment_header_keeps_a_plain_ascii_name_readable():
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import server.app as A
+
+    header = A._attachment("My_Novel.epub")
+    header.encode("latin-1")
+    assert 'filename="My_Novel.epub"' in header
+
+
+def test_attachment_header_always_has_an_ascii_fallback():
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import server.app as A
+
+    # A title with no transliterable characters at all must still yield something.
+    header = A._attachment("한국어.csv")
+    header.encode("latin-1")
+    assert 'filename="' in header and 'filename=""' not in header
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from translation_bot.docs_extract import Chapter  # noqa: E402

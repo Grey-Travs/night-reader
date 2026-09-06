@@ -88,6 +88,43 @@ def test_paragraph_variants_travel(library):
         "per-paragraph edit history must survive a move between devices"
 
 
+def test_previous_translations_travel(library):
+    """previous/ is the one-click revert. It was missing from the bundle, so moving a
+    novel dropped every revert point and "Compare previous" found nothing."""
+    (library / PID / "previous").mkdir(exist_ok=True)
+    (library / PID / "previous" / "chapter-01.md").write_text(
+        "the translation before the last overwrite", encoding="utf-8")
+
+    names = _names(pj.export_bundle([PID]))
+    assert f"{PID}/previous/chapter-01.md" in names
+
+
+def test_a_google_doc_novel_round_trips(library):
+    """Every bundle test used an images-only fixture, so nothing covered the shape all
+    52 real novels actually have: a source_doc_id, chapters, and no pages at all."""
+    import shutil
+
+    pdir = library / "0123456789ab"
+    (pdir / "chapters").mkdir(parents=True)
+    (pdir / "previous").mkdir()
+    (pdir / "project.json").write_text(
+        json.dumps({"id": "0123456789ab", "name": "From a Google Doc",
+                    "source_doc_id": "1AbCdEf", "chapter_count": 2}), encoding="utf-8")
+    (pdir / "chapters" / "chapter-01.md").write_text("Chapter one.", encoding="utf-8")
+    (pdir / "previous" / "chapter-01.md").write_text("An older chapter one.", encoding="utf-8")
+    (pdir / "state.json").write_text(
+        json.dumps({"chapters": {"1": {"status": "validated"}}}), encoding="utf-8")
+
+    data = pj.export_bundle(["0123456789ab"]).read_bytes()
+    shutil.rmtree(pdir)
+
+    assert [p["id"] for p in pj.import_bundle(data)] == ["0123456789ab"]
+    assert (pdir / "chapters" / "chapter-01.md").read_text(encoding="utf-8") == "Chapter one."
+    assert (pdir / "previous" / "chapter-01.md").exists(), "revert points must survive"
+    restored = json.loads((pdir / "project.json").read_text(encoding="utf-8"))
+    assert restored["source_doc_id"] == "1AbCdEf", "the novel must still know its document"
+
+
 def test_bundle_has_images_reports_what_can_be_offered(library):
     assert pj.bundle_has_images([PID]) is True
     assert pj.bundle_has_images(["ffffffffffff"]) is False, "a novel with no photos offers none"
