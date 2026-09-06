@@ -2652,31 +2652,35 @@ def upsert_glossary_term(pid: str, body: TermUpsert) -> dict:
     _, cfg = project_cfg(pid)
     if not body.english.strip():
         raise HTTPException(400, "An English spelling is required.")
-    g = Glossary.load(cfg.paths.glossary_json)
     entry = _entry_from(body)
-    # Drop the entry being edited (renamed Korean, or an English-only name being remapped).
     original_k = (body.original_korean or "").strip()
     original_e = (body.original_english or "").strip()
-    if original_k and original_k != entry.korean:
-        g.remove(original_k)
-    elif original_e and not original_k and (entry.korean or original_e.lower() != entry.english.lower()):
-        g.remove_english(original_e)
-    g.add(entry)
-    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {**_locked_payload(g),
-            "affected": _affected_chapters(pid, cfg, {entry.korean, original_k})}
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary.load(cfg.paths.glossary_json)
+        # Drop the entry being edited (renamed Korean, or an English-only name being
+        # remapped).
+        if original_k and original_k != entry.korean:
+            g.remove(original_k)
+        elif original_e and not original_k and (entry.korean or original_e.lower() != entry.english.lower()):
+            g.remove_english(original_e)
+        g.add(entry)
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        payload = _locked_payload(g)
+    # Reading the chapters is slow and needs no lock.
+    return {**payload, "affected": _affected_chapters(pid, cfg, {entry.korean, original_k})}
 
 
 @app.post("/api/projects/{pid}/glossary/term/delete")
 def delete_glossary_term(pid: str, body: TermDelete) -> dict:
     _, cfg = project_cfg(pid)
-    g = Glossary.load(cfg.paths.glossary_json)
     korean = body.korean.strip()
-    removed = g.remove(korean) if korean else g.remove_english(body.english.strip())
-    if not removed:
-        raise HTTPException(404, "term not found")
-    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return _locked_payload(g)
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary.load(cfg.paths.glossary_json)
+        removed = g.remove(korean) if korean else g.remove_english(body.english.strip())
+        if not removed:
+            raise HTTPException(404, "term not found")
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        return _locked_payload(g)
 
 
 @app.post("/api/projects/{pid}/glossary/term/delete-bulk")
@@ -2685,37 +2689,39 @@ def delete_glossary_terms(pid: str, body: TermsDelete) -> dict:
     glossary page. A term that's already gone is counted as missing rather than
     failing the whole batch, so a stale selection can't block the rest."""
     _, cfg = project_cfg(pid)
-    g = Glossary.load(cfg.paths.glossary_json)
-    removed, missing = 0, []
-    for t in body.terms:
-        korean = t.korean.strip()
-        english = t.english.strip()
-        if not korean and not english:
-            continue
-        if g.remove(korean) if korean else g.remove_english(english):
-            removed += 1
-        else:
-            missing.append(korean or english)
-    if removed:
-        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {**_locked_payload(g), "removed": removed, "missing": missing}
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary.load(cfg.paths.glossary_json)
+        removed, missing = 0, []
+        for t in body.terms:
+            korean = t.korean.strip()
+            english = t.english.strip()
+            if not korean and not english:
+                continue
+            if g.remove(korean) if korean else g.remove_english(english):
+                removed += 1
+            else:
+                missing.append(korean or english)
+        if removed:
+            g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        return {**_locked_payload(g), "removed": removed, "missing": missing}
 
 
 @app.post("/api/projects/{pid}/glossary/import")
 def import_glossary(pid: str, body: GlossaryImport) -> dict:
     """Bulk add terms from a CSV/JSON the client parsed. mode=replace clears first."""
     _, cfg = project_cfg(pid)
-    g = Glossary([]) if body.mode == "replace" else Glossary.load(cfg.paths.glossary_json)
-    imported = 0
-    for t in body.entries:
-        entry = _entry_from(t)
-        if not entry.english:  # Korean optional (canonical names), English required
-            continue
-        g.add(entry)
-        imported += 1
-    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {**_locked_payload(g), "imported": imported,
-            "skipped": len(body.entries) - imported}
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary([]) if body.mode == "replace" else Glossary.load(cfg.paths.glossary_json)
+        imported = 0
+        for t in body.entries:
+            entry = _entry_from(t)
+            if not entry.english:  # Korean optional (canonical names), English required
+                continue
+            g.add(entry)
+            imported += 1
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        return {**_locked_payload(g), "imported": imported,
+                "skipped": len(body.entries) - imported}
 
 
 class GlossaryCopy(BaseModel):
@@ -2732,14 +2738,17 @@ def copy_glossary(pid: str, body: GlossaryCopy) -> dict:
         raise HTTPException(400, "Choose a different novel to copy from.")
     _, cfg = project_cfg(pid)
     _, src_cfg = project_cfg(body.source_pid)  # 404s if the source novel doesn't exist
+    # The source is only read, so it needs no lock — and taking two glossary locks at
+    # once would be the one place in this app where a deadlock could be built.
     src_entries = Glossary.load(src_cfg.paths.glossary_json).entries()
-    g = Glossary([]) if body.mode == "replace" else Glossary.load(cfg.paths.glossary_json)
-    before = len(g.entries())
-    for e in src_entries:
-        g.add(e)
-    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {**_locked_payload(g), "copied": len(src_entries),
-            "added": len(g.entries()) - before}
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary([]) if body.mode == "replace" else Glossary.load(cfg.paths.glossary_json)
+        before = len(g.entries())
+        for e in src_entries:
+            g.add(e)
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        return {**_locked_payload(g), "copied": len(src_entries),
+                "added": len(g.entries()) - before}
 
 
 def _sample_english(chapters: list[Chapter], budget: int = 80000) -> str:
@@ -2776,22 +2785,26 @@ async def learn_glossary(pid: str) -> dict:
     except TranslatorError as exc:
         raise HTTPException(502, f"Couldn't read the chapters: {exc}")
 
-    g = Glossary.load(cfg.paths.glossary_json)
-    existing_english = {e.english.lower() for e in g.entries() if e.english}
-    added = 0
-    for t in terms:
-        english = t.get("english", "").strip()
-        if not english or english.lower() in existing_english:
-            continue
-        typ = t.get("type", "name")
-        g.add(GlossaryEntry(korean="", english=english,
-                            type=typ if typ in VALID_TYPES else "name",
-                            note=t.get("note", ""),
-                            pronoun=normalize_pronoun(t.get("pronoun", ""))))
-        existing_english.add(english.lower())
-        added += 1
-    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {"learned": added, "from_chapters": len(english_chs), **_locked_payload(g)}
+    # Load only now, after the model call, and under the lock: the worker queues newly
+    # found terms on every finished chapter, and a load taken before a minutes-long
+    # call would save a snapshot that predates them.
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary.load(cfg.paths.glossary_json)
+        existing_english = {e.english.lower() for e in g.entries() if e.english}
+        added = 0
+        for t in terms:
+            english = t.get("english", "").strip()
+            if not english or english.lower() in existing_english:
+                continue
+            typ = t.get("type", "name")
+            g.add(GlossaryEntry(korean="", english=english,
+                                type=typ if typ in VALID_TYPES else "name",
+                                note=t.get("note", ""),
+                                pronoun=normalize_pronoun(t.get("pronoun", ""))))
+            existing_english.add(english.lower())
+            added += 1
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        return {"learned": added, "from_chapters": len(english_chs), **_locked_payload(g)}
 
 
 def _sample_project_english(pid: str, cfg: Config) -> str:
@@ -2839,17 +2852,33 @@ async def detect_pronouns(pid: str) -> dict:
     except TranslatorError as exc:
         raise HTTPException(502, f"Couldn't read the chapters: {exc}")
 
-    filled, unresolved = [], []
+    detections, unresolved = [], []
     for e in targets:
         pronoun = detected.get(e.english.lower(), "")
         if pronoun:
-            e.pronoun = pronoun  # entries() returns the live objects — mutate in place
-            filled.append({"english": e.english, "pronoun": pronoun})
+            detections.append({"english": e.english, "pronoun": pronoun})
         else:
             unresolved.append(e.english)
-    if filled:
-        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    return {"filled": filled, "unresolved": unresolved, **_locked_payload(g)}
+
+    # Re-load and apply by name rather than saving the `g` read above. That snapshot
+    # predates a model call lasting minutes, during which the worker queues newly found
+    # terms into this same file on every finished chapter — writing the snapshot back
+    # would delete every one of them.
+    filled = []
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary.load(cfg.paths.glossary_json)
+        by_english = {e.english.lower(): e for e in g.entries() if e.english}
+        for row in detections:
+            entry = by_english.get(row["english"].lower())
+            # Only still-empty fields. A pronoun the user typed while this was running
+            # outranks a detected one, and the promise that a hand-set value is never
+            # overwritten has to hold across the call, not just before it.
+            if entry is not None and not entry.pronoun:
+                entry.pronoun = row["pronoun"]
+                filled.append(row)
+        if filled:
+            g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        return {"filled": filled, "unresolved": unresolved, **_locked_payload(g)}
 
 
 class BulkTermIn(BaseModel):
@@ -2898,12 +2927,16 @@ async def bulk_add_glossary(pid: str, body: GlossaryBulkAdd) -> dict:
     if not (plan.typed or plan.untyped or plan.updated):
         return {**_locked_payload(g), "added": [], "updated": [], "skipped": plan.skipped}
 
+    # Collected rather than applied to `g`: `g` is a snapshot used to plan against, and
+    # the classify call below can take minutes. Everything is written to a freshly
+    # loaded glossary at the end.
+    to_write: list[GlossaryEntry] = []
     added, updated = [], []
     for e in plan.typed:
-        g.add(e)
+        to_write.append(e)
         added.append({"english": e.english, "type": e.type})
     for e in plan.updated:
-        g.add(e)
+        to_write.append(e)
         updated.append({"english": e.english, "korean": e.korean, "type": e.type})
 
     classify_error = None
@@ -2925,11 +2958,18 @@ async def bulk_add_glossary(pid: str, body: GlossaryBulkAdd) -> dict:
                 typ = types.get(u["english"].lower(), "other")  # model omissions stay "other"
                 e = GlossaryEntry(korean=u["korean"], english=u["english"], type=typ,
                                   note=u["note"], pronoun=u["pronoun"], register=u["register"])
-                g.add(e)
+                to_write.append(e)
                 added.append({"english": e.english, "type": typ})
 
-    if added or updated:
-        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+    if to_write:
+        # Under the lock, onto a fresh load. The worker calls queue_new_terms on every
+        # finished chapter; saving the pre-plan snapshot would discard whatever it
+        # found while the user's paste was being classified.
+        with glossary_lock(cfg.paths.glossary_json):
+            g = Glossary.load(cfg.paths.glossary_json)
+            for e in to_write:
+                g.add(e)
+            g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
     resp = {**_locked_payload(g), "added": added, "updated": updated, "skipped": plan.skipped}
     if classify_error:
         resp["classify_error"] = classify_error
