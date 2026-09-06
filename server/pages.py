@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from translation_bot.atomic import atomic_write_text
+from translation_bot.atomic import atomic_write_text, quarantine_unreadable
 
 from .locks import file_lock
 from .projects import PROJECTS_DIR
@@ -149,6 +149,11 @@ def load_pages(pid: str) -> dict:
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        # Degrading to empty keeps one bad file from taking down the novel — but the
+        # caller then mutates this and saves it back, which would turn a MOMENTARY
+        # read failure (an antivirus holding the file, a sync client mid-write) into
+        # the permanent loss of every page transcribed from a photo. Keep the bytes.
+        quarantine_unreadable(path)
         return new_doc()
     if not isinstance(doc, dict):
         return new_doc()

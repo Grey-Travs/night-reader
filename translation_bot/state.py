@@ -12,7 +12,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .atomic import atomic_write_text
+from .atomic import atomic_write_text, quarantine_unreadable
 
 # Lifecycle: pending -> translated -> validated, or -> needs-review / failed.
 STATUS_PENDING = "pending"
@@ -47,6 +47,12 @@ class State:
         except (json.JSONDecodeError, OSError, ValueError):
             # A truncated/garbled state.json (e.g. the process was killed mid-write)
             # must not crash the whole library — start fresh for this project instead.
+            #
+            # But "start fresh" is how a MOMENTARY read failure became permanent: the
+            # caller mutates this empty state and mutate_state saves it back, erasing
+            # every chapter's status, usage and cost for the novel — which then reads
+            # as entirely untranslated and re-bills to redo. Keep the bytes first.
+            quarantine_unreadable(path)
             data = {}
         return cls(data if isinstance(data, dict) else {})
 

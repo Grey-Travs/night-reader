@@ -166,5 +166,93 @@ def test_concurrent_mutations_do_not_lose_each_other(tmp_path):
     assert not missing, f"lost updates for chapters {missing}"
 
 
+# ---- an unreadable file must never be silently replaced ---------------------
+# state.json, glossary.json and pages.json are all read with "a corrupt file must not
+# take down the library" fallbacks that return EMPTY. The caller then mutates that
+# empty value and saves it back — so a momentary read failure (an antivirus or a sync
+# client holding the file for an instant, which is ordinary on Windows) permanently
+# destroyed every chapter's progress / every locked term / every transcribed page.
+# The bytes are copied aside first now.
+
+def test_a_corrupt_file_is_preserved_before_it_is_treated_as_empty(tmp_path):
+    from translation_bot.atomic import quarantine_unreadable
+
+    path = tmp_path / "state.json"
+    path.write_text('{"chapters": {"1": {"status": "vali', encoding="utf-8")
+
+    kept = quarantine_unreadable(path)
+    assert kept is not None and kept.exists()
+    assert "status" in kept.read_text(encoding="utf-8"), "the real bytes must survive"
+
+
+def test_repeated_reads_do_not_pile_up_copies(tmp_path):
+    from translation_bot.atomic import quarantine_unreadable
+
+    path = tmp_path / "glossary.json"
+    path.write_text("[{broken", encoding="utf-8")
+    for _ in range(5):
+        quarantine_unreadable(path)
+    assert len(list(tmp_path.glob("glossary.json.unreadable-*"))) == 1
+
+
+def test_a_different_corruption_is_kept_separately(tmp_path):
+    from translation_bot.atomic import quarantine_unreadable
+
+    path = tmp_path / "state.json"
+    path.write_text("first damage", encoding="utf-8")
+    quarantine_unreadable(path)
+    path.write_text("second, different damage", encoding="utf-8")
+    quarantine_unreadable(path)
+    assert len(list(tmp_path.glob("state.json.unreadable-*"))) == 2
+
+
+def test_an_absent_or_empty_file_is_not_quarantined(tmp_path):
+    from translation_bot.atomic import quarantine_unreadable
+
+    assert quarantine_unreadable(tmp_path / "nope.json") is None
+    empty = tmp_path / "empty.json"
+    empty.write_text("", encoding="utf-8")
+    assert quarantine_unreadable(empty) is None
+    assert not list(tmp_path.glob("*.unreadable-*"))
+
+
+def test_state_load_preserves_a_corrupt_file(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text('{"chapters": {"7": {"status": "validated", "cost_usd": 1.2',
+                    encoding="utf-8")
+
+    loaded = State.load(path)
+    assert loaded.chapters == {}, "loading still degrades so the library stays usable"
+
+    kept = list(tmp_path.glob("state.json.unreadable-*"))
+    assert kept, "the real progress must be recoverable, not overwritten by the next save"
+    assert "validated" in kept[0].read_text(encoding="utf-8")
+
+
+def test_glossary_load_preserves_a_corrupt_file(tmp_path):
+    from translation_bot.glossary import Glossary
+
+    path = tmp_path / "glossary.json"
+    path.write_text('[{"korean": "유나", "english": "Yuna"', encoding="utf-8")
+
+    assert Glossary.load(path).entries() == []
+    kept = list(tmp_path.glob("glossary.json.unreadable-*"))
+    assert kept and "Yuna" in kept[0].read_text(encoding="utf-8")
+
+
+def test_pages_load_preserves_a_corrupt_manifest(tmp_path, monkeypatch):
+    import server.pages as P
+
+    monkeypatch.setattr(P, "PROJECTS_DIR", tmp_path)
+    pid = "abcdef012345"
+    (tmp_path / pid).mkdir()
+    P.pages_file(pid).write_text('{"pages": [{"text": "그는 문을 열었다."', encoding="utf-8")
+
+    assert P.load_pages(pid)["pages"] == []
+    kept = list((tmp_path / pid).glob("pages.json.unreadable-*"))
+    assert kept and "그는" in kept[0].read_text(encoding="utf-8"), \
+        "every page transcribed from a photo must be recoverable"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

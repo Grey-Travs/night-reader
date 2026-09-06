@@ -13,7 +13,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .atomic import atomic_write_text
+from .atomic import atomic_write_text, quarantine_unreadable
 from .locks import file_lock
 
 VALID_TYPES = {"name", "place", "skill", "term", "other"}
@@ -81,7 +81,13 @@ class Glossary:
             raw = path.read_text(encoding="utf-8")
             data = json.loads(raw) if raw.strip() else []
         except (json.JSONDecodeError, OSError, ValueError):
-            data = []  # a corrupt glossary must not break translation/library loading
+            # A corrupt glossary must not break translation/library loading. But the
+            # next approval loads this empty list, adds one term and saves it back —
+            # so a MOMENTARY read failure wiped every locked name and term, and the
+            # novel's spellings then drifted from the next chapter onward. Keep the
+            # bytes so the real glossary is recoverable.
+            quarantine_unreadable(path)
+            data = []
         if not isinstance(data, list):
             data = []
         return cls([GlossaryEntry.from_dict(d) for d in data if isinstance(d, dict)])

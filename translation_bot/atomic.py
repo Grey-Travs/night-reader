@@ -25,6 +25,7 @@ implementation to get right, hence this module.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 import uuid
@@ -52,6 +53,43 @@ def _replace_with_retry(src: Path, dst: Path) -> None:
                 raise
             time.sleep(delay)
             delay = min(delay * 2, _BACKOFF_MAX)
+
+
+def quarantine_unreadable(path: str | Path) -> Path | None:
+    """Preserve a file that EXISTS but could not be parsed, before anything overwrites it.
+
+    Several loaders here deliberately treat an unreadable file as empty so that one
+    corrupt file cannot take down the whole library. That is right for reading — but
+    the caller then mutates that empty value and saves it back, which turns a
+    *transient* read failure into permanent destruction:
+
+      - state.json  -> every chapter's status, usage and cost for a novel
+      - glossary.json -> every locked name and term
+      - pages.json  -> every page transcribed from a photo
+
+    and on Windows a transient failure is entirely ordinary: an antivirus or a
+    file-sync client holding the file open for a moment is enough.
+
+    Copying the bytes aside costs nothing on the happy path (this is only called from
+    an except branch) and makes that outcome recoverable. The copy is named by a hash
+    of its contents, so repeated reads of the same bad file don't pile up, and a
+    genuinely different corruption is still kept.
+    """
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None  # unreadable at the byte level too — nothing we can preserve
+    if not data:
+        return None  # an empty file holds nothing worth keeping
+    dest = path.with_name(f"{path.name}.unreadable-{hashlib.sha256(data).hexdigest()[:8]}")
+    if dest.exists():
+        return dest
+    try:
+        dest.write_bytes(data)
+    except OSError:
+        return None
+    return dest
 
 
 def atomic_write_text(path: str | Path, text: str, encoding: str = "utf-8") -> None:
