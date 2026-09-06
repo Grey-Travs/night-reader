@@ -37,16 +37,56 @@ def ensure_config() -> None:
         print("Created config.toml from the example.")
 
 
+def _newest_mtime(paths) -> float:
+    newest = 0.0
+    for path in paths:
+        try:
+            if path.is_file():
+                newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def _build_is_stale() -> bool:
+    """True when anything the build reads has changed since ``dist/`` was written.
+
+    Without this the launcher only ever built when ``dist/`` was ABSENT, so every run
+    after a source edit quietly served the previous interface. ``start.bat`` passes no
+    arguments, so ``--rebuild`` was unreachable from the double-click path, and the
+    in-app guide's advice ("close the app and run start.bat again") could not pick up
+    a frontend change no matter how many times you followed it.
+    """
+    built = _newest_mtime(p for p in DIST.rglob("*"))
+    if not built:
+        return True
+    sources = [WEB / "index.html", WEB / "package.json", WEB / "vite.config.js"]
+    src_dir = WEB / "src"
+    if src_dir.is_dir():
+        sources.extend(src_dir.rglob("*"))
+    return _newest_mtime(sources) > built
+
+
 def build_frontend(force: bool = False) -> None:
     if not VITE.exists():
         print("! Web dependencies aren't installed yet. Run setup first "
               "(see README: `npm install` inside web/).")
         return
-    if DIST.exists() and not force:
+    first_run = not DIST.exists()
+    if not first_run and not force and not _build_is_stale():
         return
-    print("Building the app interface (first run only)…")
+    print("Building the app interface (first run only)…" if first_run
+          else "The interface changed — rebuilding it…")
     # Call vite directly via node — robust across shells.
-    subprocess.run(["node", str(VITE), "build"], cwd=str(WEB), check=True)
+    try:
+        subprocess.run(["node", str(VITE), "build"], cwd=str(WEB), check=True)
+    except subprocess.CalledProcessError:
+        # A clear nudge beats a raw traceback, and an existing dist/ still runs.
+        print("! Building the interface failed."
+              + ("" if first_run else " Starting with the previous build instead."))
+    except FileNotFoundError:
+        print("! Node.js wasn't found, so the interface couldn't be rebuilt."
+              + ("" if first_run else " Starting with the previous build."))
 
 
 def open_browser_later() -> None:

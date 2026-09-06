@@ -144,6 +144,56 @@ def test_queue_keys_are_namespaced_by_kind():
         "every chapter operation shares one key so they cannot run at once"
 
 
+# ---- the browser must know about every kind the server can run --------------
+# There used to be four independent copies of TASK_LABEL in web/src, each with a
+# comment claiming to mirror app.py, and three had never learned about scanned-page
+# work. A running OCR job therefore displayed as "Translating chapter 7" in Activity,
+# Project Activity and the Review inbox - where 7 was a PAGE number. They are one
+# module now (web/src/tasks.js); this fails if a kind is added without it.
+
+def _tasks_js() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(os.path.dirname(here), "web", "src", "tasks.js")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_ui_has_a_label_for_every_server_task_kind():
+    source = _tasks_js()
+    for kind in A.TASK_KINDS:
+        assert f"'{kind}'" in source or f"{kind}:" in source, (
+            f"web/src/tasks.js has no label for {kind!r} — it would render as "
+            f"'Translating' and name a page as though it were a chapter")
+
+
+def test_the_ui_agrees_on_which_kinds_are_page_work():
+    source = _tasks_js()
+    marker = source.split("PAGE_TASK_KINDS", 1)[1].split("]", 1)[0]
+    for kind in A.PAGE_TASK_KINDS:
+        assert kind in marker, f"tasks.js does not treat {kind!r} as page work"
+    for kind in (A.TASK_TRANSLATE, A.TASK_RESOLVE, A.TASK_PRONOUNS):
+        assert kind not in marker, f"tasks.js wrongly treats {kind!r} as page work"
+
+
+def test_the_terminal_console_labels_page_work_too():
+    import server.console as C
+
+    for kind in A.PAGE_TASK_KINDS:
+        assert kind in C._TASK_NOTE, (
+            f"console._TASK_NOTE has no note for {kind!r} — an OCR run prints as an "
+            f"unlabelled chapter line")
+
+
+def test_the_terminal_console_styles_page_statuses():
+    import server.console as C
+    import server.pages as P
+
+    # Page work publishes the same "chapter" event type, so an unstyled status falls
+    # back to a grey dot and the terminal never says whether a page read well.
+    for status in (P.STATUS_OK, P.STATUS_NEEDS_CHECK, P.STATUS_EDITED, P.STATUS_SKIPPED):
+        assert status in C._STATUS_STYLE, f"console._STATUS_STYLE has no entry for {status!r}"
+
+
 # ---- the queue is read from request THREADS while the worker mutates it -----
 # /api/queue polls every few seconds and Apply checks whether a chapter is busy, both
 # on threadpool threads, while the worker pops and re-queues on the event loop.

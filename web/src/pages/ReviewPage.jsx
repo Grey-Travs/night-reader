@@ -2,14 +2,11 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { Badge, SkeletonRows } from '../components/ui'
+import { TASK_LABEL_BARE as TASK_LABEL } from '../tasks'
 import { useToast } from '../toast'
 
 // A mis-gendered chapter gets its own repair, so it needs telling apart from the rest.
 const isPronoun = (it) => (it.flags || []).includes('pronoun')
-
-// Mirrors TASK_LABEL in app.py — a row has to name the operation it is waiting on,
-// because translate / AI resolve / pronoun fix all share one queue per novel.
-const TASK_LABEL = { translate: 'Translating', resolve: 'AI resolve', pronouns: 'Fixing pronouns' }
 
 const keyOf = (pid, index) => `${pid}:${index}`
 

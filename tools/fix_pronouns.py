@@ -313,7 +313,14 @@ def main() -> int:
     args = ap.parse_args()
 
     targets = args.target or sorted(TARGETS)
-    projects = args.project or ["099de743f10a", "411cbcfcf239"]
+    # --project is REQUIRED. This used to default to two specific novel ids left over
+    # from the one-off run this tool was written for, so invoking it with no arguments
+    # rewrote the prose of whichever novels happened to hold those ids. The app has an
+    # interactive, per-chapter pronoun repair now; this stays as the offline
+    # deterministic alternative, but it must be aimed deliberately.
+    projects = args.project
+    if not projects:
+        ap.error("give at least one --project <id>; there is no default any more")
     backup_root = None
     if args.apply:
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -4,12 +4,13 @@ import { ProgressBar, StatCard } from '../components/ui'
 import TranslationConsole from '../components/TranslationConsole'
 import { useConfirm } from '../confirm'
 import { cacheHitRate, fmtCost, fmtPercent, fmtTokens } from '../format'
+import { describeTask } from '../tasks'
 
-// What the worker is doing to the chapter in flight. A repair rides the same queue as a
-// translation, so this bar has to name the operation or an AI resolve and a pronoun fix
-// both read as "Translating". Mirrors TASK_LABEL in server/app.py.
-const TASK_LABEL = { translate: 'Translating', resolve: 'AI resolve on', pronouns: 'Fixing pronouns in' }
-const TASK_NOUN = { translate: 'translating', resolve: 'the AI resolve on', pronouns: 'the pronoun fix on' }
+// How the in-flight item is described in the "stop" confirmation.
+const TASK_NOUN = {
+  translate: 'translating', resolve: 'the AI resolve on', pronouns: 'the pronoun fix on',
+  ocr: 'reading', 'ocr-verify': 'the double-check of',
+}
 
 // Live countdown to a target epoch-seconds timestamp, e.g. "in 42:10".
 function Countdown({ until }) {
@@ -66,7 +67,7 @@ export default function ProjectActivityPage() {
             <span className="inline-block h-2 w-2 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />
             {waiting ? 'Waiting for Claude to refresh'
               : queue.current != null
-                ? <>{TASK_LABEL[queue.kind] || TASK_LABEL.translate} <strong>chapter {queue.current}</strong></>
+                ? <>{describeTask(queue.kind, queue.current)}</>
                 : 'Queued'}
             {queue.pending.length > 0 && ` · ${queue.pending.length} waiting in queue`}
           </span>

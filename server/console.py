@@ -91,11 +91,22 @@ def _fmt_tokens(n: int) -> str:
 
 
 _STATUS_STYLE = {
+    # Chapter outcomes.
     "validated": ("✓", "green"),
     "needs-review": ("⚠", "yellow"),
     "failed": ("✗", "red"),
     "empty": ("·", "grey"),
     "english-source": ("·", "grey"),
+    # Scanned-page outcomes. Page work rides the same Job and publishes the same
+    # "chapter" event type, so without these every OCR result printed as the grey
+    # unknown-status fallback and the terminal never showed whether a page read well.
+    "ok": ("✓", "green"),
+    "needs-check": ("⚠", "yellow"),
+    "edited": ("✓", "cyan"),
+    "skipped": ("·", "grey"),
+    "queued": ("·", "grey"),
+    "ocr-running": ("·", "grey"),
+    "new": ("·", "grey"),
 }
 
 
@@ -108,8 +119,15 @@ def print_event(pid: str, ev: dict) -> None:
         pass
 
 
-# How a non-translation task is tagged on the chapter's console line.
-_TASK_NOTE = {"resolve": "· AI resolve", "pronouns": "· fixing pronouns"}
+# How a non-translation task is tagged on the item's console line. Mirrors TASK_LABEL
+# in app.py; the page kinds were missing, so an OCR run printed as an unlabelled
+# chapter line and read as a translation.
+_TASK_NOTE = {
+    "resolve": "· AI resolve",
+    "pronouns": "· fixing pronouns",
+    "ocr": "· reading a page",
+    "ocr-verify": "· checking a page",
+}
 
 
 def _render(pid: str, ev: dict) -> None:

@@ -3,10 +3,14 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 
 // Global quick-jump (Ctrl/⌘-K): type to filter novels and pages, Enter to go.
+// Keep this in step with NAV in AppShell.jsx — it had fallen two behind, so ⌘K could
+// not reach Scans or Upkeep at all.
 const STATIC = [
   { label: 'Library', sub: 'All your novels', to: '/' },
   { label: 'Activity', sub: 'Running translations', to: '/activity' },
   { label: 'Needs review', sub: 'Flagged chapters', to: '/review' },
+  { label: 'Scans', sub: 'Novels read from photos', to: '/scans' },
+  { label: 'Upkeep', sub: 'Glossary approvals · consistency', to: '/upkeep' },
   { label: 'Archive', sub: 'Finished novels', to: '/archive' },
   { label: 'Settings', sub: 'Model · effort · connections', to: '/settings' },
   { label: 'Guide', sub: 'How to use the app', to: '/guide' },

@@ -1,10 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
-
-// What the worker is doing. Translations, AI resolves and pronoun fixes all share one
-// queue per novel, so each row has to name its operation. Mirrors TASK_LABEL in app.py.
-const TASK_LABEL = { translate: 'Translating', resolve: 'AI resolve on', pronouns: 'Fixing pronouns in' }
+import { describeTask } from '../tasks'
 
 // Global activity — every novel with a running/queued job, live. Each row links to that
 // novel's own Activity tab (the chapter-by-chapter console).
@@ -64,7 +61,7 @@ export default function ActivityPage() {
                     {j.waiting.resume_at ? <> · resumes ~{new Date(j.waiting.resume_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</> : ''}
                   </span>
                 ) : j.current != null
-                  ? <span>{TASK_LABEL[j.kind] || TASK_LABEL.translate} <strong>chapter {j.current}</strong></span>
+                  ? <span>{describeTask(j.kind, j.current)}</span>
                   : <span>Queued</span>}
               </div>
               {j.pending.length > 0 && (

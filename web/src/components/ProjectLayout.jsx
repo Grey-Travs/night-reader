@@ -4,6 +4,7 @@ import { api } from '../api'
 import { errorTitle } from '../errors'
 import { useError } from './ErrorDialog'
 import { clearPausedJob, getLastRead, getPausedJob, setPausedJob } from '../prefs'
+import { TASK_LABEL } from '../tasks'
 
 // The persistent shell for one novel. It OWNS the translation job (the SSE stream,
 // the queue, pause/auto-resume and the live log) and the chapter list, and exposes
@@ -18,14 +19,8 @@ function notify(title, body) {
   try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body }) } catch { /* ignore */ }
 }
 
-// What the worker is doing, for log lines. Mirrors TASK_LABEL in app.py. The noun
-// ("chapter" / "page") is appended separately, because scanned-page work rides the
-// same queue and its index is a PAGE number, not a chapter number.
-const TASK_VERB = {
-  translate: 'Translating', resolve: 'AI resolve on', pronouns: 'Fixing pronouns in',
-  ocr: 'Reading', 'ocr-verify': 'Double-checking',
-}
-// Events for a page carry page_id; chapter events never do.
+// Events for a page carry page_id; chapter events never do. (kind alone also settles
+// it — see isPageTask in ../tasks — but page_id is the stronger signal on an event.)
 const noun = (e) => (e.page_id ? 'page' : 'chapter')
 const Noun = (e) => (e.page_id ? 'Page' : 'Chapter')
 
@@ -181,7 +176,7 @@ export default function ProjectLayout() {
           source: [], english: '', committed: '', chunk: [1, 1],
           started_at: e.started_at || Date.now() / 1000,
         })
-        setLog((l) => [...l, { kind: 'info', text: `${TASK_VERB[e.kind] || TASK_VERB.translate} ${noun(e)} ${e.index}…` }])
+        setLog((l) => [...l, { kind: 'info', text: `${TASK_LABEL[e.kind] || TASK_LABEL.translate} ${noun(e)} ${e.index}…` }])
       } else if (e.type === 'live') {
         // Catch-up frame for a stream that connected mid-chapter (reload, second tab).
         setLive({
