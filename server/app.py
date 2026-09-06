@@ -3504,15 +3504,18 @@ async def _run_worker(job: Job, cfg: Config) -> None:
             if outcome == "break":
                 break
             continue
+        # Refreshed on EVERY item, not only for repairs. `total` decides the pad width
+        # of the file this chapter is written to, and a Refresh button press, a newly
+        # added tab or another queued job can re-pad every file on disk while this
+        # worker runs. Holding the job-start count meant writing chapter-50.md beside
+        # an already-re-padded chapter-050.md: two files for one chapter, the reader
+        # seeing the wrong one, and no previous/ snapshot of either.
+        # get_chapters is cached and _output_total only globs for offline projects, so
+        # this is negligible next to a model call.
+        chapters = get_chapters(job.pid, cfg)
+        total = _output_total(job.pid, chapters)
+        by_index = {c.index: c for c in chapters}
         ch = by_index.get(idx)
-        if ch is None or kind != TASK_TRANSLATE:
-            # by_index is captured once when the worker starts; a repair queued later
-            # (and the fresh source its endpoint just fetched) would otherwise be read
-            # from a stale snapshot. get_chapters is cached, so this is cheap.
-            chapters = get_chapters(job.pid, cfg)
-            total = _output_total(job.pid, chapters)
-            by_index = {c.index: c for c in chapters}
-            ch = by_index.get(idx)
         if ch is None:
             job.queued.discard(_queue_key(idx, kind))
             job.current = None

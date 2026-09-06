@@ -40,6 +40,41 @@ def chapter_filename(index: int, total: int) -> str:
     return f"chapter-{index:0{_pad_width(total)}d}.md"
 
 
+def existing_chapter_file(directory: Path, index: int) -> Path | None:
+    """A file holding this chapter at ANY pad width, or None.
+
+    The canonical name is derived from a chapter COUNT, so it changes the moment a
+    novel crosses a digit boundary: 99 tabs to 100 turns ``chapter-07.md`` into
+    ``chapter-007.md``. Anything holding a count captured earlier — the translation
+    worker keeps one for its entire run — then looks for a name that no longer matches
+    what is on disk, and a finished translation goes invisible.
+
+    Resolving by INDEX makes a read independent of the count, which is what stops a
+    chapter the user already paid for from silently disappearing.
+    """
+    try:
+        candidates = list(directory.glob("chapter-*.md"))
+    except OSError:
+        return None
+    for f in candidates:
+        tail = f.stem.split("-", 1)[-1]
+        if tail.isdigit() and int(tail) == index:
+            return f
+    return None
+
+
+def chapter_path(directory: Path, index: int, total: int) -> Path:
+    """Where chapter ``index`` lives.
+
+    The canonical name wins when it exists; a file written at any other width is
+    honoured next; otherwise the canonical name is returned so a caller can create it.
+    """
+    canonical = directory / chapter_filename(index, total)
+    if canonical.exists():
+        return canonical
+    return existing_chapter_file(directory, index) or canonical
+
+
 def stripped_chapter(chapter: Chapter) -> Chapter:
     """The chapter as the MODEL should see it: export header and footer removed.
 
@@ -65,7 +100,22 @@ def stripped_chapter(chapter: Chapter) -> Chapter:
 def write_chapter_file(output_dir: Path, index: int, total: int, prose: str,
                        *, snapshot: bool = True) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / chapter_filename(index, total)
+    # Resolved by INDEX. If this chapter already exists under a different pad width,
+    # write to THAT file instead of creating a second one for the same chapter.
+    #
+    # `total` can be stale: the worker captures a chapter count at job start and keeps
+    # it for its whole run, while a Refresh press or a newly added tab re-pads every
+    # file underneath it. Writing at the captured width produced chapter-50.md beside
+    # an already-re-padded chapter-050.md — the reader saw one, the other was
+    # invisible, previous/ snapshotted neither (the canonical name did not exist, so
+    # the snapshot below was skipped), and the padding normalizer then refused to
+    # reconcile them because its destination was taken. A translation the user had
+    # paid for, marked validated in state.json, that could be neither read nor
+    # recovered.
+    #
+    # Renaming is deliberately NOT done here — that belongs to the padding normalizer,
+    # and doing it from a stale writer would drag the file back to an older name.
+    path = chapter_path(output_dir, index, total)
     # Guarded here rather than at each call site, because there are seven of them
     # (translate, repair, pronoun fix, manual save, auto-fix, accept, consistency
     # rename) and one that forgets silently loses a whole translation: two writers
@@ -100,8 +150,13 @@ def _write_chapter_locked(path: Path, output_dir: Path, index: int, total: int,
 
 
 def previous_chapter_path(output_dir: Path, index: int, total: int) -> Path:
-    """Path of the retained prior translation (sibling ``previous/`` folder)."""
-    return output_dir.parent / "previous" / chapter_filename(index, total)
+    """Path of the retained prior translation (sibling ``previous/`` folder).
+
+    Resolved by index: a snapshot taken while the novel had a different chapter count
+    carries that count's pad width, and looking for today's width would report "no
+    previous version" for a snapshot that is sitting right there.
+    """
+    return chapter_path(output_dir.parent / "previous", index, total)
 
 
 # The audit file records source + translation under fixed headings (see write_audit).
@@ -118,7 +173,10 @@ def read_audit_translation(audit_dir: Path, index: int, total: int) -> str | Non
     fixed-format doc — source, then the translation under a known heading — so the prose is
     everything after that heading."""
     try:
-        text = (audit_dir / chapter_filename(index, total)).read_text(encoding="utf-8")
+        # By index, not by count — the audit copy was written with whatever pad width
+        # was current at the time, and this is the ONLY copy of a needs-review
+        # chapter's translation.
+        text = chapter_path(audit_dir, index, total).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     if not text or _AUDIT_TRANSLATION_MARK not in text:
@@ -405,7 +463,9 @@ def current_translation(cfg: Config, index: int, total: int) -> str | None:
     that case, so the pronoun repair has to look in both places or it would find
     nothing to fix on the chapters that need it most.
     """
-    path = cfg.paths.output_dir / chapter_filename(index, total)
+    # Resolved by index, not by the count: the worker can have written this chapter
+    # under a different pad width than the caller's `total` implies.
+    path = chapter_path(cfg.paths.output_dir, index, total)
     if path.exists():
         try:
             return path.read_text(encoding="utf-8")

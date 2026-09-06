@@ -104,6 +104,78 @@ def test_zero_total_is_a_no_op(tmp_path, monkeypatch):
     assert (d / "chapter-01.md").exists()
 
 
+# ---- a stale count must never create a SECOND file for one chapter ----------
+# The worker captures a chapter count at job start and keeps it for its whole run,
+# while a Refresh press or a newly added tab re-pads every file underneath it. Writing
+# at the stale width then produced two files for one chapter: the reader saw one, the
+# other was invisible, previous/ captured neither, and the padding normalizer refused
+# to reconcile them because its destination was taken. A paid-for translation, marked
+# validated in state.json, that could be neither read nor recovered.
+
+def test_writing_with_a_stale_count_reuses_the_existing_file(tmp_path):
+    from translation_bot.pipeline import write_chapter_file
+
+    out = tmp_path / "chapters"
+    # Novel had 100 chapters: 3-digit names on disk.
+    write_chapter_file(out, 7, 100, "first translation")
+    assert (out / "chapter-007.md").exists()
+
+    # A worker holding the OLD count of 99 finishes the same chapter.
+    write_chapter_file(out, 7, 99, "second translation")
+
+    files = sorted(p.name for p in out.glob("chapter-*.md"))
+    assert files == ["chapter-007.md"], f"a stale count created a duplicate: {files}"
+    assert "second translation" in (out / "chapter-007.md").read_text(encoding="utf-8")
+
+
+def test_the_superseded_text_still_reaches_previous(tmp_path):
+    """The dual-file bug also skipped the previous/ snapshot, because the canonical
+    name did not exist yet — so neither copy was recoverable.
+
+    Note the file keeps the name it already had: renaming belongs to the padding
+    normalizer, not to a writer that may be holding a stale count.
+    """
+    from translation_bot.pipeline import write_chapter_file
+
+    out = tmp_path / "chapters"
+    write_chapter_file(out, 7, 99, "older translation")     # width 2
+    write_chapter_file(out, 7, 100, "newer translation")    # count grew to width 3
+
+    files = sorted(p.name for p in out.glob("chapter-*.md"))
+    assert len(files) == 1, f"one chapter must mean one file, got {files}"
+    assert "newer translation" in (out / files[0]).read_text(encoding="utf-8")
+
+    prev = tmp_path / "previous"
+    kept = list(prev.glob("chapter-*.md")) if prev.is_dir() else []
+    assert kept, "the superseded translation must be snapshotted, not lost"
+    assert "older translation" in kept[0].read_text(encoding="utf-8")
+
+
+def test_a_chapter_written_at_any_width_is_still_found(tmp_path):
+    from translation_bot.pipeline import chapter_path, write_chapter_file
+
+    out = tmp_path / "chapters"
+    write_chapter_file(out, 7, 99, "translated at width two")
+
+    # Every reader now passes the CURRENT count, which implies width 3.
+    found = chapter_path(out, 7, 100)
+    assert found.exists(), "a chapter written at another width must still resolve"
+    assert "width two" in found.read_text(encoding="utf-8")
+
+
+def test_the_canonical_name_wins_when_both_exist(tmp_path):
+    """Existing damage: both widths on disk. Resolution must be deterministic and
+    match what the app already shows, so a repair never swaps the visible text."""
+    from translation_bot.pipeline import chapter_path
+
+    out = tmp_path / "chapters"
+    out.mkdir()
+    (out / "chapter-07.md").write_text("older, hidden", encoding="utf-8")
+    (out / "chapter-007.md").write_text("newer, visible", encoding="utf-8")
+
+    assert chapter_path(out, 7, 100).name == "chapter-007.md"
+
+
 def test_variants_history_is_repadded_too(tmp_path, monkeypatch):
     """Per-paragraph history is named from the same stem as the chapter file.
 
