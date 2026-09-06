@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api'
+import { isFullyConnected, isReady } from '../ready'
 import ThemeToggle from './ThemeToggle'
 
 function Step({ done, n, title, children }) {
@@ -25,8 +26,11 @@ export default function SetupWizard({ status, setStatus, onDone }) {
   const [busy, setBusy] = useState('')
   const [error, setError] = useState(null)
 
-  const ready = status?.config_present && status?.claude_logged_in &&
-    status?.google_client_secret_present && status?.google_logged_in
+  // `ready` gates the exit button, so it MUST use the same rule as App.jsx — this
+  // wizard replaces the entire route tree, and it has no Esc, no back and no route of
+  // its own. When the two rules disagreed, a user without Google could never leave.
+  const ready = isReady(status)
+  const allConnected = isFullyConnected(status)
 
   async function run(name, fn) {
     setBusy(name)
@@ -66,7 +70,7 @@ export default function SetupWizard({ status, setStatus, onDone }) {
                 : 'Open Claude Code and sign in with your Claude Max or Pro plan, then re-check below.'}
             </Step>
 
-            <Step done={status?.google_client_secret_present} n={3} title="Add your Google credential">
+            <Step done={status?.google_client_secret_present} n={3} title="Add your Google credential (optional)">
               {status?.google_client_secret_present ? 'Google credential found.' : (
                 <>
                   Create a free Google OAuth <strong>Desktop app</strong> credential (Google Cloud
@@ -77,7 +81,7 @@ export default function SetupWizard({ status, setStatus, onDone }) {
               )}
             </Step>
 
-            <Step done={status?.google_logged_in} n={4} title="Connect Google">
+            <Step done={status?.google_logged_in} n={4} title="Connect Google (optional)">
               {status?.google_logged_in ? 'Google connected — read-only Docs access.' : (
                 <button
                   onClick={() => run('google', api.googleLogin)}
@@ -92,11 +96,28 @@ export default function SetupWizard({ status, setStatus, onDone }) {
 
           {error && <div className="mb-4 rounded-btn px-3 py-2 text-sm pill-review">{error}</div>}
 
+          {/* Steps 1-2 are all the app actually needs. Saying so here stops the exit
+              button looking broken when it lights up with 3-4 still outstanding. */}
+          {ready && !allConnected && (
+            <div className="mb-4 rounded-btn px-3 py-2 text-sm pill-queued">
+              You're ready to go. Steps 3 and 4 are only needed to read novels from
+              Google Docs — you can add them later from Settings.
+            </div>
+          )}
+
           <div className="mt-2 flex items-center justify-between border-t border-line pt-5">
             <button onClick={() => run('refresh', async () => {})} className="btn btn-quiet text-sm">↻ Re-check</button>
-            <button onClick={onDone} disabled={!ready} className="btn btn-primary px-5 py-2">
-              {ready ? 'Go to my library →' : 'Finish the steps above'}
-            </button>
+            <div className="flex items-center gap-2">
+              {/* Always enabled. This wizard replaces the whole app, so it must never
+                  be possible to get stuck inside it — Google in particular is optional
+                  and a user who only reads photos or pasted text never needs it. */}
+              <button onClick={onDone} className="btn btn-quiet px-3 py-2 text-sm">
+                Skip for now
+              </button>
+              <button onClick={onDone} disabled={!ready} className="btn btn-primary px-5 py-2">
+                {ready ? 'Go to my library →' : 'Finish steps 1 and 2'}
+              </button>
+            </div>
           </div>
         </div>
       </div>

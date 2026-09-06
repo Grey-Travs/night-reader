@@ -253,6 +253,20 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     finally { setAccepting(false) }
   }
 
+  // Paragraph spans of the translation as it currently stands. The server addresses a
+  // rewrite by this same ordinal (see web/src/blocks.js — it mirrors paragraphs.py).
+  //
+  // These two MUST stay above the keydown effect below: its dependency array names
+  // `openParagraph`, and a dependency array is an ordinary expression evaluated during
+  // render. Declaring it after the effect put it in the temporal dead zone, so every
+  // render threw ReferenceError and the reader never displayed at all.
+  const blocks = useMemo(() => splitBlocks(data?.translation || ''), [data?.translation])
+
+  const openParagraph = useCallback((k) => {
+    const block = blocks[k]
+    if (block) setParaPanel({ paragraph: k, text: block.text })
+  }, [blocks])
+
   // Neighbour chapters for prev/next (across the whole novel, in order).
   const order = (chapters || []).map((c) => c.index)
   const pos = order.indexOf(index)
@@ -421,15 +435,6 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     () => (data?.source || '').split(/\n{2,}/).map((p) => p.trim()).filter(Boolean),
     [data?.source],
   )
-
-  // Paragraph spans of the translation as it currently stands. The server addresses a
-  // rewrite by this same ordinal (see web/src/blocks.js — it mirrors paragraphs.py).
-  const blocks = useMemo(() => splitBlocks(data?.translation || ''), [data?.translation])
-
-  const openParagraph = useCallback((k) => {
-    const block = blocks[k]
-    if (block) setParaPanel({ paragraph: k, text: block.text })
-  }, [blocks])
 
   const glossRegex = useMemo(() => {
     if (!prefs.glossaryTips || glossLookup.size === 0) return null
