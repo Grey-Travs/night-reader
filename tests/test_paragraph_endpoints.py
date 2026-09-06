@@ -98,6 +98,24 @@ def test_a_fresh_chapter_has_no_history(client, novel):
     assert res["groups"] == [] and res["paragraph_count"] == 3
 
 
+def test_reading_the_history_writes_nothing_to_disk(client, novel):
+    """It is a GET. It used to enter mutate_variants, which saves on exit, so simply
+    opening a chapter created and rewrote variants/chapter-NN.json — mkdir, serialise,
+    fsync, replace — even for a chapter that had never been rewritten."""
+    pid, _cfg = novel
+    path = V.variants_path(pid, 1, 1)
+
+    assert client.get(f"/api/projects/{pid}/chapters/1/variants").status_code == 200
+    assert not path.exists(), "reading paragraph history must not create a file"
+
+    # And when history DOES exist, reading must not rewrite it.
+    _rephrase(client, pid)
+    assert path.exists()
+    before = path.read_bytes()
+    client.get(f"/api/projects/{pid}/chapters/1/variants")
+    assert path.read_bytes() == before, "a GET must leave the file byte-identical"
+
+
 def test_retranslate_is_available_when_the_korean_lines_up(client, novel):
     pid, _cfg = novel
     res = client.get(f"/api/projects/{pid}/chapters/1/variants").json()

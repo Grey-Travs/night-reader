@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .atomic import atomic_write_text
+from .locks import file_lock
 
 VALID_TYPES = {"name", "place", "skill", "term", "other"}
 
@@ -222,6 +223,24 @@ def save_pending(path: str | Path, items: list[dict]) -> None:
     atomic_write_text(Path(path), json.dumps(items, ensure_ascii=False, indent=2))
 
 
+def glossary_lock(any_glossary_path: str | Path):
+    """The lock guarding one project's glossary.
+
+    ``glossary.json`` and ``glossary_pending.json`` are two halves of one thing —
+    approving a term removes it from pending *and* adds it to the locked list — so a
+    single lock covers both, keyed on the folder they share. The key is synthetic; no
+    file of that name is ever created.
+
+    Needed because the translation worker calls :func:`queue_new_terms` on every
+    finished chapter, on a threadpool thread, while the user is approving terms in the
+    browser. Both sides did load → modify → save with nothing ordering them, so
+    whichever saved last silently discarded the other's work: a chapter's six newly
+    found names vanished because three terms were approved at the same moment. The
+    atomic write guarantees the file isn't torn; it guarantees nothing about ordering.
+    """
+    return file_lock(Path(any_glossary_path).parent / "_glossary")
+
+
 def queue_new_terms(
     pending_path: str | Path,
     glossary: Glossary,
@@ -234,6 +253,16 @@ def queue_new_terms(
     Conflicts (same Korean term, different English) are kept and flagged rather
     than silently overwriting an established spelling.
     """
+    with glossary_lock(pending_path):
+        return _queue_new_terms_locked(pending_path, glossary, new_terms, chapter_index)
+
+
+def _queue_new_terms_locked(
+    pending_path: str | Path,
+    glossary: Glossary,
+    new_terms: list[dict],
+    chapter_index: int,
+) -> int:
     pending = load_pending(pending_path)
     pending_keys = {(p["korean"], p["english"]) for p in pending}
     added = 0

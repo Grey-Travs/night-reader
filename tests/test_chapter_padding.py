@@ -104,6 +104,38 @@ def test_zero_total_is_a_no_op(tmp_path, monkeypatch):
     assert (d / "chapter-01.md").exists()
 
 
+def test_variants_history_is_repadded_too(tmp_path, monkeypatch):
+    """Per-paragraph history is named from the same stem as the chapter file.
+
+    It was left out of the re-pad, so a novel crossing 99 -> 100 chapters orphaned
+    every rewrite the reader had kept: the app looked for chapter-007.json while the
+    file on disk was still chapter-07.json, and the history silently vanished.
+    """
+    import server.projects as pj
+
+    monkeypatch.setattr(pj, "PROJECTS_DIR", tmp_path)
+    d = tmp_path / "novel" / "variants"
+    d.mkdir(parents=True)
+    (d / "chapter-07.json").write_text('{"version": 1, "groups": []}', encoding="utf-8")
+
+    _normalize_chapter_padding("novel", 100)
+
+    assert (d / "chapter-007.json").exists(), "paragraph history must follow the re-pad"
+    assert not (d / "chapter-07.json").exists()
+
+
+def test_repadding_leaves_unrelated_json_alone(tmp_path, monkeypatch):
+    import server.projects as pj
+
+    monkeypatch.setattr(pj, "PROJECTS_DIR", tmp_path)
+    d = tmp_path / "novel" / "variants"
+    d.mkdir(parents=True)
+    (d / "notes.json").write_text("{}", encoding="utf-8")
+
+    _normalize_chapter_padding("novel", 100)
+    assert (d / "notes.json").exists()
+
+
 # ---- the CALLER has to pass the right total ---------------------------------
 # Every test above exercises _normalize_chapter_padding directly. The bug was one
 # level up: get_chapters passed len(_chapter_cache[pid]) instead of _output_total.

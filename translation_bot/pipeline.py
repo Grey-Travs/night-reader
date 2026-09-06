@@ -474,8 +474,15 @@ def fix_pronouns_chapter(
         )
 
     write_chapter_file(cfg.paths.output_dir, chapter.index, total, after)
-    validation = validate_translation(chapter, after, cfg.validation,
-                                      glossary.relevant_to(chapter.text))
+    # stripped_chapter, like every other judge (process_chapter, _chapter_problems,
+    # _recheck_saved, apply_paragraph). Measuring against the RAW tab counts the
+    # Google-Docs export header and closing copyright notice as source, which
+    # inflates the source length and drives the ratio under the floor — so a chapter
+    # whose pronouns had just been repaired successfully was written to disk AND
+    # flagged needs-review for a failure that wasn't real.
+    source = stripped_chapter(chapter)
+    validation = validate_translation(source, after, cfg.validation,
+                                      glossary.relevant_to(source.text))
     status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW
     state.update(
         chapter.index,

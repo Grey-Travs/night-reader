@@ -55,6 +55,7 @@ from translation_bot.glossary import (
     VALID_TYPES,
     Glossary,
     GlossaryEntry,
+    glossary_lock,
     load_pending,
     normalize_pronoun,
     save_pending,
@@ -325,24 +326,30 @@ def _normalize_chapter_padding(pid: str, total: int) -> None:
     ``chapter-001.md`` while the files on disk are still ``chapter-01.md``, and
     a fully translated novel reads as untranslated over its Korean source.
     Re-pad on load so the library heals itself instead. Idempotent, and it
-    never overwrites a name that is already taken."""
+    never overwrites a name that is already taken.
+
+    ``variants/`` is included because per-paragraph history is named from the same
+    ``chapter_filename`` stem. It was left out originally, so a novel crossing 99 to
+    100 chapters silently orphaned every rewrite the reader had kept: the app looked
+    for ``chapter-007.json`` while the file on disk was still ``chapter-07.json``."""
     if total <= 0:
         return
     width = max(2, len(str(total)))
     base = pj.PROJECTS_DIR / pid
-    for sub in ("chapters", "previous", "audit"):
+    for sub, ext in (("chapters", "md"), ("previous", "md"), ("audit", "md"),
+                     ("variants", "json")):
         d = base / sub
         if not d.is_dir():
             continue
         try:
-            stale = list(d.glob("chapter-*.md"))
+            stale = list(d.glob(f"chapter-*.{ext}"))
         except OSError:
             continue
         for f in stale:
             tail = f.stem.split("-", 1)[-1]
             if not tail.isdigit() or len(tail) == width:
                 continue
-            dest = d / f"chapter-{int(tail):0{width}d}.md"
+            dest = d / f"chapter-{int(tail):0{width}d}.{ext}"
             if dest.exists():
                 continue  # a newer translation already owns the canonical name
             try:
@@ -1957,11 +1964,17 @@ def _alignment_for(pid: str, ch: Chapter, blocks, k: int):
 def chapter_variants(pid: str, index: int) -> dict:
     """This chapter's paragraph history, re-anchored to the text as it stands now."""
     _project, cfg, ch, total, _text, blocks = _paragraph_context(pid, index)
+    # Read-only: this is a GET, and it used to enter mutate_variants, which saves
+    # unconditionally on exit. Every single chapter you opened therefore created and
+    # rewrote projects/<id>/variants/chapter-NN.json — mkdir, serialise, fsync,
+    # replace — even for a chapter with no rewrite history at all. Re-anchoring is
+    # recomputed on every read anyway, so nothing is lost by not persisting it; the
+    # paths that actually change something (generate, apply, discard) still do.
     path = variants_mod.variants_path(pid, index, total)
-    with variants_mod.mutate_variants(path, index) as doc:
-        # A whole-chapter edit may have moved paragraphs since these were written.
-        variants_mod.relocate(doc, [b.text for b in blocks])
-        groups = [dict(g) for g in doc.get("groups", [])]
+    doc = variants_mod.load_variants(path, index)
+    # A whole-chapter edit may have moved paragraphs since these were written.
+    variants_mod.relocate(doc, [b.text for b in blocks])
+    groups = [dict(g) for g in doc.get("groups", [])]
     _alignment, reason = _alignment_for(pid, ch, blocks, 0)
     return {"index": index, "paragraph_count": len(blocks), "groups": groups,
             "retranslate_available": reason is None, "retranslate_reason": reason}
@@ -2529,15 +2542,21 @@ class GlossaryReview(BaseModel):
 @app.post("/api/projects/{pid}/glossary/review")
 def review_glossary(pid: str, review: GlossaryReview) -> dict:
     _, cfg = project_cfg(pid)
-    g = Glossary.load(cfg.paths.glossary_json)
-    for t in review.approve:
-        g.add(GlossaryEntry(korean=t.korean, english=t.english, type=t.type, note=t.note,
-                            pronoun=normalize_pronoun(t.pronoun),
-                            register=t.speech_register.strip()))
-    g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
-    decided = {t.korean for t in review.approve} | set(review.reject)
-    remaining = [p for p in load_pending(cfg.paths.glossary_pending) if p["korean"] not in decided]
-    save_pending(cfg.paths.glossary_pending, remaining)
+    # Under the glossary lock: the translation worker calls queue_new_terms on every
+    # finished chapter, and it reads pending too. Without ordering, a chapter's newly
+    # found names were discarded by whichever save landed last — approving three terms
+    # at the wrong moment quietly threw away the six the worker had just queued.
+    with glossary_lock(cfg.paths.glossary_json):
+        g = Glossary.load(cfg.paths.glossary_json)
+        for t in review.approve:
+            g.add(GlossaryEntry(korean=t.korean, english=t.english, type=t.type, note=t.note,
+                                pronoun=normalize_pronoun(t.pronoun),
+                                register=t.speech_register.strip()))
+        g.save(cfg.paths.glossary_json, cfg.paths.glossary_md)
+        decided = {t.korean for t in review.approve} | set(review.reject)
+        remaining = [p for p in load_pending(cfg.paths.glossary_pending)
+                     if p["korean"] not in decided]
+        save_pending(cfg.paths.glossary_pending, remaining)
     return {"approved": len(review.approve), "rejected": len(review.reject), "pending": len(remaining)}
 
 
