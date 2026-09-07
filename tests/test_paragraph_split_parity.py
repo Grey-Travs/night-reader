@@ -43,6 +43,21 @@ CASES = [
     "text\n\n33.\n\nmore",                        # the author's own part divider
     "a\n\n***\n\nb",
     "\n\n\nlead\n\ntail\n\n\n",
+    # The six characters where `\s` itself differs between the two engines. Every case
+    # above is built from ordinary spaces and newlines, so the parity test passed for
+    # months while the two splitters genuinely disagreed. Python's `\s` matches
+    # \x1c-\x1f and \x85; JavaScript's matches ﻿. A blank line carrying one of
+    # these split on one side only, and every rewrite on such a chapter was refused
+    # with a 409 that nothing explained.
+    "a\n﻿\nb",                               # BOM — survives a copy-paste
+    "a\n\x85\nb",                                 # NEL
+    "a\n\x1c\nb",
+    "a\n\x1d\nb",
+    "a\n\x1e\nb",
+    "a\n\x1f\nb",
+    "a\n ﻿ \nb",                             # mixed with ordinary spaces
+    "one\n\ntwo\n﻿\nthree\n\nfour",          # mid-chapter, so ordinals shift
+    "﻿one\n\ntwo",                           # a BOM at the very start of a file
 ]
 
 _NODE = shutil.which("node")
@@ -69,6 +84,32 @@ def test_the_two_splitters_agree_exactly():
             f"blocks.js and paragraphs.py disagree on {text!r} — a rewrite would land "
             f"on the wrong paragraph"
         )
+
+
+# The six characters are worth their own test as well as their entry in CASES: the
+# list above proves the two agree, this proves they agree on the RIGHT answer. Both
+# treating an invisible character as content would be "agreement" too, and would still
+# be wrong — a line that looks blank to the reader is a paragraph break.
+
+DIVERGENT = {
+    "﻿": "BOM (JavaScript's \\s matches it, Python's does not)",
+    "\x85": "NEL (Python's \\s matches it, JavaScript's does not)",
+    "\x1c": "file separator (Python only)",
+    "\x1d": "group separator (Python only)",
+    "\x1e": "record separator (Python only)",
+    "\x1f": "unit separator (Python only)",
+}
+
+
+@pytest.mark.parametrize("char,why", list(DIVERGENT.items()), ids=list(DIVERGENT.values()))
+def test_an_invisible_character_on_a_blank_line_still_ends_the_paragraph(char, why):
+    assert [b.text for b in split_blocks(f"a\n{char}\nb")] == ["a", "b"], why
+
+
+def test_the_same_character_inside_a_line_is_content_not_a_break():
+    """Only a whole blank LINE separates paragraphs. Widening the class must not start
+    splitting mid-sentence on a stray control character."""
+    assert [b.text for b in split_blocks("a\x1cb\n\nc")] == ["a\x1cb", "c"]
 
 
 if __name__ == "__main__":

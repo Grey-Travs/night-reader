@@ -27,11 +27,14 @@ from .sanitize import (
     remove_korean_echoes,
     strip_reasoning,
 )
+from .textsplit import SEP_RE, SEP_RUN_RE, lstrip_ws, rstrip_ws, strip_ws
 
 # The paragraph separator used everywhere else in this app (validate._paragraphs,
-# sanitize, epub, _paragraph_count, the reader's SourceProse). Kept identical on
-# purpose — a second, subtly different splitter would misaddress paragraphs.
-_SEP_RE = re.compile(r"\n\s*\n")
+# sanitize, epub, _paragraph_count, the reader's SourceProse) AND in web/src/blocks.js.
+# Imported rather than re-declared: it had been written out inline in fourteen places,
+# and the JavaScript one was not the same expression — `\s` differs between the two
+# languages. See translation_bot/textsplit.
+_SEP_RE = SEP_RE
 
 _QUOTE_RE = re.compile(r"[\"“”「」『』]")
 _WS_RE = re.compile(r"\s+")
@@ -77,12 +80,17 @@ class ParagraphCheck:
 # ---- splitting and splicing --------------------------------------------------
 
 def _block(text: str, start: int, end: int, i: int) -> Block | None:
+    # strip_ws, not str.strip: the span is what makes a splice lossless, so the
+    # whitespace skipped here has to be exactly what blocks.js trims. str.strip()
+    # does not remove a BOM and JavaScript's trim() does, which put every span in a
+    # BOM-prefixed chapter off by one on the server side only.
     raw = text[start:end]
-    if not raw.strip():
+    stripped = strip_ws(raw)
+    if not stripped:
         return None
-    lead = len(raw) - len(raw.lstrip())
-    trail = len(raw) - len(raw.rstrip())
-    return Block(i=i, start=start + lead, end=end - trail, text=raw.strip())
+    lead = len(raw) - len(lstrip_ws(raw))
+    trail = len(raw) - len(rstrip_ws(raw))
+    return Block(i=i, start=start + lead, end=end - trail, text=stripped)
 
 
 def split_blocks(text: str) -> list[Block]:
@@ -119,7 +127,7 @@ def normalize_paragraph(s: str) -> str:
     """
     s = (s or "").strip()
     s = re.sub(r"[ \t]+\n", "\n", s)     # trailing spaces before a newline
-    s = re.sub(r"\n\s*\n+", "\n", s)     # blank lines -> a single line break
+    s = SEP_RUN_RE.sub("\n", s)          # blank lines -> a single line break
     return s.strip()
 
 

@@ -13,6 +13,7 @@ import re
 import uuid
 import zipfile
 from pathlib import Path
+from .textsplit import SEP_RE
 
 _CSS = """\
 body { font-family: Georgia, 'Times New Roman', serif; line-height: 1.6; margin: 5%; }
@@ -35,7 +36,7 @@ def _inline(text: str) -> str:
 
 def _markdown_to_xhtml(md: str) -> str:
     """Convert the small Markdown subset the translator emits into XHTML body."""
-    blocks = re.split(r"\n\s*\n", (md or "").strip())
+    blocks = SEP_RE.split((md or "").strip())
     parts: list[str] = []
     for block in blocks:
         block = block.strip()

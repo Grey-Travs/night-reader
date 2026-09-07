@@ -16,6 +16,7 @@ phrases that characters actually say ("I apologize", "let me check") are NOT sig
 from __future__ import annotations
 
 import re
+from .textsplit import SEP_RE
 
 # ALWAYS signals — phrases/notation that don't occur in real web-novel prose, so they
 # mark a block as meta even if it also contains dialogue quotes.
@@ -174,7 +175,7 @@ def strip_source_header(text: str) -> tuple[str, str | None]:
 
     Stops at the first real line, so only the contiguous header at the very top is touched.
     """
-    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    blocks = SEP_RE.split((text or "").strip())
     number: str | None = None
     i = 0
     while i < len(blocks):
@@ -216,7 +217,7 @@ def strip_export_footer(text: str) -> str:
     part of the story. The length cap keeps a long paragraph that merely mentions a
     copyright holder from being mistaken for the notice.
     """
-    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    blocks = SEP_RE.split((text or "").strip())
     j = len(blocks)
     while j > 0:
         b = blocks[j - 1].strip()
@@ -231,7 +232,7 @@ def remove_korean_echoes(text: str) -> tuple[str, int]:
     """Remove paragraphs that are predominantly untranslated Korean — source the model
     echoed and then translated right after, leaving a redundant Korean copy. Keeps short
     bits (e.g. an in-line sound effect); only whole Korean sentences are dropped."""
-    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    blocks = SEP_RE.split((text or "").strip())
     kept, removed = [], 0
     for b in blocks:
         if _is_korean_echo(b):
@@ -258,7 +259,7 @@ def remove_snippets(text: str, snippets: list[str]) -> tuple[str, int]:
 
 def find_leaks(text: str) -> list[str]:
     """Return meta/reasoning blocks present in the text (empty if clean)."""
-    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    blocks = SEP_RE.split((text or "").strip())
     return [b.strip()[:160] for b in blocks if _block_is_meta(b)]
 
 
@@ -280,7 +281,7 @@ def strip_reasoning(text: str, *, keep_korean: bool = False) -> tuple[str, list[
     the whole page.
     """
     text = (text or "").strip()
-    blocks = re.split(r"\n\s*\n", text)
+    blocks = SEP_RE.split(text)
     flags = [_block_is_meta(b) for b in blocks]
     if not any(flags):
         return text, []

@@ -97,6 +97,7 @@ from . import pages as pages_mod
 from . import projects as pj
 from . import variants as variants_mod
 from .bulk import MAX_ROWS, MAX_UNTYPED, prepare_bulk_rows, split_flat
+from translation_bot.textsplit import SEP_RE
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.toml"
@@ -3397,7 +3398,7 @@ def _paragraph_count(text: str) -> int:
     and the source-alignment highlight."""
     if not text:
         return 0
-    return len([p for p in re.split(r"\n\s*\n", text) if p.strip()])
+    return len([p for p in SEP_RE.split(text) if p.strip()])
 
 
 def _rate_limit_resume_at(exc: Exception, strikes: int) -> tuple[float, float | None]:

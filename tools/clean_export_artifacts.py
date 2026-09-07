@@ -55,6 +55,7 @@ from translation_bot.sanitize import (  # noqa: E402
     strip_source_header,
 )
 from translation_bot.text_source import records_to_chapters  # noqa: E402
+from translation_bot.textsplit import SEP_RE  # noqa: E402
 
 PROJECTS = pathlib.Path(__file__).resolve().parent.parent / "projects"
 
@@ -119,7 +120,7 @@ def source_numbers(pdir: pathlib.Path) -> dict[int, str] | None:
 
 def clean_prose(prose: str, number: str | None) -> tuple[str, bool, bool]:
     """Return (cleaned, dropped_number, dropped_notice) for one chapter's English."""
-    blocks = [b for b in re.split(r"\n\s*\n", (prose or "").strip()) if b.strip()]
+    blocks = [b for b in SEP_RE.split((prose or "").strip()) if b.strip()]
     dropped_number = False
     if blocks and is_chapter_number_block(blocks[0], number):
         blocks = blocks[1:]

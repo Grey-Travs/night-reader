@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 
 from .docs_extract import Chapter, _strip_invisibles
+from .textsplit import SEP_RE
 
 # A line that introduces a chapter (English or Korean web-novel conventions).
 _HEADING_RE = re.compile(
@@ -37,7 +38,7 @@ _DEFAULT_SEP_RE = re.compile(r"^\s*(?:-{3,}|={3,}|\*{3,}|#{3,}|_{3,})\s*$")
 def _paragraphs(block: str) -> list[str]:
     """Split a chapter block into paragraphs on blank lines, dropping empties."""
     block = _strip_invisibles(block)
-    paras = [p.strip() for p in re.split(r"\n\s*\n", block)]
+    paras = [p.strip() for p in SEP_RE.split(block)]
     return [p for p in paras if p]
 
 

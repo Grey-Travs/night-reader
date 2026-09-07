@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from .config import ValidationConfig
 from .docs_extract import Chapter, _QUOTE_RE
 from .sanitize import find_leaks, has_korean_leak, korean_fraction
+from .textsplit import SEP_RE
 
 
 @dataclass
@@ -50,7 +51,7 @@ class ValidationResult:
 
 
 def _paragraphs(text: str) -> list[str]:
-    return [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+    return [p for p in SEP_RE.split(text.strip()) if p.strip()]
 
 
 def _nonspace_len(text: str) -> int:

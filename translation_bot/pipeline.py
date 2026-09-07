@@ -30,6 +30,7 @@ from .translator import (
     Translator,
 )
 from .validate import ValidationResult, validate_translation
+from .textsplit import SEP_RE
 
 
 def _pad_width(total: int) -> int:
@@ -94,7 +95,7 @@ def stripped_chapter(chapter: Chapter) -> Chapter:
     if not clean or clean == chapter.text:
         return chapter
     return Chapter(index=chapter.index, title=chapter.title,
-                   paragraphs=[p for p in re.split(r"\n\s*\n", clean) if p.strip()])
+                   paragraphs=[p for p in SEP_RE.split(clean) if p.strip()])
 
 
 def write_chapter_file(output_dir: Path, index: int, total: int, prose: str,
@@ -507,7 +508,7 @@ def fix_pronouns_chapter(
     if hooks is not None:
         # Show the text being corrected in the live console's left-hand column, the
         # same slot the Korean source occupies during a translation.
-        hooks.source([p for p in re.split(r"\n\s*\n", before) if p.strip()])
+        hooks.source([p for p in SEP_RE.split(before) if p.strip()])
 
     after, usage, cost = translator.fix_pronouns(before, conflicts, hooks=hooks)
     if usage:
