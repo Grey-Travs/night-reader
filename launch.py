@@ -100,6 +100,17 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def app_is_running() -> bool:
+    """Whether an instance of the app is already serving on the usual port.
+
+    A heuristic — it cannot tell this app from anything else that happens to hold
+    the port, and it cannot see an instance started by hand on a different one. Good
+    enough to stop the common mistake (running a repair tool with the app open),
+    which is what ``tools/repair_library.py`` uses it for.
+    """
+    return _port_in_use(HOST, PORT)
+
+
 def main() -> None:
     # Dependencies present? (A clear nudge beats a raw ImportError traceback.)
     try:
@@ -110,7 +121,7 @@ def main() -> None:
         return
 
     # Already running? Don't crash with "address already in use" — just open it.
-    if _port_in_use(HOST, PORT):
+    if app_is_running():
         print(f"\n  The app is already running at {URL} — opening it in your browser.\n")
         webbrowser.open(URL)
         return

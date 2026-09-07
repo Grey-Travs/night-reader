@@ -25,11 +25,26 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest  # noqa: E402
+
+import tools.repair_library as R  # noqa: E402
 from tools.repair_library import (  # noqa: E402
     canonical_width,
     repair_library,
     repair_pages,
 )
+
+
+@pytest.fixture(autouse=True)
+def app_closed(monkeypatch):
+    """No test opens a socket.
+
+    The tool detects a running app by probing its port, which would otherwise make
+    this suite depend on whether the user happens to have Night Reader open — and
+    would probe the network on every call. Tests that care about the running case
+    patch this again themselves.
+    """
+    monkeypatch.setattr(R, "app_is_running", lambda: False)
 
 
 # ---- fixtures ----------------------------------------------------------------
@@ -293,7 +308,7 @@ def test_a_stranded_page_is_reset_to_new(tmp_path):
     f.write_text(json.dumps(_pages_doc("ocr-running", "queued", "ok")), encoding="utf-8")
     _age(f, 120)
 
-    report = repair_library(tmp_path, apply=True)
+    report = repair_library(tmp_path, apply=True, app_running=False)
 
     saved = json.loads(f.read_text(encoding="utf-8"))
     assert [p["status"] for p in saved["pages"]] == ["new", "new", "ok"], \
@@ -301,34 +316,61 @@ def test_a_stranded_page_is_reset_to_new(tmp_path):
     assert report.by_kind()["stuck-page"] == 2
 
 
-def test_a_recently_written_manifest_is_left_alone(tmp_path):
-    """A job may be live. Resetting its page would race the worker — and the page is
-    not stranded, it is running."""
+def test_a_freshly_stranded_page_is_repaired_when_the_app_is_closed(tmp_path):
+    """The case the age guard used to refuse, and the one that matters most.
+
+    The commonest way a page strands is pressing Stop — and the stop handler WRITES
+    pages.json as it strands them, so the manifest is newest at the exact moment the
+    damage is done. Keying liveness off the mtime meant the user who just hit the bug
+    and reached for the tool built to fix it was told to come back in 30 minutes, with
+    nothing naming a remedy. With the app closed, nothing can be writing.
+    """
+    pdir = _novel(tmp_path)
+    f = pdir / "pages.json"
+    f.write_text(json.dumps(_pages_doc("queued", "queued")), encoding="utf-8")
+    # mtime is NOW — exactly as it would be one second after pressing Stop.
+
+    report = repair_library(tmp_path, apply=True, app_running=False)
+
+    assert [p["status"] for p in json.loads(f.read_text(encoding="utf-8"))["pages"]] \
+        == ["new", "new"]
+    assert report.by_kind()["stuck-page"] == 2
+
+
+def test_a_recently_written_manifest_is_left_alone_while_the_app_is_open(tmp_path):
+    """A job really can be live then. Resetting its page would race the worker — and
+    the page is not stranded, it is running."""
     pdir = _novel(tmp_path)
     f = pdir / "pages.json"
     f.write_text(json.dumps(_pages_doc("ocr-running")), encoding="utf-8")
-    # mtime is now, so the manifest is fresh
 
-    report = repair_library(tmp_path, apply=True)
+    report = repair_library(tmp_path, apply=True, app_running=True)
 
     assert json.loads(f.read_text(encoding="utf-8"))["pages"][0]["status"] == "ocr-running"
     assert report.changes == []
     assert any("may be live" in w for w in report.warnings)
+    assert any("Close the app" in w for w in report.warnings), \
+        "a skip the user cannot act on is not a useful skip"
 
 
-def test_the_staleness_threshold_is_configurable(tmp_path):
+def test_the_staleness_threshold_only_applies_while_the_app_is_open(tmp_path):
     pdir = _novel(tmp_path)
     f = pdir / "pages.json"
     f.write_text(json.dumps(_pages_doc("queued")), encoding="utf-8")
     _age(f, 10)
 
-    assert repair_library(tmp_path, apply=True, stale_minutes=30).changes == []
-    assert repair_library(tmp_path, apply=True, stale_minutes=5).changes != []
+    assert repair_library(tmp_path, apply=False,
+                          app_running=True, stale_minutes=30).changes == []
+    assert repair_library(tmp_path, apply=False,
+                          app_running=True, stale_minutes=5).changes != []
+    assert repair_library(tmp_path, apply=False,
+                          app_running=False, stale_minutes=30).changes != [], \
+        "with the app closed the age is irrelevant — nothing can be writing"
 
 
 def test_a_project_with_no_pages_file_is_skipped(tmp_path):
     _novel(tmp_path)
-    report = repair_library(tmp_path, apply=True)
+    report = repair_library(tmp_path, apply=True, app_running=False)
     assert report.changes == [] and report.warnings == []
     assert report.projects_scanned == 1
 
@@ -341,9 +383,69 @@ def test_pages_repair_uses_the_clock_it_is_given(tmp_path):
     f.write_text(json.dumps(_pages_doc("queued")), encoding="utf-8")
 
     report = Report()
-    repair_pages(pdir, report, apply=False, stale_minutes=30,
+    repair_pages(pdir, report, apply=False, app_running=True, stale_minutes=30,
                  now=time.time() + 31 * 60)
     assert len(report.changes) == 1
+
+
+# ---- refusing to run alongside the app ---------------------------------------
+
+def test_apply_refuses_while_the_app_is_running(tmp_path, monkeypatch, capsys):
+    """This is a second process, so the app's in-process locks mean nothing to it.
+    Renaming a chapter out from under a running worker recreates the very
+    two-files-for-one-chapter damage the tool exists to clean up."""
+    import tools.repair_library as R
+    pdir = _novel(tmp_path, chapter_count=100, chapters={
+        "chapter-07.md": "old", "chapter-007.md": "new",
+    })
+    _age(pdir / "chapters" / "chapter-07.md", 60 * 24 * 60)
+    monkeypatch.setattr(R, "app_is_running", lambda: True)
+
+    code = R.main(["--apply", "--projects-dir", str(tmp_path)])
+
+    assert code == 2, "refusing must be a non-zero exit, not a silent success"
+    assert (pdir / "chapters" / "chapter-07.md").exists(), "nothing may be moved"
+    out = capsys.readouterr().out
+    assert "still running" in out and "Close it first" in out
+
+
+def test_a_dry_run_is_allowed_while_the_app_is_running(tmp_path, monkeypatch, capsys):
+    import tools.repair_library as R
+    pdir = _novel(tmp_path, chapter_count=100, chapters={
+        "chapter-07.md": "old", "chapter-007.md": "new",
+    })
+    _age(pdir / "chapters" / "chapter-07.md", 60 * 24 * 60)
+    monkeypatch.setattr(R, "app_is_running", lambda: True)
+
+    assert R.main(["--projects-dir", str(tmp_path)]) == 0
+    assert "Would repair" in capsys.readouterr().out
+
+
+def test_apply_proceeds_when_the_app_is_closed(tmp_path, monkeypatch):
+    import tools.repair_library as R
+    pdir = _novel(tmp_path, chapter_count=100, chapters={
+        "chapter-07.md": "old", "chapter-007.md": "new",
+    })
+    _age(pdir / "chapters" / "chapter-07.md", 60 * 24 * 60)
+    monkeypatch.setattr(R, "app_is_running", lambda: False)
+
+    assert R.main(["--apply", "--projects-dir", str(tmp_path)]) == 0
+    assert (pdir / "chapters" / ".superseded" / "chapter-07.md").exists()
+
+
+def test_the_running_app_check_can_be_overridden(tmp_path, monkeypatch):
+    """The check is port-based and cannot tell the app from anything else holding the
+    port, so there has to be a way past it — deliberate, and named in the refusal."""
+    import tools.repair_library as R
+    pdir = _novel(tmp_path, chapter_count=100, chapters={
+        "chapter-07.md": "old", "chapter-007.md": "new",
+    })
+    _age(pdir / "chapters" / "chapter-07.md", 60 * 24 * 60)
+    monkeypatch.setattr(R, "app_is_running", lambda: True)
+
+    assert R.main(["--apply", "--ignore-running-app",
+                   "--projects-dir", str(tmp_path)]) == 0
+    assert (pdir / "chapters" / ".superseded" / "chapter-07.md").exists()
 
 
 # ---- the driver ---------------------------------------------------------------

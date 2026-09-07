@@ -28,10 +28,17 @@ Nothing here deletes. A superseded chapter file is MOVED into a ``.superseded/``
 folder beside it, because those files are real (older) translations the user paid
 for; they are simply not the current ones. Reversing this repair is a drag-and-drop.
 
+**Close Night Reader before repairing.** This is a second process, so the in-process
+file locks the app relies on mean nothing to it. Renaming a chapter file out from
+under a running translation worker is precisely the race the app was fixed to avoid:
+the worker resolves a path, this tool renames it, and the worker's write then
+recreates the old name — leaving two files for one chapter, the newer one invisible.
+``--apply`` refuses while the app is answering on its usual port.
+
 Dry run by default::
 
     python tools/repair_library.py                  # report, change nothing
-    python tools/repair_library.py --apply          # actually repair
+    python tools/repair_library.py --apply          # actually repair (app closed)
     python tools/repair_library.py --project <pid>  # one novel
 """
 
@@ -47,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from launch import app_is_running  # noqa: E402
 from server.pages import STATUS_NEW, STATUS_QUEUED, STATUS_RUNNING  # noqa: E402
 from server.projects import PROJECTS_DIR  # noqa: E402
 from translation_bot.atomic import atomic_write_text  # noqa: E402
@@ -240,8 +248,24 @@ def repair_variants(project_dir: Path, report: Report, *, apply: bool) -> None:
 # ---- C. pages stranded mid-run ------------------------------------------------
 
 def repair_pages(project_dir: Path, report: Report, *, apply: bool,
+                 app_running: bool = True,
                  stale_minutes: int = DEFAULT_STALE_MINUTES,
                  now: float | None = None) -> None:
+    """Reset pages stranded in ``queued``/``ocr-running``.
+
+    Liveness is decided by whether the APP is running, not by how old the manifest
+    is. Keying it off the mtime had it exactly backwards: the commonest way a page
+    strands is pressing Stop, and the stop handler WRITES pages.json as it strands
+    them — so the manifest is freshest at the precise moment the damage is done, and
+    an age rule refuses to repair the one case it exists for. The user who just hit
+    the bug and reached for the tool built to fix it was told to come back in half an
+    hour, with nothing naming the remedy.
+
+    With the app closed nothing can be writing, so a page still marked queued or
+    running is stranded by definition, whatever its timestamp says. The age threshold
+    survives only for a dry run taken while the app is up, where a job really could
+    be in flight.
+    """
     pid = project_dir.name
     f = project_dir / "pages.json"
     if not f.exists():
@@ -259,10 +283,10 @@ def repair_pages(project_dir: Path, report: Report, *, apply: bool,
              if isinstance(p, dict) and p.get("status") in (STATUS_QUEUED, STATUS_RUNNING)]
     if not stuck:
         return
-    if age_minutes < stale_minutes:
-        # A live job would be writing to this manifest. Never race one.
-        report.warn(f"{pid}: {len(stuck)} page(s) queued/running but pages.json was "
-                    f"touched {age_minutes:.0f}min ago — a job may be live, skipped")
+    if app_running and age_minutes < stale_minutes:
+        report.warn(f"{pid}: {len(stuck)} page(s) queued/running, Night Reader is open, "
+                    f"and pages.json was touched {age_minutes:.0f}min ago — a job may be "
+                    f"live, skipped. Close the app and run this again.")
         return
 
     for page in stuck:
@@ -276,8 +300,11 @@ def repair_pages(project_dir: Path, report: Report, *, apply: bool,
 # ---- driver -------------------------------------------------------------------
 
 def repair_library(projects_dir: Path | None = None, *, apply: bool = False,
-                   only: str | None = None,
+                   only: str | None = None, app_running: bool | None = None,
                    stale_minutes: int = DEFAULT_STALE_MINUTES) -> Report:
+    """Walk the library and repair. ``app_running=None`` detects it."""
+    if app_running is None:
+        app_running = app_is_running()
     base = Path(projects_dir or PROJECTS_DIR)
     report = Report()
     if not base.is_dir():
@@ -290,7 +317,8 @@ def repair_library(projects_dir: Path | None = None, *, apply: bool = False,
         report.projects_scanned += 1
         repair_padding(project_dir, report, apply=apply)
         repair_variants(project_dir, report, apply=apply)
-        repair_pages(project_dir, report, apply=apply, stale_minutes=stale_minutes)
+        repair_pages(project_dir, report, apply=apply, app_running=app_running,
+                     stale_minutes=stale_minutes)
     return report
 
 
@@ -338,14 +366,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--projects-dir", metavar="DIR",
                         help="override the library location (for testing)")
     parser.add_argument("--stale-minutes", type=int, default=DEFAULT_STALE_MINUTES,
-                        help="how old pages.json must be before a queued/running page "
-                             f"counts as stranded (default {DEFAULT_STALE_MINUTES})")
+                        help="only while the app is open: how old pages.json must be "
+                             "before a queued/running page counts as stranded "
+                             f"(default {DEFAULT_STALE_MINUTES}). With the app closed, "
+                             "nothing can be writing, so age is not consulted.")
+    parser.add_argument("--ignore-running-app", action="store_true",
+                        help="repair even though something is answering on the app's "
+                             "port (only if you are sure that is not Night Reader)")
     parser.add_argument("--verbose", action="store_true", help="list every change")
     args = parser.parse_args(argv)
 
+    running = app_is_running()
+    if args.apply and running and not args.ignore_running_app:
+        # A separate process, so the app's in-process locks do not apply to it.
+        # Renaming a chapter file out from under a running worker recreates exactly
+        # the two-files-for-one-chapter damage this tool exists to clean up.
+        print("Night Reader looks like it is still running.")
+        print()
+        print("  Close it first — this tool moves and rewrites the same files the app")
+        print("  writes while it works, and it cannot take the app's locks from")
+        print("  another process.")
+        print()
+        print("  Nothing was changed. Close the app and run this again, or re-run")
+        print("  without --apply to see the report.")
+        return 2
+
     report = repair_library(Path(args.projects_dir) if args.projects_dir else None,
                             apply=args.apply, only=args.project,
-                            stale_minutes=args.stale_minutes)
+                            app_running=running, stale_minutes=args.stale_minutes)
     _print(report, apply=args.apply, verbose=args.verbose)
     return 0
 
