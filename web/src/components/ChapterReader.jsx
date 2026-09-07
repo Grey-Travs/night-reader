@@ -453,16 +453,22 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     return new RegExp(`(${names.join('|')})`, 'g')
   }, [prefs.glossaryTips, glossLookup])
 
-  // One components object doing two jobs: glossary tooltips, and a rewrite handle in
-  // the margin. It must ALWAYS exist — it used to be undefined when glossary tips
-  // were switched off, which would have silently disabled rewriting with them.
-  const glossComponents = useMemo(() => {
-    const decorate = glossRegex
-      ? (kids) => highlightChildren(kids, glossRegex, glossLookup)
-      : (kids) => kids
+  // Glossary tooltips. Shared by both components objects below, and it must ALWAYS
+  // exist — it used to be undefined when glossary tips were switched off, which would
+  // have silently disabled rewriting with them.
+  const decorate = useMemo(() => (glossRegex
+    ? (kids) => highlightChildren(kids, glossRegex, glossLookup)
+    : (kids) => kids), [glossRegex, glossLookup])
+
+  const inlineComponents = useMemo(() => {
     const wrap = (Tag) => function GlossTag({ node, children, ...props }) {
       return <Tag {...props}>{decorate(children)}</Tag>
     }
+    return { li: wrap('li'), em: wrap('em'), strong: wrap('strong') }
+  }, [decorate])
+
+  // THE CHAPTER BODY: tooltips plus a rewrite handle in the margin.
+  const glossComponents = useMemo(() => {
     const Paragraph = function ReaderParagraph({ node, children, ...props }) {
       const k = blockIndexAt(blocks, node?.position?.start?.offset)
       // Only offer the handle where a Markdown paragraph and a blank-line block are
@@ -482,8 +488,22 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
         </p>
       )
     }
-    return { p: Paragraph, li: wrap('li'), em: wrap('em'), strong: wrap('strong') }
-  }, [glossRegex, glossLookup, blocks, paraPanel, editing, openParagraph])
+    return { ...inlineComponents, p: Paragraph }
+  }, [inlineComponents, decorate, blocks, paraPanel, editing, openParagraph])
+
+  // THE DRAWER'S VERSION CARDS: tooltips only, never a handle.
+  //
+  // `blocks` describes the CHAPTER, but a preview's markdown is one paragraph on its
+  // own — so every offset in it is near 0 and blockIndexAt resolves them all to block
+  // 0. Reusing the chapter's components put a ✎ in the margin of each version card,
+  // and clicking it called openParagraph(0): the drawer silently jumped to the
+  // chapter's first paragraph, dropping the versions being compared.
+  const previewComponents = useMemo(() => {
+    const Paragraph = function PreviewParagraph({ node, children, ...props }) {
+      return <p {...props}>{decorate(children)}</p>
+    }
+    return { ...inlineComponents, p: Paragraph }
+  }, [inlineComponents, decorate])
   const readStyle = { fontSize: prefs.fontSize, maxWidth: `${prefs.width}ch`, color: th.ink }
   // Side-by-side columns: honour font size + theme ink, but let the grid govern width.
   const dualStyle = { fontSize: prefs.fontSize, color: th.ink }
@@ -777,7 +797,7 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
             index={index}
             paragraph={paraPanel.paragraph}
             expectedText={paraPanel.text}
-            components={glossComponents}
+            components={previewComponents}
             onClose={() => setParaPanel(null)}
             onApplied={(res) => {
               // Patch in place rather than reloading: a remount re-fires the

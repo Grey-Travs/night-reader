@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ChapterReader from './ChapterReader'
@@ -128,5 +128,71 @@ describe('ChapterReader renders', () => {
     api.chapter.mockRejectedValue(new Error('backend is down'))
     renderReader()
     await waitFor(() => expect(screen.getByText(/backend is down/)).toBeInTheDocument())
+  })
+})
+
+// The rewrite drawer renders each kept version as Markdown. It used to be handed the
+// CHAPTER's components, which put a ✎ handle in every version card's margin — and
+// `blocks` describes the chapter while a preview's markdown is one paragraph on its
+// own, so every offset in it resolved to block 0. Clicking that handle called
+// openParagraph(0): the drawer silently jumped to the chapter's first paragraph,
+// dropping the versions you were comparing.
+
+describe('the rewrite drawer', () => {
+  beforeEach(() => {
+    api.chapter.mockResolvedValue(chapterPayload())
+    // Mirrors chapter_variants() in server/app.py.
+    api.chapterVariants.mockResolvedValue({
+      index: 1,
+      paragraph_count: 3,
+      groups: [{
+        id: 'g1',
+        paragraph: 1,
+        original: '"Are you coming?" she asked.',
+        current_id: 'v0',
+        stale: false,
+        source_ko: null,
+        alignment: null,
+        variants: [
+          { id: 'v0', kind: 'original', text: '"Are you coming?" she asked.', warnings: [] },
+          { id: 'v1', kind: 'rephrase', text: '"Coming?" she said.', warnings: [] },
+        ],
+      }],
+      retranslate_available: true,
+      retranslate_reason: null,
+    })
+    api.paragraphSource.mockResolvedValue({ korean: [], target: 0, confidence: 0 })
+  })
+
+  async function openDrawer(container) {
+    await screen.findByText(/The door slid open/)
+    fireEvent.click(screen.getByRole('button', { name: /Rewrite paragraph 2/i }))
+    await waitFor(() => expect(api.chapterVariants).toHaveBeenCalled())
+    return container
+  }
+
+  it('offers a rewrite handle on the chapter body', async () => {
+    const { container } = renderReader()
+    await screen.findByText(/The door slid open/)
+    expect(container.querySelectorAll('.reading p.para .para-handle').length)
+      .toBeGreaterThan(0)
+  })
+
+  it('puts no rewrite handle inside the version cards', async () => {
+    const { container } = renderReader()
+    await openDrawer(container)
+
+    const version = await screen.findByText(/"Coming\?" she said\./)
+    const card = version.closest('p') || version
+    expect(card.querySelector('.para-handle')).toBeNull()
+    expect(card.hasAttribute('data-para')).toBe(false)
+  })
+
+  it('still shows the versions themselves', async () => {
+    // A guard on the test above: if the drawer failed to render at all, "no handle
+    // inside it" would pass for the wrong reason.
+    const { container } = renderReader()
+    await openDrawer(container)
+    expect(await screen.findByText(/"Coming\?" she said\./)).toBeInTheDocument()
   })
 })

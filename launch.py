@@ -67,14 +67,31 @@ def _build_is_stale() -> bool:
     return _newest_mtime(sources) > built
 
 
-def build_frontend(force: bool = False) -> None:
+def _has_built_interface() -> bool:
+    """Whether there is actually something to serve.
+
+    index.html specifically, not just a dist/ folder: an interrupted build can leave
+    the directory there and empty, and `dist/ exists` would then read as "fine".
+    """
+    return (DIST / "index.html").is_file()
+
+
+def build_frontend(force: bool = False) -> bool:
+    """Build the interface if needed. Returns whether there is one to serve.
+
+    The return value matters on a FIRST run. A failed build used to print one line
+    and carry on, so the launcher started the server and opened a browser onto a
+    served-nothing app — and the line had already scrolled away behind uvicorn's
+    startup output. On the double-click start.bat path, where the console is often
+    not read at all, that looks like the app itself is broken.
+    """
     if not VITE.exists():
         print("! Web dependencies aren't installed yet. Run setup first "
               "(see README: `npm install` inside web/).")
-        return
-    first_run = not DIST.exists()
+        return _has_built_interface()
+    first_run = not _has_built_interface()
     if not first_run and not force and not _build_is_stale():
-        return
+        return True
     print("Building the app interface (first run only)…" if first_run
           else "The interface changed — rebuilding it…")
     # Call vite directly via node — robust across shells.
@@ -84,9 +101,12 @@ def build_frontend(force: bool = False) -> None:
         # A clear nudge beats a raw traceback, and an existing dist/ still runs.
         print("! Building the interface failed."
               + ("" if first_run else " Starting with the previous build instead."))
+        return not first_run
     except FileNotFoundError:
         print("! Node.js wasn't found, so the interface couldn't be rebuilt."
               + ("" if first_run else " Starting with the previous build."))
+        return not first_run
+    return _has_built_interface()
 
 
 def open_browser_later() -> None:
@@ -128,7 +148,13 @@ def main() -> None:
 
     force_build = "--rebuild" in sys.argv
     ensure_config()
-    build_frontend(force=force_build)
+    if not build_frontend(force=force_build):
+        # Nothing to serve. Starting anyway would open a browser onto a blank page
+        # and bury the reason behind uvicorn's startup output.
+        print("\n  There's no app interface to open yet, so it wasn't started.")
+        print("  Fix the error above and run this again — if you've just installed,")
+        print("  try running setup once more (setup.bat on Windows).\n")
+        return
 
     print("\n  Translation Bot is starting…")
     print(f"  Open {URL} in your browser (it should open automatically).")

@@ -122,10 +122,47 @@ def test_never_claims_a_gap():
             "Tier 1 must never claim a gap it cannot actually detect"
 
 
-def test_low_confidence_seams_are_flagged_for_the_model():
-    join = propose_join("그는 말했다.", "…", {}, {})
-    assert join.needs_model == (join.confidence < LOW_CONFIDENCE), \
-        "needs_model must track the confidence threshold"
+# `needs_model` IS `confidence < LOW_CONFIDENCE` — a property whose whole body is that
+# comparison. Asserting the two against each other is a tautology that no change can
+# break, and it hid the fact that its own fixture ("그는 말했다." / "…") scores 0.65,
+# which is not a low-confidence seam at all. What matters is that the threshold cuts
+# in the right place on BOTH sides, so these assert outcomes instead.
+
+def test_an_ambiguous_seam_is_escalated_to_the_model():
+    """A quotation opening after a page that never finished its sentence is genuinely
+    two-ways: the quote may be the object of the running sentence ("그가 조용히" /
+    "「가자」고 말했다"), or a fresh line of speech.
+
+    If this stopped being escalated it would silently keep its deterministic guess —
+    a sentence that ran across the page break becomes a paragraph break, the
+    translator faithfully preserves it, and the English gains a break that is not in
+    the book.
+    """
+    join = propose_join("그가 조용히", "「가자」고 말했다.", {}, {})
+    assert join.confidence < LOW_CONFIDENCE
+    assert join.needs_model is True
+
+
+def test_a_confident_seam_is_decided_without_the_model():
+    """The threshold has to cut both ways. If a clear seam also asked the model,
+    /pages/stitch would spend a call on every boundary in the novel."""
+    join = propose_join("그는 천천히 문을 열", "고 안으로 들어갔다.",
+                        {"ends_mid_sentence": True, "ends_mid_word": True},
+                        {"starts_mid_sentence": True})
+    assert join.confidence >= LOW_CONFIDENCE
+    assert join.needs_model is False
+
+
+def test_every_escalating_rule_actually_scores_below_the_threshold():
+    """The three paths that exist to reach the model. A tuning change that lifted any
+    of them above 0.6 would stop escalating it, with no test failing."""
+    escalating = [
+        ("", "다음 날 아침이 밝았다.", {}, {}),                    # a blank page
+        ("그가 조용히", "「가자」고 말했다.", {}, {}),               # a fresh quotation
+    ]
+    for prev, nxt, m1, m2 in escalating:
+        join = propose_join(prev, nxt, m1, m2)
+        assert join.needs_model is True, f"{join.reason!r} scored {join.confidence}"
 
 
 # ---- glue --------------------------------------------------------------------
