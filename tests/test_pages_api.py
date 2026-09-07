@@ -322,6 +322,53 @@ def test_a_second_build_appends_without_renumbering(client):
     assert chapters[1].paragraphs == ["다음 장의 본문."]
 
 
+def test_an_append_keeps_the_earlier_chapters_photo_attribution(client):
+    """page_map is the ONLY record of which photos a chapter was built from.
+
+    An append only builds the new chapters, so build_chapters returns a map keyed by
+    those indices alone. Storing it wholesale dropped every earlier entry, and the
+    reader's Photo/Text toggle and its source images silently vanished from every
+    chapter built before the append — permanently, with no error, and recoverable only
+    by a full rebuild that renumbers and re-bills the whole novel.
+    """
+    pid = _novel(client)
+    _two_page_chapter(client, pid)
+    client.post(f"/api/projects/{pid}/pages/build", json={"mode": "batch"})
+    before = (P.load_pages(pid)["build"] or {})["page_map"]
+    assert "1" in before, "the first build attributes chapter 1 to its photos"
+
+    later = _upload(client, pid, data=PNG).json()["page"]
+    _set(client, pid, later["id"], text="다음 장의 본문.", status=P.STATUS_OK)
+    client.post(f"/api/projects/{pid}/pages/build",
+                json={"mode": "batch", "append": True})
+
+    after = (P.load_pages(pid)["build"] or {})["page_map"]
+    assert after.get("1") == before["1"], "chapter 1 must keep its photos"
+    assert "2" in after, "and the appended chapter must gain its own"
+
+    project = pj.get_project(pid)
+    assert A._chapter_page_ids(project, 1), "the reader must still find chapter 1's photos"
+    assert A._chapter_page_ids(project, 2)
+
+
+def test_a_full_rebuild_replaces_the_attribution_rather_than_merging_it(client):
+    """The merge is append-only. A rebuild renumbers from 1, so carrying the old map
+    forward would attribute a chapter to photos that are no longer under it."""
+    pid = _novel(client)
+    _two_page_chapter(client, pid)
+    client.post(f"/api/projects/{pid}/pages/build", json={"mode": "batch"})
+
+    later = _upload(client, pid, data=PNG).json()["page"]
+    _set(client, pid, later["id"], text="다음 장의 본문.", status=P.STATUS_OK)
+    res = client.post(f"/api/projects/{pid}/pages/build",
+                      json={"mode": "batch", "append": False, "force": True})
+    assert res.status_code == 200, res.text
+
+    build = P.load_pages(pid)["build"] or {}
+    assert set(build["page_map"]) == {str(i) for i in range(1, res.json()["chapters"] + 1)}, \
+        "a rebuild's map covers exactly the chapters it just built"
+
+
 def test_a_gap_is_reported_in_the_build_warnings(client):
     pid = _novel(client)
     first_res = _upload(client, pid, data=JPEG).json()
@@ -433,6 +480,89 @@ def test_queueing_work_that_is_all_already_busy_says_so(client, monkeypatch):
     res = client.post(f"/api/projects/{pid}/pages/ocr", json={"ids": [page["id"]]})
     assert res.status_code == 409
     assert "already queued" in res.text
+
+
+# ---- what a page falls back to -----------------------------------------------
+# Marking a page `queued` OVERWRITES the only record of its real status. The abort
+# path then read that back as "what it was before" and restored `queued` — so the
+# page the user had just stopped was stuck in the one status the default sweep does
+# not select, and hand-picking it was the only way out.
+
+def _queue_without_running(client, monkeypatch, pid, page):
+    """Accept OCR work for a page but never spawn a worker.
+
+    The endpoint normally starts the job inline and a stubbed translator runs it to
+    completion, so the page is finished before the test can look at it. These cases
+    are about the state the page sits in WHILE queued.
+    """
+    monkeypatch.setattr(A, "_enqueue_task",
+                        lambda _pid, _cfg, items: {"job_id": "j",
+                                                   "queued": [i for i, _f, _k in items]})
+    res = client.post(f"/api/projects/{pid}/pages/ocr", json={"ids": [page["id"]]})
+    assert res.status_code == 200, res.text
+
+
+def test_a_page_in_flight_falls_back_to_what_it_was_before_being_queued(
+        client, monkeypatch):
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _queue_without_running(client, monkeypatch, pid, page)
+
+    rec = next(p for p in P.load_pages(pid)["pages"] if p["id"] == page["id"])
+    assert rec["status"] == P.STATUS_QUEUED
+    assert A._resting_status(rec) == P.STATUS_NEW, \
+        "restoring the CURRENT status would put it back to queued, forever"
+
+
+def test_stopping_a_re_read_does_not_discard_an_approval(client, monkeypatch):
+    """Re-reading a page that was already accepted and then pressing Stop must leave
+    it accepted. A blanket reset to "not read yet" would throw away the approval and
+    the page would come back round on the next "Read all unread"."""
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _set(client, pid, page["id"], text="본문", status=P.STATUS_OK)
+
+    _queue_without_running(client, monkeypatch, pid, page)
+    assert A._release_queued_pages(pid) == 1
+
+    rail = client.get(f"/api/projects/{pid}/pages").json()["pages"]
+    assert rail[0]["status"] == P.STATUS_OK
+
+
+def test_a_stale_fallback_is_ignored_once_the_page_is_at_rest(client):
+    """prior_status is only meaningful while the page is in flight. A page that has
+    since been read is `ok`, and an old stash saying `new` must not win."""
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    with P.mutate_pages(pid) as doc:
+        rec = P.find_page(doc, page["id"])
+        rec["prior_status"] = P.STATUS_NEW
+        rec["status"] = P.STATUS_OK
+
+    rec = next(p for p in P.load_pages(pid)["pages"] if p["id"] == page["id"])
+    assert A._resting_status(rec) == P.STATUS_OK
+
+
+def test_a_page_left_running_is_released_too(client):
+    """The page that was mid-flight when a worker died is the ONE item not in the
+    pending queue, so releasing only the queue left exactly it stranded."""
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _set(client, pid, page["id"], status=P.STATUS_RUNNING)
+
+    assert A._release_queued_pages(pid) == 1
+    rail = client.get(f"/api/projects/{pid}/pages").json()["pages"]
+    assert rail[0]["status"] == P.STATUS_NEW
+
+
+def test_releasing_clears_the_fallback_it_used(client, monkeypatch):
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _queue_without_running(client, monkeypatch, pid, page)
+    assert A._release_queued_pages(pid) == 1
+
+    rec = next(p for p in P.load_pages(pid)["pages"] if p["id"] == page["id"])
+    assert "prior_status" not in rec, "a consumed fallback must not linger and go stale"
 
 
 # ---- the cross-novel index ---------------------------------------------------

@@ -351,13 +351,26 @@ def _normalize_chapter_padding(pid: str, total: int) -> None:
             tail = f.stem.split("-", 1)[-1]
             if not tail.isdigit() or len(tail) == width:
                 continue
-            dest = d / f"chapter-{int(tail):0{width}d}.{ext}"
-            if dest.exists():
-                continue  # a newer translation already owns the canonical name
-            try:
-                f.rename(dest)
-            except OSError:
-                pass  # never block reading a novel on a rename
+            index = int(tail)
+            dest = d / f"chapter-{index:0{width}d}.{ext}"
+            # Under the writer's own lock. This runs on a REQUEST thread (a Refresh
+            # press, or starting a translation) while the worker may be mid-write on
+            # the very file being renamed — and renaming between a writer's
+            # os.replace and its temp file leaves two files for one chapter, the
+            # newer one invisible, which the `dest.exists()` guard below then refuses
+            # to reconcile forever.
+            #
+            # Variants lock by chapter index (their filename is what changes here);
+            # chapter files lock by name, which is what write_chapter_file holds.
+            lock = (variants_mod.variants_lock(pid, index) if sub == "variants"
+                    else file_lock(f))
+            with lock:
+                if dest.exists():
+                    continue  # a newer translation already owns the canonical name
+                try:
+                    f.rename(dest)
+                except OSError:
+                    pass  # never block reading a novel on a rename
 
 
 def _safe_read(path: Path) -> str | None:
@@ -1052,29 +1065,65 @@ class PageWork(BaseModel):
     only_new: bool = False
 
 
-def _release_queued_pages(pid: str, seqs: set[int] | None = None) -> int:
-    """Put pages back to "not read yet" when their queued work will never run.
+# Statuses this pipeline sets on itself while work is in flight. Neither is a state
+# a page can be left in: the default sweep selects only new/failed, so a page stuck in
+# one is invisible to "Read all unread" and can only be recovered by hand.
+_TRANSIENT_PAGE_STATUSES = (pages_mod.STATUS_QUEUED, pages_mod.STATUS_RUNNING)
 
-    A page is marked ``queued`` when work is accepted for it. If that work is then
-    dropped — Stop, a rate-limit give-up, or a worker that died — nothing used to
-    reset it, and the default sweep only selects ``new``/``failed``. The page showed
-    "Queued" forever and "Read N pages" answered *"There are no pages to do that to"*,
-    leaving hand-selecting every stranded page as the only way out.
+
+def _resting_status(page: dict) -> str:
+    """What a page goes back to when its work never completes.
+
+    NEVER a transient status. ``_run_page_item`` used to read the page's CURRENT
+    status as the thing to restore — but by then the page had already been marked
+    ``queued`` when the work was accepted, so Stop and a refusal both "restored" it to
+    ``queued``, permanently. The page then showed Queued forever while nothing was
+    coming for it, and "Read N pages" answered *"There are no pages to do that to"*.
+
+    ``prior_status`` is stashed at queue time and is only trusted while the page is
+    actually in flight; once it is at rest again that stash is stale, and the page's
+    own status is the truth. That is what keeps a re-read of an already-approved page
+    from being downgraded to "not read yet" when it is aborted.
+    """
+    status = page.get("status") or pages_mod.STATUS_NEW
+    if status not in _TRANSIENT_PAGE_STATUSES:
+        return status
+    prior = page.get("prior_status")
+    if prior and prior not in _TRANSIENT_PAGE_STATUSES:
+        return prior
+    return pages_mod.STATUS_NEW
+
+
+def _release_queued_pages(pid: str, seqs: set[int] | None = None) -> int:
+    """Hand back pages whose work will never run.
+
+    A page is marked ``queued`` when work is accepted for it, and ``ocr-running``
+    while it is in flight. If that work is then dropped — Stop, a rate-limit give-up,
+    or a worker that died mid-page — nothing used to reset it, and the default sweep
+    only selects ``new``/``failed``.
+
+    Covers ``ocr-running`` too, not just ``queued``: when the worker dies partway
+    through a page (an OSError applying its result), that page is the one item NOT in
+    the pending queue, so releasing only the queue left the single page that was
+    actually mid-flight stranded forever.
 
     Reads before opening the manifest for writing, so a novel with no pages at all
     never gets a ``pages.json`` created as a side effect of pressing Stop.
     """
     doc = pages_mod.load_pages(pid)
     stranded = [p for p in doc.get("pages", [])
-                if p.get("status") == pages_mod.STATUS_QUEUED
+                if p.get("status") in _TRANSIENT_PAGE_STATUSES
                 and (seqs is None or int(p.get("seq") or -1) in seqs)]
     if not stranded:
         return 0
-    wanted = {p.get("id") for p in stranded}
+    # Back to what each page was before, not a blanket "new": re-reading a page that
+    # was already approved and then pressing Stop must not discard its approval.
+    resting = {p.get("id"): _resting_status(p) for p in stranded}
     with pages_mod.mutate_pages(pid) as live:
         for rec in live.get("pages", []):
-            if rec.get("id") in wanted:
-                rec["status"] = pages_mod.STATUS_NEW
+            if rec.get("id") in resting:
+                rec["status"] = resting[rec["id"]]
+                rec.pop("prior_status", None)
     return len(stranded)
 
 
@@ -1111,6 +1160,12 @@ def _queue_page_work(pid: str, body: PageWork, kind: str) -> dict:
                 if int(page.get("seq") or -1) in accepted:
                     rec = pages_mod.find_page(live, page["id"])
                     if rec is not None:
+                        # Stash what to fall back to BEFORE overwriting it. Marking
+                        # the page queued destroys the only record of its real
+                        # status, and the abort path then read that back and
+                        # "restored" queued — see _resting_status.
+                        if rec.get("status") not in _TRANSIENT_PAGE_STATUSES:
+                            rec["prior_status"] = rec.get("status") or pages_mod.STATUS_NEW
                         rec["status"] = pages_mod.STATUS_QUEUED
     elif wanted:
         # One operation per page at a time is deliberate (it stops two model calls
@@ -1257,10 +1312,17 @@ def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
 
     used = [p.get("id") for p in ocr_build.usable_pages(doc, include=body.include)]
     with pages_mod.mutate_pages(pid) as live:
-        prior = set((live.get("build") or {}).get("used_page_ids") or []) if body.append else set()
+        # An append only BUILT the new chapters, so build_chapters returns a page_map
+        # keyed by those indices alone. Storing it wholesale dropped every earlier
+        # chapter's entry — and this is the only record of which photos a chapter came
+        # from, so the reader's Photo/Text toggle and its source images silently
+        # disappeared from every chapter built before the append. used_page_ids on the
+        # next line was already merged; page_map was not.
+        prev = (live.get("build") or {}) if body.append else {}
+        prior = set(prev.get("used_page_ids") or [])
         live["build"] = {"mode": body.mode, "at": pages_mod.now_iso(),
                          "chapters": len(combined), "warnings": warnings,
-                         "page_map": page_map,
+                         "page_map": {**(prev.get("page_map") or {}), **page_map},
                          "used_page_ids": sorted(prior | set(used))}
 
     return {"ok": True, "chapters": len(combined), "added": len(chapters),
@@ -2078,7 +2140,9 @@ async def _generate_paragraph(pid: str, index: int, body: ParagraphRef, mode: st
         # A malformed reply is a normal outcome, not an error dialog.
         return {"ok": False, "reasons": check.reasons, "usage": usage, "cost_usd": cost}
 
-    with variants_mod.mutate_variants(path, index) as live:
+    # Re-resolved inside the lock: `path` above was resolved BEFORE the model call,
+    # and a Refresh during it can re-pad this file out from under us.
+    with variants_mod.mutate_variants(pid, index, total) as live:
         variants_mod.relocate(live, [b.text for b in blocks])
         target = (variants_mod.find_group(live, group["id"]) if group else None)
         if target is None:
@@ -2182,7 +2246,7 @@ def apply_paragraph(pid: str, index: int, body: ParagraphPick) -> dict:
         state.update(index, manual_edit=True, validation=verdict.metrics)
     _invalidate_consistency(pid)
 
-    with variants_mod.mutate_variants(path, index) as live:
+    with variants_mod.mutate_variants(pid, index, total) as live:
         target = variants_mod.find_group(live, body.group_id)
         if target is not None:
             target["current_id"] = body.variant_id
@@ -2200,8 +2264,7 @@ def apply_paragraph(pid: str, index: int, body: ParagraphPick) -> dict:
 def discard_paragraph_history(pid: str, index: int, body: ParagraphDiscard) -> dict:
     """Throw away one version, or a paragraph's whole history. Never automatic."""
     _project, _cfg, _ch, total, _text, _blocks = _paragraph_context(pid, index)
-    path = variants_mod.variants_path(pid, index, total)
-    with variants_mod.mutate_variants(path, index) as doc:
+    with variants_mod.mutate_variants(pid, index, total) as doc:
         group = variants_mod.find_group(doc, body.group_id)
         if group is None:
             raise HTTPException(404, "That paragraph's history is gone.")
@@ -3456,7 +3519,9 @@ async def _run_page_item(job: Job, cfg: Config, idx: int, force: bool, kind: str
         return strikes, "continue"
 
     page_id = page.get("id", "")
-    prior_status = page.get("status") or pages_mod.STATUS_NEW
+    # NOT page["status"] — that already reads "queued", because this item was marked
+    # when the work was accepted. Restoring it left the page queued forever.
+    prior_status = _resting_status(page)
     label = page.get("name") or f"Page {idx}"
 
     job.abort.clear()
@@ -3747,9 +3812,16 @@ async def _run_worker_guarded(job: Job, cfg: Config) -> None:
                      "status": "failed", "title": "",
                      "error": str(exc), "explain": errors.as_dict(explained)})
     finally:
+        # Capture the in-flight item BEFORE clearing it. When the worker dies partway
+        # through a page, that page is the one item NOT in the pending queue — so
+        # draining the queue alone released everything except the page that was
+        # actually mid-flight, which sat on "ocr-running" forever.
+        in_flight = job.current if job.kind in PAGE_TASK_KINDS else None
         job.live = None
         job.current = None
         stranded = {i for i, _f, k in job.drain() if k in PAGE_TASK_KINDS}
+        if in_flight is not None:
+            stranded.add(in_flight)
         if stranded:
             try:
                 _release_queued_pages(job.pid, stranded)

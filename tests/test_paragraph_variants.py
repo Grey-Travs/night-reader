@@ -232,19 +232,75 @@ def test_pruning_bounds_the_number_of_groups():
 # ---- durability --------------------------------------------------------------
 
 def test_history_round_trips_through_disk(store):
-    path = V.variants_path(PID, 7, 30)
-    with V.mutate_variants(path, 7) as doc:
+    with V.mutate_variants(PID, 7, 30) as doc:
         group = V.new_group(doc, 3, ORIGINAL)
         V.add_variant(group, kind=V.KIND_REPHRASE, text="문이 열렸다 rephrased")
         gid = group["id"]
 
-    reloaded = V.load_variants(path, 7)
+    reloaded = V.load_variants(V.variants_path(PID, 7, 30), 7)
     assert V.find_group(reloaded, gid)["variants"][1]["text"] == "문이 열렸다 rephrased"
 
 
 def test_the_file_name_mirrors_the_chapter_file(store):
+    assert V.canonical_variants_path(PID, 7, 300).name == "chapter-007.json"
+    assert V.canonical_variants_path(PID, 7, 30).name == "chapter-07.json"
+
+
+# ---- surviving a re-padding underneath ---------------------------------------
+# The name comes from a chapter COUNT, so it changes the moment a novel crosses 99 to
+# 100. A rewrite resolves its path, spends 10-30s in the model, and only then writes —
+# and a Translate or Refresh pressed during that wait re-pads the file underneath it.
+
+def test_history_is_found_at_whatever_width_it_was_written(store):
+    with V.mutate_variants(PID, 7, 30) as doc:            # writes chapter-07.json
+        V.new_group(doc, 3, ORIGINAL)
+
+    # The novel has since grown past 99 chapters, so the canonical name is now
+    # chapter-007.json — which does not exist. The history is still right there.
+    found = V.variants_path(PID, 7, 300)
+    assert found.name == "chapter-07.json"
+    assert V.load_variants(found, 7)["groups"], "a rewrite history must not go missing"
+
+
+def test_the_canonical_name_wins_when_both_exist(store):
+    V.save_variants(V.canonical_variants_path(PID, 7, 30), V.new_doc(7))
+    V.save_variants(V.canonical_variants_path(PID, 7, 300), V.new_doc(7))
     assert V.variants_path(PID, 7, 300).name == "chapter-007.json"
-    assert V.variants_path(PID, 7, 30).name == "chapter-07.json"
+
+
+def test_a_rename_during_a_rewrite_does_not_strand_the_new_variant(store):
+    """The window the lock exists to close.
+
+    Resolving the path up front and locking it later meant a re-pad landing in
+    between wrote to a name that no longer existed: the history read back empty, a
+    fresh group was minted, and the variant the user had just paid for landed in an
+    orphan file that Apply could not find.
+    """
+    with V.mutate_variants(PID, 7, 30) as doc:            # chapter-07.json
+        group = V.new_group(doc, 3, ORIGINAL)
+        gid = group["id"]
+
+    # The padding normalizer runs: the novel crossed 100 chapters.
+    old = V.variants_dir(PID) / "chapter-07.json"
+    old.rename(V.variants_dir(PID) / "chapter-007.json")
+
+    # The rewrite finishes and writes, now with the new count.
+    with V.mutate_variants(PID, 7, 300) as doc:
+        target = V.find_group(doc, gid)
+        assert target is not None, "the existing history must still be found"
+        V.add_variant(target, kind=V.KIND_REPHRASE, text="문이 열렸다 rephrased")
+
+    files = sorted(f.name for f in V.variants_dir(PID).glob("chapter-*.json"))
+    assert files == ["chapter-007.json"], "one chapter must mean one history file"
+    reloaded = V.load_variants(V.variants_path(PID, 7, 300), 7)
+    assert len(V.find_group(reloaded, gid)["variants"]) == 2
+
+
+def test_the_lock_is_keyed_by_index_not_by_filename(store):
+    """A name-keyed lock guards two different names for one chapter, so it excludes
+    nothing at exactly the moment the file is being renamed underneath."""
+    assert V.variants_lock(PID, 7) is V.variants_lock(PID, 7)
+    assert V.variants_lock(PID, 7) is not V.variants_lock(PID, 8)
 
 
 def test_a_corrupt_history_reads_as_empty_instead_of_raising(store):
@@ -260,9 +316,9 @@ def test_a_missing_history_reads_as_empty(store):
 
 
 def test_korean_source_is_stored_readably(store):
-    path = V.variants_path(PID, 1, 10)
-    with V.mutate_variants(path, 1) as doc:
+    with V.mutate_variants(PID, 1, 10) as doc:
         V.new_group(doc, 0, ORIGINAL, source_ko="그는 문을 열었다.")
+    path = V.variants_path(PID, 1, 10)
     assert "그는" in path.read_text(encoding="utf-8")
     assert json.loads(path.read_text(encoding="utf-8"))["groups"][0]["source_ko"]
 

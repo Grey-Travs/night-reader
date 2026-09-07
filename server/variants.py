@@ -52,9 +52,49 @@ def variants_dir(pid: str) -> Path:
     return PROJECTS_DIR / pid / VARIANTS_DIRNAME
 
 
-def variants_path(pid: str, index: int, total: int) -> Path:
+def canonical_variants_path(pid: str, index: int, total: int) -> Path:
     """Mirrors the chapter file's own name, including its zero padding."""
     return variants_dir(pid) / (Path(chapter_filename(index, total)).stem + ".json")
+
+
+def existing_variants_file(pid: str, index: int) -> Path | None:
+    """The file holding this chapter's history at ANY pad width, or None."""
+    try:
+        candidates = list(variants_dir(pid).glob("chapter-*.json"))
+    except OSError:
+        return None
+    for f in candidates:
+        tail = f.stem.split("-", 1)[-1]
+        if tail.isdigit() and int(tail) == index:
+            return f
+    return None
+
+
+def variants_path(pid: str, index: int, total: int) -> Path:
+    """Where this chapter's history lives.
+
+    Mirrors :func:`translation_bot.pipeline.chapter_path`: the canonical name wins
+    when it exists, otherwise a file written at another pad width is honoured. The
+    name is derived from a chapter COUNT, so it changes the moment a novel crosses
+    99 to 100 — and looking only at today's width reported "no history" for a file
+    sitting right there.
+    """
+    canonical = canonical_variants_path(pid, index, total)
+    if canonical.exists():
+        return canonical
+    return existing_variants_file(pid, index) or canonical
+
+
+def variants_lock(pid: str, index: int):
+    """The lock guarding one chapter's rewrite history.
+
+    Keyed on the chapter INDEX, not on the resolved filename. The pad width changes
+    when the novel crosses a digit boundary, so a name-keyed lock guards two
+    different names for one chapter — and therefore excludes nothing at exactly the
+    moment the padding normalizer is renaming the file underneath. The key is
+    synthetic; no file of that name is ever created.
+    """
+    return file_lock(variants_dir(pid) / f"_chapter-{index}")
 
 
 # ---- storage -----------------------------------------------------------------
@@ -87,13 +127,22 @@ def save_variants(path: Path, doc: dict) -> None:
 
 
 @contextmanager
-def mutate_variants(path: Path, index: int = 0):
+def mutate_variants(pid: str, index: int, total: int):
     """Load → mutate → save with no other thread interleaving.
 
     Yields a FRESHLY LOADED document: anything read before the lock was taken is
     already stale.
+
+    The path is resolved INSIDE the lock, and it has to be. A rewrite resolves its
+    path, spends 10-30 seconds in the model, and only then writes — and a Translate
+    or Refresh pressed during that wait re-pads every file when the novel has just
+    crossed 99 chapters. Resolving up front then wrote to a name that no longer
+    existed: the history read back empty, a fresh group was minted, and the variant
+    the user had just paid for landed in an orphan file that Apply could not find
+    ("That paragraph's history is gone").
     """
-    with file_lock(path):
+    with variants_lock(pid, index):
+        path = variants_path(pid, index, total)
         doc = load_variants(path, index)
         yield doc
         save_variants(path, doc)
