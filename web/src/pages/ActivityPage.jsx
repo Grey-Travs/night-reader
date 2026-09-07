@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
-import { describeTask } from '../tasks'
+import { describeTask, isPageTask } from '../tasks'
 
 // Global activity — every novel with a running/queued job, live. Each row links to that
 // novel's own Activity tab (the chapter-by-chapter console).
@@ -24,6 +24,10 @@ export default function ActivityPage() {
   }, [])
 
   const totalQueued = (jobs || []).reduce((n, j) => n + (j.current != null ? 1 : 0) + j.pending.length, 0)
+  // "3 chapters" was a lie whenever any of them was a scanned page. Only claim the
+  // noun when every running job actually is chapter work.
+  const allChapters = (jobs || []).every((j) => !isPageTask(j.kind))
+  const noun = allChapters ? 'chapter' : 'item'
 
   return (
     <div className="page page-narrow">
@@ -32,7 +36,7 @@ export default function ActivityPage() {
         <p className="text-sm text-hint">
           {jobs == null ? 'Loading…'
             : jobs.length === 0 ? 'Nothing running right now.'
-            : `${totalQueued} chapter${totalQueued === 1 ? '' : 's'} across ${jobs.length} novel${jobs.length === 1 ? '' : 's'}.`}
+            : `${totalQueued} ${noun}${totalQueued === 1 ? '' : 's'} across ${jobs.length} novel${jobs.length === 1 ? '' : 's'}.`}
         </p>
       </div>
 

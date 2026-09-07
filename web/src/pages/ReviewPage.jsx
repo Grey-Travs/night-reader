@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { Badge, SkeletonRows } from '../components/ui'
-import { TASK_LABEL_BARE as TASK_LABEL } from '../tasks'
+import { TASK_LABEL_BARE as TASK_LABEL, isPageTask } from '../tasks'
 import { useToast } from '../toast'
 
 // A mis-gendered chapter gets its own repair, so it needs telling apart from the rest.
@@ -42,6 +42,12 @@ export default function ReviewPage() {
       if (!alive) return
       const next = new Map()
       for (const j of jobs) {
+        // A scanned-page job's current/pending are PAGE sequence numbers. This inbox
+        // is keyed by chapter index, so folding them in locked whichever flagged
+        // chapter happened to share a number with a page being read: its row showed
+        // "Reading a page now…" and every repair button went disabled, on a chapter
+        // no worker was touching.
+        if (isPageTask(j.kind)) continue
         if (j.current != null) next.set(keyOf(j.pid, j.current), { kind: j.kind, active: true, waiting: !!j.waiting })
         for (const i of j.pending || []) next.set(keyOf(j.pid, i), { kind: j.kind, active: false, waiting: false })
       }

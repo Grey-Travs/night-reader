@@ -30,7 +30,7 @@ const MIN_HANGUL = 0.15
 const CONFIDENCE_CLS = { high: 'pill-translated', medium: 'pill-queued', low: 'pill-review' }
 
 export default function PagesPage() {
-  const { pid, running, enqueue: _enqueue, showError, reload, setProjectMeta } = useOutletContext()
+  const { pid, running, submitTask, showError, reload, setProjectMeta } = useOutletContext()
   const toast = useToast()
   const confirm = useConfirm()
 
@@ -203,20 +203,33 @@ export default function PagesPage() {
     try { return await fn() } catch (e) { showError(e, { context }); return null } finally { setBusy('') }
   }
 
+  // Reading pages is queued on the novel's shared worker exactly like a translation,
+  // so it has to be STARTED like one: submitTask attaches the SSE stream and flips
+  // `running`. Calling api.readPages directly threw the returned job_id away, so
+  // nothing ever attached — the rail's 2.5s poll is gated on `running`, so every row
+  // sat on "Queued" forever, the Activity console stayed empty, and the transcribed
+  // Korean never appeared however long you waited. The only way to see progress was
+  // to reload the browser.
+  const startPageWork = (what, call, context, done) => run(what, async () => {
+    const res = await submitTask(call, { context })
+    if (!res) return null   // submitTask already surfaced the error
+    await loadRail()
+    done(res)
+    return res
+  }, context)
+
   const unread = (counts.new || 0) + (counts.failed || 0)
   const flagged = counts['needs-check'] || 0
 
-  const readAll = () => run('read', async () => {
-    await api.readPages(pid, [])
-    await loadRail()
-    toast(`Reading ${unread} page${unread === 1 ? '' : 's'}…`)
-  }, 'reading the pages')
+  const readAll = () => startPageWork(
+    'read', () => api.readPages(pid, []), 'reading the pages',
+    () => toast(`Reading ${unread} page${unread === 1 ? '' : 's'}…`),
+  )
 
-  const verifyFlagged = () => run('verify', async () => {
-    await api.verifyPages(pid, [])
-    await loadRail()
-    toast(`Double-checking ${flagged} page${flagged === 1 ? '' : 's'}…`)
-  }, 'double-checking the pages')
+  const verifyFlagged = () => startPageWork(
+    'verify', () => api.verifyPages(pid, []), 'double-checking the pages',
+    () => toast(`Double-checking ${flagged} page${flagged === 1 ? '' : 's'}…`),
+  )
 
   const stitch = () => run('stitch', async () => {
     const res = await api.stitchPages(pid, { use_model: true })
@@ -226,17 +239,15 @@ export default function PagesPage() {
       : `${res.seams} seam${res.seams === 1 ? '' : 's'} worked out`)
   }, 'working out how the pages join')
 
-  const rereadOne = () => run('reread', async () => {
-    await api.readPages(pid, [selectedId])
-    await loadRail()
-    toast('Re-reading that page…')
-  }, 'reading that page')
+  const rereadOne = () => startPageWork(
+    'reread', () => api.readPages(pid, [selectedId]), 'reading that page',
+    () => toast('Re-reading that page…'),
+  )
 
-  const verifyOne = () => run('verify1', async () => {
-    await api.verifyPages(pid, [selectedId])
-    await loadRail()
-    toast('Checking that page against its photo…')
-  }, 'checking that page')
+  const verifyOne = () => startPageWork(
+    'verify1', () => api.verifyPages(pid, [selectedId]), 'checking that page',
+    () => toast('Checking that page against its photo…'),
+  )
 
   async function acceptAllGood() {
     const good = pages.filter((p) => p.status === 'needs-check' && p.confidence === 'high')

@@ -7,6 +7,7 @@ import { useConfirm } from '../confirm'
 import { errorTitle } from '../errors'
 import { fmtCost, fmtTokens } from '../format'
 import { getReadChapters } from '../prefs'
+import { describeTask, taskNoun } from '../tasks'
 
 const SELECTABLE = ['pending', 'needs-review', 'failed', 'validated']
 const FILTER_ORDER = ['pending', 'validated', 'needs-review', 'failed', 'english-source', 'empty']
@@ -33,8 +34,8 @@ const usageTitle = (ch) => {
 export default function ChaptersPage() {
   const {
     pid, data, loading, chapters, offline, counts, done, remaining,
-    running, submitting, waiting, queue, totalQueued, totals, enqueue, cancelQueue,
-    stopAll, showError, fixPronounsFlagged,
+    running, submitting, waiting, queue, chapterQueue, totalQueued, totals, enqueue,
+    cancelQueue, stopAll, showError, fixPronounsFlagged,
   } = useOutletContext()
   const navigate = useNavigate()
   const confirm = useConfirm()
@@ -63,12 +64,14 @@ export default function ChaptersPage() {
 
   async function stop() {
     if (queue.current != null) {
+      // The noun follows the kind: during an OCR run this is a page, not a chapter.
+      const noun = taskNoun(queue.kind)
       const ok = await confirm({
-        title: `Stop chapter ${queue.current}?`,
+        title: `Stop ${noun} ${queue.current}?`,
         body: `It stops as soon as Claude sends its next update, usually within a second or two.\n\n`
-          + `The chapter won't be marked failed and nothing already saved is overwritten — but the `
+          + `The ${noun} won't be marked failed and nothing already saved is overwritten — but the `
           + `work done so far is discarded, and re-running it spends your plan allowance again.`
-          + (queue.pending.length ? `\n\nThe ${queue.pending.length} chapter(s) still queued are dropped too.` : ''),
+          + (queue.pending.length ? `\n\nThe ${queue.pending.length} ${noun}(s) still queued are dropped too.` : ''),
         confirmLabel: 'Stop it',
       })
       if (!ok) return
@@ -95,7 +98,10 @@ export default function ChaptersPage() {
     })
   }, [data, chapters])
 
-  const queuedSet = new Set(queue.pending)
+  // chapterQueue, not queue: while the worker reads scanned pages these numbers are
+  // page sequence numbers, and badging chapter 7 as "Queued" because PAGE 7 is
+  // waiting is simply a different novel's worth of wrong.
+  const queuedSet = new Set(chapterQueue.pending)
   const visible = filter === 'all'
     ? chapters
     : chapters.filter((c) => c.status === filter || c.status === 'translating')
@@ -221,7 +227,12 @@ export default function ChaptersPage() {
         <div className="mb-5 flex flex-wrap items-center justify-between gap-2 rounded-card border border-line p-3 text-sm" style={{ background: 'var(--b-translating-bg)', color: 'var(--b-translating-tx)' }}>
           <span className="flex items-center gap-2">
             <span className="inline-block h-2 w-2 rounded-full animate-pulse" style={{ background: 'var(--accent)' }} />
-            {waiting ? 'Waiting for Claude to refresh' : queue.current != null ? <>Translating <strong>chapter {queue.current}</strong></> : 'Queued'}
+            {/* describeTask, not a hardcoded "Translating chapter": the same worker
+                reads scanned pages, and this banner announced "Translating chapter 7"
+                while it was reading PAGE 7. */}
+            {waiting ? 'Waiting for Claude to refresh'
+              : queue.current != null ? <strong>{describeTask(queue.kind, queue.current)}</strong>
+              : 'Queued'}
             {queue.pending.length > 0 && ` · ${queue.pending.length} waiting`}
           </span>
           <span className="flex items-center gap-2">
@@ -328,7 +339,7 @@ export default function ChaptersPage() {
                   const translated = ch.has_output && ch.language === 'korean'
                   const canRead = ch.has_output || ch.language === 'english'
                   const inQueue = queuedSet.has(ch.index)
-                  const isCurrent = queue.current === ch.index
+                  const isCurrent = chapterQueue.current === ch.index
                   return (
                     <tr key={ch.index} className="rowhover border-t border-line">
                       <td className="px-3 py-2">

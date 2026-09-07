@@ -36,3 +36,18 @@ export const taskNoun = (kind) => (isPageTask(kind) ? 'page' : 'chapter')
 export function describeTask(kind, index) {
   return `${TASK_LABEL[kind] || TASK_LABEL.translate} ${taskNoun(kind)} ${index}`
 }
+
+/** The queue as a CHAPTER view: empty whenever its numbers aren't chapter indices.
+ *
+ * One worker queue carries both chapter work and scanned-page work, and `current` /
+ * `pending` are page sequence numbers during an OCR run. Four separate places
+ * compared them straight against a chapter index, so reading page 7 of a
+ * photographed novel marked chapter 7 as busy — repair buttons disabled, paragraph
+ * rewrites refused, a Review row locked, and a "Queued" badge on a chapter nothing
+ * was going to touch. Anything asking "is this CHAPTER busy?" asks this instead.
+ */
+export function chapterScopedQueue(queue) {
+  const q = queue || {}
+  if (isPageTask(q.kind)) return { current: null, pending: [] }
+  return { current: q.current ?? null, pending: q.pending || [] }
+}

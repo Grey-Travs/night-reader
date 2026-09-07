@@ -4,7 +4,7 @@ import { api } from '../api'
 import { errorTitle } from '../errors'
 import { useError } from './ErrorDialog'
 import { clearPausedJob, getLastRead, getPausedJob, setPausedJob } from '../prefs'
-import { TASK_LABEL } from '../tasks'
+import { TASK_LABEL, chapterScopedQueue } from '../tasks'
 
 // The persistent shell for one novel. It OWNS the translation job (the SSE stream,
 // the queue, pause/auto-resume and the live log) and the chapter list, and exposes
@@ -394,6 +394,11 @@ export default function ProjectLayout() {
   const done = counts.validated || 0
   const remaining = counts.pending || 0
   const totalQueued = (queue.current != null ? 1 : 0) + queue.pending.length
+
+  // Empty whenever the queue's numbers are page sequence numbers rather than chapter
+  // indices — see chapterScopedQueue. Everything asking "is this CHAPTER busy?" reads
+  // this, never `queue` directly.
+  const chapterQueue = chapterScopedQueue(queue)
   const lastRead = getLastRead(pid)
 
   const ctx = {
@@ -401,7 +406,10 @@ export default function ProjectLayout() {
     setRowStatus, setProjectMeta, showError,
     chapters, offline, counts, koreanTotal, done, remaining,
     running, submitting, log, live, totals: totals || data?.totals, paused, waiting,
-    queue, totalQueued, enqueue, cancelQueue, stopAll, resumeJob,
+    queue, chapterQueue, totalQueued, enqueue, cancelQueue, stopAll, resumeJob,
+    // Pages start OCR work through this, so a page run attaches the SSE stream and
+    // flips `running` exactly as a translation does.
+    submitTask,
     resolveChapter, fixPronouns, fixPronounsFlagged,
   }
 

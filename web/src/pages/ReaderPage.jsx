@@ -5,7 +5,10 @@ import ChapterReader from '../components/ChapterReader'
 // screen over the shell; chapters + the job's re-translate come from ProjectLayout,
 // which stays mounted underneath so a running translation is never interrupted.
 export default function ReaderPage() {
-  const { pid, chapters, reload, enqueue, glossary, queue, resolveChapter, fixPronouns } = useOutletContext()
+  const {
+    pid, chapters, reload, enqueue, glossary, queue, chapterQueue,
+    resolveChapter, fixPronouns,
+  } = useOutletContext()
   const { idx } = useParams()
   const navigate = useNavigate()
   const index = Number(idx)
@@ -16,7 +19,12 @@ export default function ReaderPage() {
 
   // A repair is queued on the novel's shared worker, so "is this chapter busy?" is a
   // question about that queue, not about local state inside the reader.
-  const busy = queue?.current === index || (queue?.pending || []).includes(index)
+  //
+  // chapterQueue, not queue: the same worker also reads scanned pages, and its
+  // current/pending are PAGE numbers then. Reading page 12 used to mark chapter 12
+  // busy — every repair button disabled and the flagged banner claiming a
+  // re-translation that was not happening, on a chapter nothing was touching.
+  const busy = chapterQueue?.current === index || (chapterQueue?.pending || []).includes(index)
 
   return (
     <ChapterReader
@@ -31,7 +39,7 @@ export default function ReaderPage() {
       onResolve={resolveChapter}
       onFixPronouns={fixPronouns}
       taskRunning={busy}
-      taskKind={queue?.current === index ? queue?.kind : 'translate'}
+      taskKind={chapterQueue?.current === index ? queue?.kind : 'translate'}
       onGuide={() => navigate('/guide')}
     />
   )
