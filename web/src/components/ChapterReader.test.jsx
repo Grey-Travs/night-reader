@@ -51,6 +51,7 @@ function chapterPayload(over = {}) {
     manual_edit: false,
     has_previous: false,
     offline: false,
+    source_changed: false,
     page_ids: [],
     ...over,
   }
@@ -128,6 +129,50 @@ describe('ChapterReader renders', () => {
     api.chapter.mockRejectedValue(new Error('backend is down'))
     renderReader()
     await waitFor(() => expect(screen.getByText(/backend is down/)).toBeInTheDocument())
+  })
+})
+
+// Rebuilding a scanned novel, or correcting a page already built into a chapter,
+// replaces the chapter's Korean while the translation file stays where it is. Both
+// panes then show real text that was never a translation of each other, and the state
+// record still said "validated", so nothing told the reader.
+
+describe('a chapter whose source changed after translation', () => {
+  it('says so', async () => {
+    api.chapter.mockResolvedValue(chapterPayload({ source_changed: true }))
+    renderReader()
+    expect(await screen.findByText(/original changed after this was translated/i))
+      .toBeInTheDocument()
+  })
+
+  it('still shows the translation, which the reader paid for', async () => {
+    api.chapter.mockResolvedValue(chapterPayload({ source_changed: true }))
+    renderReader()
+    expect(await screen.findByText(/The door slid open/)).toBeInTheDocument()
+  })
+
+  it('offers the re-translate that fixes it', async () => {
+    const onRetranslate = vi.fn()
+    api.chapter.mockResolvedValue(chapterPayload({ source_changed: true }))
+    renderReader({ onRetranslate, onClose: () => {} })
+    fireEvent.click(await screen.findByRole('button', { name: /Re-translate this chapter/i }))
+    expect(onRetranslate).toHaveBeenCalledWith(1)
+  })
+
+  it('says nothing when the source still matches', async () => {
+    api.chapter.mockResolvedValue(chapterPayload())
+    renderReader()
+    await screen.findByText(/The door slid open/)
+    expect(screen.queryByText(/original changed after this was translated/i)).toBeNull()
+  })
+
+  it('says nothing on an untranslated chapter', async () => {
+    // No English means nothing to be out of step with, whatever the flag says.
+    api.chapter.mockResolvedValue(
+      chapterPayload({ source_changed: true, translation: null, status: 'pending' }))
+    renderReader()
+    await screen.findByText(/그는 천천히 문을 열었다/)
+    expect(screen.queryByText(/original changed after this was translated/i)).toBeNull()
   })
 })
 

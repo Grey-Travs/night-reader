@@ -417,6 +417,30 @@ def fetch_doc_title(doc_id: str) -> str:
     return meta.get("title", "")
 
 
+def source_changed(ch: Chapter, rec: dict) -> bool:
+    """Whether this chapter's Korean has changed since its English was made.
+
+    ``state.json`` fingerprints the source each translation was made from, and
+    :meth:`State.is_done` already compares it — which is why a plain Translate
+    re-queues such a chapter. Nothing READ that fingerprint, though, so the chapter
+    went on reporting ``validated`` with its old English file intact.
+
+    Two paths get a novel into that state, both on scanned books: rebuilding after
+    deleting or reordering pages, and correcting a page that was already built into a
+    chapter. Either replaces the Korean under a chapter while the English stays
+    exactly where it was, so the reader showed one chapter's English beside another's
+    Korean — presented as finished — and exports shipped it. The user had no reason to
+    press the one button that would have fixed it.
+
+    Only meaningful once a translation exists: an untranslated chapter has no stored
+    hash to differ from.
+    """
+    stored = rec.get("source_hash") or ""
+    return bool(stored
+                and rec.get("status") in state_mod.DONE_STATUSES
+                and stored != ch.metrics.content_hash)
+
+
 def chapter_row(ch: Chapter, cfg: Config, state: State, total: int) -> dict:
     lang = classify(ch, cfg)
     rec = state.get(ch.index) or {}
@@ -424,9 +448,16 @@ def chapter_row(ch: Chapter, cfg: Config, state: State, total: int) -> dict:
     status_val = rec.get("status") or (
         "empty" if lang == "empty" else ("english-source" if lang == "english" else "pending")
     )
+    # A translation whose source has moved on is not done, whatever the record says.
+    # Reporting it as pending is what the queue already believes (is_done compares the
+    # same hash), so this makes the list agree with the button.
+    stale = source_changed(ch, rec)
+    if stale:
+        status_val = "pending"
     return {
         "index": ch.index,
         "title": ch.title,
+        "source_changed": stale,
         "number": strip_source_header(ch.text)[1],  # real chapter number from the source header
         "language": lang,
         "paragraphs": m.paragraph_count,
@@ -1257,6 +1288,41 @@ class BuildChapters(BaseModel):
     force: bool = False
 
 
+def _refresh_built_chapters(existing: list[Chapter], doc: dict, page_map: dict,
+                            *, include: str) -> list[int]:
+    """Rebuild already-built chapters whose pages have been corrected since.
+
+    ``existing`` is mutated in place; returns the indices that actually changed.
+
+    Only a batch build attributes pages to a specific chapter. A whole-novel split
+    records ``"*"`` because it genuinely cannot say which chapter a page landed in, so
+    those are left alone rather than guessed at.
+    """
+    usable = {p.get("id") for p in ocr_build.usable_pages(doc, include=include)}
+    by_id = {p.get("id"): p for p in doc.get("pages", [])}
+    by_index = {c.index: c for c in existing}
+    changed: list[int] = []
+    for key, ids in (page_map or {}).items():
+        if not str(key).isdigit():
+            continue                      # "*" — a whole-novel split
+        target = by_index.get(int(key))
+        if target is None:
+            continue
+        run = [by_id[i] for i in ids if i in by_id and i in usable]
+        if not run:
+            # Every page behind this chapter has been deleted or un-approved. Emptying
+            # it here would lose its text without renumbering anything; dropping a
+            # chapter is what a full rebuild is for, so leave this one alone.
+            continue
+        text, _warnings = ocr_build.assemble_pages(run)
+        rebuilt = ocr_build.make_chapter(int(key), target.title, text)
+        if rebuilt is None or rebuilt.paragraphs == target.paragraphs:
+            continue
+        target.paragraphs = rebuilt.paragraphs
+        changed.append(int(key))
+    return sorted(changed)
+
+
 @app.post("/api/projects/{pid}/pages/build")
 def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
     """Turn the transcribed pages into chapters (source.json).
@@ -1271,8 +1337,18 @@ def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
 
     existing = pj.load_text_chapters(pid)
     state = State.load(cfg.paths.state_file)
+    refreshed: list[int] = []
     if body.append:
-        built_ids = set((doc.get("build") or {}).get("used_page_ids") or [])
+        prev_build = doc.get("build") or {}
+        built_ids = set(prev_build.get("used_page_ids") or [])
+        # Corrections to pages that are ALREADY in a chapter have to reach source.json
+        # too. The filter below exists so a second build does not duplicate chapters,
+        # but it also meant an edit to a built page was simply dropped: fix an OCR
+        # mistake, press Build, and the answer was "No pages are ready to build" while
+        # the chapter kept the wrong Korean forever, with no way to correct it short of
+        # a full rebuild that renumbers and re-bills the novel.
+        refreshed = _refresh_built_chapters(
+            existing, doc, prev_build.get("page_map") or {}, include=body.include)
         if built_ids:
             doc = {**doc, "pages": [p for p in doc.get("pages", [])
                                     if p.get("id") not in built_ids]}
@@ -1294,7 +1370,7 @@ def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
-    if not chapters:
+    if not chapters and not refreshed:
         raise HTTPException(
             400, "No pages are ready to build. Read the pages first, then accept the "
                  "ones that look right.")
@@ -1326,7 +1402,18 @@ def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
                          "page_map": {**(prev.get("page_map") or {}), **page_map},
                          "used_page_ids": sorted(prior | set(used))}
 
+    if refreshed:
+        which = ", ".join(str(i) for i in refreshed)
+        warnings.append(
+            f"Chapter {which} updated from pages you corrected. Their English was "
+            f"translated from the old text, so re-translate them when you're ready."
+            if len(refreshed) == 1 else
+            f"Chapters {which} were updated from pages you corrected. Their English "
+            f"was translated from the old text, so re-translate them when you're ready."
+        )
+
     return {"ok": True, "chapters": len(combined), "added": len(chapters),
+            "refreshed": refreshed,
             "warnings": warnings, "project": project_summary(project)}
 
 
@@ -1602,6 +1689,11 @@ def chapter_detail(pid: str, index: int) -> dict:
         "source": clean_source,
         "translation": translation,
         "status": rec.get("status", "pending"),
+        # The English below was made from DIFFERENT Korean than the source above — a
+        # rebuild or a page correction moved it. The translation is still served (it
+        # is real work the user paid for), but the reader has to say so rather than
+        # present the two side by side as if they matched.
+        "source_changed": source_changed(ch, rec),
         "validation": rec.get("validation"),
         "failures": rec.get("failures", []),
         "diagnosis": diagnose(rec.get("failures", []), rec.get("validation")),

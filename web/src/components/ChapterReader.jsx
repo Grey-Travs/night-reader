@@ -650,6 +650,31 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
           </h1>
         )}
 
+        {/* The Korean moved out from under the English.
+            Rebuilding a scanned novel, or correcting a page that was already built
+            into a chapter, replaces this chapter's source while the translation file
+            stays exactly where it was. Both panes below then show real text that was
+            never a translation of each other — and nothing said so, because the state
+            record still read "validated". The translation is still shown: it is work
+            the reader paid for, and it is theirs to keep or redo. */}
+        {data?.source_changed && hasTranslation && !editing && (
+          <div className="mx-auto mb-6 rounded-card border border-line px-4 py-3 text-sm"
+               style={{ maxWidth: '68ch', background: 'var(--b-review-bg)', color: 'var(--b-review-tx)' }}>
+            <div className="font-medium">The original changed after this was translated</div>
+            <p className="mt-1">
+              This English was translated from different Korean than the text shown
+              here — the pages behind this chapter were rebuilt or corrected since.
+              Re-translate the chapter to bring them back in line.
+            </p>
+            {onRetranslate && !data.offline && (
+              <button onClick={() => { onRetranslate(index); onClose() }}
+                      className="btn btn-ghost mt-2 px-3 py-1 text-xs">
+                Re-translate this chapter
+              </button>
+            )}
+          </div>
+        )}
+
         {/* review reasons */}
         {data && data.status === 'needs-review' && !editing && (failures.length > 0 || data.diagnosis?.length > 0) && (
           <div className="mx-auto mb-6 rounded-card border border-line px-4 py-3 text-sm" style={{ maxWidth: '68ch', background: 'var(--b-review-bg)', color: 'var(--b-review-tx)' }}>

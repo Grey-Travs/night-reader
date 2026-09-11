@@ -351,6 +351,90 @@ def test_an_append_keeps_the_earlier_chapters_photo_attribution(client):
     assert A._chapter_page_ids(project, 2)
 
 
+# ---- a correction to an already-built page must reach source.json ------------
+# The append filter exists so a second build does not duplicate chapters, but it also
+# dropped edits to pages already in a chapter: fix an OCR mistake, press Build, and the
+# answer was "No pages are ready to build" while the chapter kept the wrong Korean
+# forever — correctable only by a full rebuild, which renumbers and re-bills the novel.
+
+def test_correcting_a_built_page_reaches_the_chapter(client):
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _set(client, pid, page["id"], text="원래 본문입니다.", status=P.STATUS_OK)
+    client.post(f"/api/projects/{pid}/pages/build", json={"mode": "batch"})
+
+    _set(client, pid, page["id"], text="고쳐진 본문입니다.", status=P.STATUS_OK)
+    res = client.post(f"/api/projects/{pid}/pages/build",
+                      json={"mode": "batch", "append": True})
+
+    assert res.status_code == 200, res.text
+    assert res.json()["refreshed"] == [1]
+    A._chapter_cache.clear()
+    chapters = A.get_chapters(pid, pj.project_config(Config(), pj.get_project(pid)))
+    assert chapters[0].paragraphs == ["고쳐진 본문입니다."]
+
+
+def test_a_correction_says_the_translation_is_now_stale(client):
+    """Silently updating the Korean under a finished translation would be its own
+    trap, so the build says what it did and what it means."""
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _set(client, pid, page["id"], text="원래 본문입니다.", status=P.STATUS_OK)
+    client.post(f"/api/projects/{pid}/pages/build", json={"mode": "batch"})
+    _set(client, pid, page["id"], text="고쳐진 본문입니다.", status=P.STATUS_OK)
+
+    warnings = client.post(f"/api/projects/{pid}/pages/build",
+                           json={"mode": "batch", "append": True}).json()["warnings"]
+    assert any("re-translate" in w.lower() for w in warnings)
+
+
+def test_building_with_nothing_changed_is_still_refused(client):
+    """The refresh must not turn "nothing to do" into a silent success."""
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _set(client, pid, page["id"], text="원래 본문입니다.", status=P.STATUS_OK)
+    client.post(f"/api/projects/{pid}/pages/build", json={"mode": "batch"})
+
+    res = client.post(f"/api/projects/{pid}/pages/build",
+                      json={"mode": "batch", "append": True})
+    assert res.status_code == 400
+    assert "No pages are ready" in res.text
+
+
+def test_a_correction_does_not_disturb_the_other_chapters(client):
+    pid = _novel(client)
+    first = _upload(client, pid, data=JPEG).json()
+    _set(client, pid, first["page"]["id"], text="첫 장.", status=P.STATUS_OK)
+    client.post(f"/api/projects/{pid}/pages/build", json={"mode": "batch"})
+    second = _upload(client, pid, data=JPEG2).json()
+    _set(client, pid, second["page"]["id"], text="둘째 장.", status=P.STATUS_OK)
+    client.post(f"/api/projects/{pid}/pages/build",
+                json={"mode": "batch", "append": True})
+
+    _set(client, pid, first["page"]["id"], text="첫 장, 고침.", status=P.STATUS_OK)
+    res = client.post(f"/api/projects/{pid}/pages/build",
+                      json={"mode": "batch", "append": True})
+
+    assert res.json()["refreshed"] == [1], "only the corrected chapter is rebuilt"
+    A._chapter_cache.clear()
+    chapters = A.get_chapters(pid, pj.project_config(Config(), pj.get_project(pid)))
+    assert [c.paragraphs for c in chapters] == [["첫 장, 고침."], ["둘째 장."]]
+
+
+def test_a_whole_novel_split_is_not_guessed_at(client):
+    """A "single" build records page_map {"*": …} because it genuinely cannot say
+    which chapter a page landed in. Refreshing from that would be a guess."""
+    pid = _novel(client)
+    page = _upload(client, pid).json()["page"]
+    _set(client, pid, page["id"], text="원래 본문입니다.", status=P.STATUS_OK)
+    client.post(f"/api/projects/{pid}/pages/build", json={"mode": "single"})
+    _set(client, pid, page["id"], text="고쳐진 본문입니다.", status=P.STATUS_OK)
+
+    res = client.post(f"/api/projects/{pid}/pages/build",
+                      json={"mode": "single", "append": True})
+    assert res.status_code == 400, "nothing attributable to refresh, nothing new to add"
+
+
 def test_a_full_rebuild_replaces_the_attribution_rather_than_merging_it(client):
     """The merge is append-only. A rebuild renumbers from 1, so carrying the old map
     forward would attribute a chapter to photos that are no longer under it."""
