@@ -2118,7 +2118,7 @@ def _worker_owns_chapter(pid: str, index: int) -> bool:
                for i, _f, k in job.snapshot_pending())
 
 
-def _alignment_for(pid: str, ch: Chapter, blocks, k: int):
+def _alignment_for(pid: str, cfg: Config, ch: Chapter, blocks, k: int):
     """(alignment, reason-it-is-unavailable). Rephrase never needs this."""
     if pid in _offline_projects:
         return None, ("This novel is open as a saved copy, so its Korean source isn't "
@@ -2126,7 +2126,10 @@ def _alignment_for(pid: str, ch: Chapter, blocks, k: int):
     korean = stripped_chapter(ch).paragraphs
     if not korean:
         return None, "There's no Korean source stored for this chapter."
-    if hangul_fraction(ch.text) < 0.15:
+    # From config, like classify() and the pipeline both do. Hardcoding 0.15 here meant
+    # a reader who changed min_hangul_fraction got one answer from the translator and a
+    # different one from the rewrite panel on the same chapter.
+    if hangul_fraction(ch.text) < cfg.translation.min_hangul_fraction:
         return None, "This chapter's source is already English."
     alignment = align_korean([b.text for b in blocks], k, korean)
     if alignment.index < 0 or alignment.confidence < MIN_ALIGNMENT_CONFIDENCE:
@@ -2151,7 +2154,7 @@ def chapter_variants(pid: str, index: int) -> dict:
     # A whole-chapter edit may have moved paragraphs since these were written.
     variants_mod.relocate(doc, [b.text for b in blocks])
     groups = [dict(g) for g in doc.get("groups", [])]
-    _alignment, reason = _alignment_for(pid, ch, blocks, 0)
+    _alignment, reason = _alignment_for(pid, cfg, ch, blocks, 0)
     return {"index": index, "paragraph_count": len(blocks), "groups": groups,
             "retranslate_available": reason is None, "retranslate_reason": reason}
 
@@ -2159,9 +2162,9 @@ def chapter_variants(pid: str, index: int) -> dict:
 @app.post("/api/projects/{pid}/chapters/{index}/paragraph/source")
 def paragraph_source(pid: str, index: int, body: ParagraphRef) -> dict:
     """The Korean this paragraph probably came from, as a window around the best guess."""
-    _project, _cfg, ch, _total, _text, blocks = _paragraph_context(pid, index)
+    _project, cfg, ch, _total, _text, blocks = _paragraph_context(pid, index)
     k = _require_block(blocks, body.paragraph, body.expected_text)
-    alignment, reason = _alignment_for(pid, ch, blocks, k)
+    alignment, reason = _alignment_for(pid, cfg, ch, blocks, k)
     if reason:
         return {"paragraph": k, "korean": [], "focus": 0, "alignment": None,
                 "available": False, "reason": reason}
@@ -2199,7 +2202,7 @@ async def _generate_paragraph(pid: str, index: int, body: ParagraphRef, mode: st
     source_ko = None
     try:
         if mode == variants_mod.KIND_RETRANSLATE:
-            alignment, reason = _alignment_for(pid, ch, blocks, k)
+            alignment, reason = _alignment_for(pid, cfg, ch, blocks, k)
             if reason:
                 raise HTTPException(400, reason)
             korean = stripped_chapter(ch).paragraphs

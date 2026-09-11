@@ -90,6 +90,32 @@ def _rephrase(client, pid, **extra):
                        json=_ref(**extra))
 
 
+# ---- "is this chapter Korean?" must mean one thing ---------------------------
+# classify() and the pipeline both read min_hangul_fraction from config; the rewrite
+# panel's alignment check hardcoded 0.15. A reader who changed that setting got one
+# answer from the translator and a different one from the rewrite panel, on the same
+# chapter — retranslate offered where the translator had skipped the chapter as
+# already-English, or refused where it had not.
+
+def test_the_korean_threshold_comes_from_config(client, novel, monkeypatch):
+    pid, _cfg = novel
+    high = Config()
+    high.translation.min_hangul_fraction = 0.99   # nothing counts as Korean
+    monkeypatch.setattr(A, "load_global_config", lambda: high)
+    A._chapter_cache.clear()
+
+    res = client.get(f"/api/projects/{pid}/chapters/1/variants").json()
+    assert res["retranslate_available"] is False
+    assert "already English" in res["retranslate_reason"]
+
+
+def test_a_korean_chapter_is_still_retranslatable_by_default(client, novel):
+    pid, _cfg = novel
+    res = client.get(f"/api/projects/{pid}/chapters/1/variants").json()
+    assert res["retranslate_available"] is True, \
+        "the default threshold must still recognise ordinary Korean"
+
+
 # ---- reading the history -----------------------------------------------------
 
 def test_a_fresh_chapter_has_no_history(client, novel):
