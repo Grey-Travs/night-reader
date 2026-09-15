@@ -58,7 +58,8 @@ def client(monkeypatch, tmp_path):
     A._offline_projects.clear()
     A._jobs.clear()
     A._active_job_by_project.clear()
-    return TestClient(A.app, base_url="http://localhost")
+    return TestClient(A.app, base_url="http://localhost",
+                      client=("127.0.0.1", 50000))
 
 
 @pytest.fixture

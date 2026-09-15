@@ -33,7 +33,14 @@ export default function ReaderPage() {
       chapters={chapters}
       glossary={glossary}
       onClose={() => navigate(`/novel/${pid}`)}
-      onNavigate={(i) => navigate(`/novel/${pid}/chapter/${i}`)}
+      // A plain number is a chapter of THIS novel; a {pid, index} ref may be the chapter
+      // either side of a series boundary, which lives in a different Google Doc. Sending
+      // the reader to that novel's own route remounts ProjectLayout for it, which is
+      // correct — you are not translating the document you are reading.
+      onNavigate={(target) => {
+        const ref = typeof target === 'number' ? { project_id: pid, index: target } : target
+        navigate(`/novel/${ref.project_id || pid}/chapter/${ref.index}`)
+      }}
       onChanged={reload}
       onRetranslate={(i) => enqueue([i], true)}
       onResolve={resolveChapter}

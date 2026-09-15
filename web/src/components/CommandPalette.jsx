@@ -7,6 +7,8 @@ import { api } from '../api'
 // not reach Scans or Upkeep at all.
 const STATIC = [
   { label: 'Library', sub: 'All your novels', to: '/' },
+  { label: 'Series', sub: 'Novels split across several documents', to: '/series' },
+  { label: 'Posting', sub: 'What a publishing run would do', to: '/posting' },
   { label: 'Activity', sub: 'Running translations', to: '/activity' },
   { label: 'Needs review', sub: 'Flagged chapters', to: '/review' },
   { label: 'Scans', sub: 'Novels read from photos', to: '/scans' },

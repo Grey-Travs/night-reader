@@ -2,6 +2,9 @@ import { Children, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api'
 import { blockIndexAt, isPlainParagraph, splitBlocks } from '../blocks'
+// One converter, mirrored in translation_bot/mdhtml.py, so what Copy puts on the
+// clipboard is byte-for-byte what the posting payload sends.
+import { markdownToHtml, stripLeadingHeading } from '../mdhtml'
 import { Badge } from './ui'
 import Hint from './Hint'
 import ParagraphPanel from './ParagraphPanel'
@@ -80,40 +83,6 @@ function SourceProse({ text, lang, style }) {
   return <article className="korean mx-auto" style={style}>{paras.map((p, i) => <p key={i} className="mb-4">{p}</p>)}</article>
 }
 
-function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-// Inline Markdown emphasis -> HTML, so it pastes as actual italic/bold.
-function inlineHtml(s) {
-  return escapeHtml(s)
-    .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/(?<!\w)_(.+?)_(?!\w)/g, '<em>$1</em>')
-    .replace(/`([^`]+)`/g, '$1')
-}
-
-// Drop a leading chapter-number/title heading (e.g. "# 12") so Copy gives just the
-// prose. Only the very first block is removed, and only when it's a heading.
-function stripLeadingHeading(md) {
-  return (md || '').replace(/^﻿?\s*#{1,6}[ \t]+[^\n]*(?:\n+|$)/, '')
-}
-
-// Render the chapter Markdown to HTML so copying preserves italics, bold, and the
-// *** thematic break (as a real <hr> line) when pasted into Docs/Word/email.
-function mdToHtml(md) {
-  return (md || '').replace(/\r\n/g, '\n').trim().split(/\n\s*\n/).map((b) => {
-    b = b.trim()
-    if (!b) return ''
-    if (/^(?:[-*_] *){3,}$/.test(b)) return '<hr>'
-    const h = b.match(/^(#{1,6})\s+(.*)$/)
-    if (h) { const lv = Math.min(h[1].length, 6); return `<h${lv}>${inlineHtml(h[2].trim())}</h${lv}>` }
-    if (b.startsWith('>')) return `<blockquote><p>${inlineHtml(b.replace(/^[ \t]{0,3}>[ \t]?/gm, '')).replace(/\n/g, '<br>')}</p></blockquote>`
-    return `<p>${b.split('\n').map(inlineHtml).join('<br>')}</p>`
-  }).filter(Boolean).join('\n')
-}
-
 function downloadText(filename, text, type = 'text/markdown') {
   const url = URL.createObjectURL(new Blob([text], { type }))
   const a = document.createElement('a')
@@ -162,7 +131,7 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
   // paste into Docs/Word), keeping the raw text as the plain-text fallback.
   async function copyChapter(rawMd) {
     const md = stripLeadingHeading(rawMd)
-    const html = mdToHtml(md)
+    const html = markdownToHtml(md)
     let ok = false
     try {
       if (navigator.clipboard?.write && window.ClipboardItem) {
@@ -278,11 +247,27 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     if (block) setParaPanel({ paragraph: k, text: block.text })
   }, [blocks])
 
-  // Neighbour chapters for prev/next (across the whole novel, in order).
+  // Neighbour chapters for prev/next, as {pid, index} refs.
+  //
+  // Within one novel that is just its chapter list. When the novel is part of a series
+  // the server resolves the neighbours instead, and the one either side of a boundary
+  // lives in a DIFFERENT Google Doc — which is what lets chapter 100 flow straight into
+  // the next document's chapter 1. The in-novel calculation stays as the fallback, so a
+  // novel in no series behaves exactly as it always did.
   const order = (chapters || []).map((c) => c.index)
   const pos = order.indexOf(index)
-  const prevIndex = pos > 0 ? order[pos - 1] : null
-  const nextIndex = pos >= 0 && pos < order.length - 1 ? order[pos + 1] : null
+  const prevInNovel = pos > 0 ? order[pos - 1] : null
+  const nextInNovel = pos >= 0 && pos < order.length - 1 ? order[pos + 1] : null
+  // `project_id`, not `pid` — the same field name the server uses for a neighbour, so the
+  // in-novel fallback and the server's cross-document ref are the same shape. They were
+  // not: the server sent `project_id` while the navigator read `pid`, so crossing a
+  // boundary kept the CURRENT novel's id and used the other novel's index. Chapter 100
+  // led to chapter 1 of the same document, and chapter 101's Prev asked part 2 for a
+  // chapter 100 it does not have.
+  const prevRef = data?.prev
+    || (prevInNovel != null ? { project_id: pid, index: prevInNovel } : null)
+  const nextRef = data?.next
+    || (nextInNovel != null ? { project_id: pid, index: nextInNovel } : null)
 
   // Esc backs out one layer at a time (popover → edit mode → close), so it never
   // throws away an in-progress edit. ←/→ flip chapters (unless typing in a field).
@@ -317,12 +302,12 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
         if (best) openParagraph(Number(best.dataset.para))
         return
       }
-      if (e.key === 'ArrowLeft' && prevIndex != null) onNavigate(prevIndex)
-      if (e.key === 'ArrowRight' && nextIndex != null) onNavigate(nextIndex)
+      if (e.key === 'ArrowLeft' && prevRef) onNavigate(prevRef)
+      if (e.key === 'ArrowRight' && nextRef) onNavigate(nextRef)
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose, onNavigate, prevIndex, nextIndex, editing, showType, showShortcuts,
+  }, [onClose, onNavigate, prevRef, nextRef, editing, showType, showShortcuts,
       paraPanel, openParagraph])
 
   function updatePrefs(patch) {
@@ -358,9 +343,9 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
     if (now - lastSave.current > 350) { lastSave.current = now; setScrollPos(pid, index, ratio) }
     // `!paraPanel`: applying a shorter version can push the ratio past the threshold,
     // which would flip to the next chapter out from under an open rewrite.
-    if (prefs.autoAdvance && !editing && !paraPanel && nextIndex != null && !advancedRef.current && ratio >= 0.992) {
+    if (prefs.autoAdvance && !editing && !paraPanel && nextRef && !advancedRef.current && ratio >= 0.992) {
       advancedRef.current = true
-      onNavigate(nextIndex)
+      onNavigate(nextRef)
     }
   }
 
@@ -520,8 +505,8 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
       >
         <button onClick={onClose} className="btn btn-quiet text-sm" aria-label="Back">← Back</button>
         <div className="flex min-w-0 items-center gap-2">
-          <span className="hidden truncate text-sm text-muted sm:inline">Chapter {data?.number || index}</span>
-          <span className="text-sm text-muted sm:hidden">Ch {data?.number || index}</span>
+          <span className="hidden truncate text-sm text-muted sm:inline">Chapter {data?.global ?? data?.number ?? index}</span>
+          <span className="text-sm text-muted sm:hidden">Ch {data?.global ?? data?.number ?? index}</span>
           {data && <Badge status={data.status} />}
         </div>
         <div className="flex items-center gap-1">
@@ -592,8 +577,8 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
       {data && !editing && (
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2 px-5 pt-4 sm:px-8">
           <div className="flex items-center gap-1.5">
-            <button onClick={() => prevIndex != null && onNavigate(prevIndex)} disabled={prevIndex == null} className="btn btn-ghost px-3 py-1.5 text-xs">← Prev</button>
-            <button onClick={() => nextIndex != null && onNavigate(nextIndex)} disabled={nextIndex == null} className="btn btn-ghost px-3 py-1.5 text-xs">Next →</button>
+            <button onClick={() => prevRef && onNavigate(prevRef)} disabled={!prevRef} className="btn btn-ghost px-3 py-1.5 text-xs">← Prev</button>
+            <button onClick={() => nextRef && onNavigate(nextRef)} disabled={!nextRef} className="btn btn-ghost px-3 py-1.5 text-xs">Next →</button>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {copyableText && (
@@ -644,9 +629,9 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
 
         {/* Prominent chapter heading — page chrome from the chapter's own number, NOT
             part of the prose, so "Copy text" never includes it. */}
-        {data && data.number && !editing && (
+        {data && (data.global ?? data.number) && !editing && (
           <h1 className="reading mx-auto mb-6 text-center font-semibold" style={{ maxWidth: '68ch', fontSize: `${Math.round(prefs.fontSize * 1.5)}px`, color: th.ink, fontFamily: fontFam }}>
-            Chapter {data.number}
+            Chapter {data.global ?? data.number}
           </h1>
         )}
 
@@ -843,9 +828,11 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
         {/* Bottom navigation — so you don't have to scroll back up to flip chapters. */}
         {data && !editing && (
           <div className="mx-auto mt-12 flex max-w-3xl items-center justify-between gap-2 pb-10">
-            <button onClick={() => prevIndex != null && onNavigate(prevIndex)} disabled={prevIndex == null} className="btn btn-ghost px-4 py-2 text-sm">◂ Prev</button>
-            <span className="text-xs text-hint">{data.number ? `Chapter ${data.number}` : `Ch ${index}`}</span>
-            <button onClick={() => nextIndex != null && onNavigate(nextIndex)} disabled={nextIndex == null} className="btn btn-primary px-5 py-2.5 text-sm">Next chapter ▸</button>
+            <button onClick={() => prevRef && onNavigate(prevRef)} disabled={!prevRef} className="btn btn-ghost px-4 py-2 text-sm">◂ Prev</button>
+            <span className="text-xs text-hint">
+              {(data.global ?? data.number) ? `Chapter ${data.global ?? data.number}` : `Ch ${index}`}
+            </span>
+            <button onClick={() => nextRef && onNavigate(nextRef)} disabled={!nextRef} className="btn btn-primary px-5 py-2.5 text-sm">Next chapter ▸</button>
           </div>
         )}
       </div>

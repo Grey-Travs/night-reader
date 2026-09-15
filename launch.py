@@ -27,6 +27,11 @@ DIST = WEB / "dist"
 VITE = WEB / "node_modules" / "vite" / "bin" / "vite.js"
 HOST, PORT = "127.0.0.1", 8000
 URL = f"http://localhost:{PORT}"
+# Serving every interface rather than just loopback is what lets a phone reach
+# the app. Uvicorn binds one address, and loopback has to keep working for the
+# desktop browser and the extension, so it is all-or-nothing: the access key is
+# what protects it. See server/remote.py.
+ANY_INTERFACE = "0.0.0.0"
 
 
 def ensure_config() -> None:
@@ -120,6 +125,25 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def remote_state() -> dict:
+    """Whether this app may answer other devices, and how to reach it.
+
+    Read here rather than passed as a flag: the switch in Settings is the deliberate act,
+    and needing to remember a command-line argument as well would only mean the feature
+    quietly not working after a restart.
+    """
+    try:
+        from server import remote
+    except Exception:  # noqa: BLE001 - a broken import must not stop the app starting
+        return {"enabled": False, "url": "", "addresses": []}
+    try:
+        doc = remote.ensure_token() if remote.load()["enabled"] else remote.load()
+        return {"enabled": doc["enabled"], "url": remote.phone_url(PORT),
+                "addresses": remote.addresses(PORT)}
+    except Exception:  # noqa: BLE001
+        return {"enabled": False, "url": "", "addresses": []}
+
+
 def app_is_running() -> bool:
     """Whether an instance of the app is already serving on the usual port.
 
@@ -158,13 +182,23 @@ def main() -> None:
 
     print("\n  Translation Bot is starting…")
     print(f"  Open {URL} in your browser (it should open automatically).")
-    print("  Leave this window open while you use the app. Close it to quit.\n")
+    away = remote_state()
+    host = ANY_INTERFACE if away["enabled"] else HOST
+    if away["enabled"]:
+        print("\n  Other devices can reach this app, because 'Use from your phone' is on.")
+        if away["url"]:
+            print(f"  On your phone, open:\n    {away['url']}")
+        else:
+            print("  No reachable address was found yet - connect Tailscale, or")
+            print("  check Settings on this computer for the link.")
+        print("  That link carries the access key; anything without it is refused.")
+    print("\n  Leave this window open while you use the app. Close it to quit.\n")
 
     threading.Thread(target=open_browser_later, daemon=True).start()
 
     import uvicorn
 
-    uvicorn.run("server.app:app", host=HOST, port=PORT, log_level="warning")
+    uvicorn.run("server.app:app", host=host, port=PORT, log_level="warning")
 
 
 if __name__ == "__main__":

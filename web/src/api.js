@@ -140,4 +140,61 @@ export const api = {
   queueOverview: () => get('/api/queue'),
   activeJob: (pid) => get(`/api/projects/${pid}/active-job`),
   streamUrl: (pid, jobId) => `/api/projects/${pid}/translate/${jobId}/stream`,
+
+  // Series: several Google Docs that are really one novel. A doc caps out around 100
+  // tabs, so a long novel arrives split, and the library would otherwise show the parts
+  // as unrelated novels with separate glossaries.
+  listSeries: () => get('/api/series'),
+  suggestSeries: () => get('/api/series/suggest'),
+  createSeries: (name, projectIds) => post('/api/series', { name, project_ids: projectIds }),
+  series: (sid) => get(`/api/series/${sid}`),
+  updateSeries: (sid, body) => post(`/api/series/${sid}`, body),
+  // Unlinks the series only — the member novels are never deleted.
+  deleteSeries: (sid) => del(`/api/series/${sid}`),
+  // refresh=true re-reads the documents; without it the stored numbering is served as-is,
+  // because a resolved chapter number must never be silently recomputed.
+  seriesMapping: (sid, refresh = false) =>
+    get(`/api/series/${sid}/mapping${refresh ? '?refresh=true' : ''}`),
+  confirmSeriesMapping: (sid, overrides) => put(`/api/series/${sid}/mapping`, { overrides }),
+  // dry_run reports every disagreement with its evidence and writes nothing. This is the
+  // one step that changes what FUTURE translations read, so it gets a look first.
+  mergeSeriesGlossary: (sid, picks = {}, dryRun = true) =>
+    post(`/api/series/${sid}/glossary/merge`, { picks, dry_run: dryRun }),
+
+  // Set every series' publishing link from the site's own series export. Matching
+  // reports only; applying writes just the URL and leaves pricing alone.
+  matchPublishLinks: (csv) => post('/api/posting/targets/match', { csv }),
+  applyPublishLinks: (assignments) => post('/api/posting/targets/apply', { assignments }),
+
+  // What a posting run would do. Writes nothing and opens no browser — this is the gate
+  // in front of the free/paid cutoff, which is painful to change once readers have been
+  // through a chapter.
+  postingPlan: (sid, { targetId, start, end } = {}) => {
+    const q = new URLSearchParams({ sid })
+    if (targetId) q.set('target_id', targetId)
+    if (start) q.set('start', String(start))
+    if (end) q.set('end', String(end))
+    return get(`/api/posting/plan?${q}`)
+  },
+  postingLedger: (sid, targetId = 'default') =>
+    get(`/api/posting/ledger?${new URLSearchParams({ sid, target_id: targetId })}`),
+
+  // Starting a run. The app cannot post — only the extension, inside the logged-in
+  // browser, can — so pressing Start leaves a request in a file that an open meiko tab
+  // picks up on its next poll. That indirection is also what makes a phone trigger work:
+  // the run waits on disk rather than in the tab that asked for it.
+  postingRun: (sid, targetId = 'default') =>
+    get(`/api/posting/run?${new URLSearchParams({ sid, target_id: targetId })}`),
+  startPostingRun: (sid, targetId, options) =>
+    post('/api/posting/run', { sid, target_id: targetId, options }),
+  cancelPostingRun: (sid, targetId = 'default') =>
+    del(`/api/posting/run?${new URLSearchParams({ sid, target_id: targetId })}`),
+  resumePostingRun: (sid, targetId = 'default') =>
+    post('/api/posting/run/resume', { sid, target_id: targetId }),
+
+  // Reaching this app from a phone, so a run can be started from anywhere. The access key
+  // rides in a cookie once the phone has opened the link, so nothing here has to carry it.
+  remote: () => get('/api/remote'),
+  updateRemote: (body) => post('/api/remote', body),
+  testRemoteNotification: () => post('/api/remote/test-notification'),
 }

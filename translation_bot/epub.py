@@ -9,11 +9,10 @@ the standard library (``zipfile``). The chapter bodies are light Markdown
 from __future__ import annotations
 
 import html
-import re
 import uuid
 import zipfile
 from pathlib import Path
-from .textsplit import SEP_RE
+from .mdhtml import markdown_to_html
 
 _CSS = """\
 body { font-family: Georgia, 'Times New Roman', serif; line-height: 1.6; margin: 5%; }
@@ -26,37 +25,15 @@ blockquote { border-left: 2px solid #999; padding-left: 1em; color: #555; margin
 """
 
 
-def _inline(text: str) -> str:
-    """Escape, then apply **bold** and *italic* (after escaping, so user text is safe)."""
-    out = html.escape(text)
-    out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
-    out = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<em>\1</em>", out)
-    return out
-
-
 def _markdown_to_xhtml(md: str) -> str:
-    """Convert the small Markdown subset the translator emits into XHTML body."""
-    blocks = SEP_RE.split((md or "").strip())
-    parts: list[str] = []
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        if re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", block):
-            parts.append("<hr/>")
-            continue
-        m = re.match(r"^(#{1,6})\s+(.*)$", block)
-        if m:
-            level = min(len(m.group(1)), 6)
-            parts.append(f"<h{level}>{_inline(m.group(2).strip())}</h{level}>")
-            continue
-        if block.startswith(">"):
-            inner = "<br/>".join(_inline(re.sub(r"^>\s?", "", ln)) for ln in block.split("\n"))
-            parts.append(f"<blockquote><p>{inner}</p></blockquote>")
-            continue
-        # Ordinary paragraph; preserve hard line breaks within it.
-        parts.append("<p>" + "<br/>".join(_inline(ln) for ln in block.split("\n")) + "</p>")
-    return "\n".join(parts)
+    """The translator's Markdown subset as an XHTML body.
+
+    Kept as a name because that is what this module's readers look for; the conversion
+    itself lives in :mod:`translation_bot.mdhtml`, shared with the posting payload and
+    mirrored in ``web/src/mdhtml.js`` so the reader's Copy button cannot drift from what
+    gets exported or published.
+    """
+    return markdown_to_html(md, xhtml=True)
 
 
 def _chapter_doc(title: str, body_md: str) -> str:

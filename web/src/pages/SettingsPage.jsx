@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { api } from '../api'
 import { Dot } from '../components/ui'
+import RemoteAccess from '../components/RemoteAccess'
 
 const MODELS = [
   { id: 'claude-opus-5', label: 'Opus — best quality (recommended)' },
@@ -105,6 +106,8 @@ export default function SettingsPage() {
         </div>
         <p className="text-xs text-hint">Google is needed only for reading Google Docs. Pasted-text novels work without it.</p>
       </section>
+
+      <RemoteAccess />
     </div>
   )
 }

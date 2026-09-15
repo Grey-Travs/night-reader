@@ -5,6 +5,9 @@ import AppShell from './components/AppShell'
 import SetupWizard from './components/SetupWizard'
 import ProjectLayout from './components/ProjectLayout'
 import LibraryPage from './pages/LibraryPage'
+import SeriesPage from './pages/SeriesPage'
+import SeriesDetailPage from './pages/SeriesDetailPage'
+import PostingPage from './pages/PostingPage'
 import ActivityPage from './pages/ActivityPage'
 import ArchivePage from './pages/ArchivePage'
 import ReviewPage from './pages/ReviewPage'
@@ -64,6 +67,9 @@ export default function App() {
       <Routes>
         <Route element={<AppShell status={status} setStatus={setStatus} onSetup={() => setForceSetup(true)} />}>
           <Route index element={<LibraryPage />} />
+          <Route path="series" element={<SeriesPage />} />
+          <Route path="series/:sid" element={<SeriesDetailPage />} />
+          <Route path="posting" element={<PostingPage />} />
           <Route path="activity" element={<ActivityPage />} />
           <Route path="review" element={<ReviewPage />} />
           <Route path="scans" element={<ScansPage />} />

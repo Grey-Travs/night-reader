@@ -241,3 +241,62 @@ describe('the rewrite drawer', () => {
     expect(await screen.findByText(/"Coming\?" she said\./)).toBeInTheDocument()
   })
 })
+
+// A novel longer than ~100 chapters is split across several Google Docs, so the chapter
+// after the last one lives in a DIFFERENT novel. The server says which in a neighbour ref.
+//
+// This shipped broken: the server sends `project_id` and the navigator read `pid`, so
+// crossing a boundary silently kept the CURRENT novel's id and used the other novel's
+// index. Chapter 100's Next landed on chapter 1 of the same document, and chapter 101's
+// Prev asked a 4-chapter document for its chapter 100. Both are URLs the reader builds
+// itself, so only exercising the navigation catches it — the build was happy throughout.
+describe('ChapterReader crosses a document boundary', () => {
+  const NEXT = { project_id: 'ffffffffffff', index: 1, global: 101, kind: 'chapter' }
+  const PREV = { project_id: 'aaaaaaaaaaaa', index: 100, global: 100, kind: 'chapter' }
+
+  beforeEach(() => {
+    api.chapter.mockResolvedValue(chapterPayload({ global: 100, next: NEXT, prev: PREV }))
+  })
+
+  it('sends Next to the neighbour’s own novel, not the current one', async () => {
+    const onNavigate = vi.fn()
+    renderReader({ onNavigate })
+    await screen.findByText(/The door slid open/)
+    fireEvent.click(screen.getByRole('button', { name: /Next chapter/i }))
+    expect(onNavigate).toHaveBeenCalledTimes(1)
+    const ref = onNavigate.mock.calls[0][0]
+    expect(ref.project_id).toBe('ffffffffffff')
+    expect(ref.index).toBe(1)
+  })
+
+  it('sends Prev to the previous novel', async () => {
+    const onNavigate = vi.fn()
+    const { container } = renderReader({ onNavigate })
+    await screen.findByText(/The door slid open/)
+    const prev = [...container.querySelectorAll('button')]
+      .find((b) => /Prev/i.test(b.textContent))
+    fireEvent.click(prev)
+    const ref = onNavigate.mock.calls[0][0]
+    expect(ref.project_id).toBe('aaaaaaaaaaaa')
+    expect(ref.index).toBe(100)
+  })
+
+  it('shows the series chapter number, not the document’s own', async () => {
+    // Part 2's first tab is its chapter 1 but the series' chapter 101. Labelling it "1"
+    // right after chapter 100 made a correct jump look like a loop back to the start.
+    renderReader()
+    await screen.findByText(/The door slid open/)
+    expect(screen.getAllByText(/Chapter 100/).length).toBeGreaterThan(0)
+  })
+
+  it('falls back to its own chapter list when the novel is in no series', async () => {
+    api.chapter.mockResolvedValue(chapterPayload())  // no prev/next, no global
+    const onNavigate = vi.fn()
+    renderReader({ onNavigate })
+    await screen.findByText(/The door slid open/)
+    fireEvent.click(screen.getByRole('button', { name: /Next chapter/i }))
+    const ref = onNavigate.mock.calls[0][0]
+    expect(ref.project_id).toBe('abcdef012345')   // the novel it is already in
+    expect(ref.index).toBe(2)
+  })
+})

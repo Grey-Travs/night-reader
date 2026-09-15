@@ -1,0 +1,92 @@
+/* A small fixed panel on meiko.studio. Scoped names so nothing can collide with the
+   site's own styles, and `all: initial` on the root so the site's CSS cannot reach in. */
+.nr-panel {
+  all: initial;
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 2147483647;
+  width: 420px;
+  max-height: 62vh;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #14121a;
+  border: 1px solid #3a3446;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #e8e3ee;
+}
+
+.nr-panel * { all: unset; font: inherit; color: inherit; box-sizing: border-box; }
+
+/* Collapsed to just its header, for when it sits over a button on the page. The site's own
+   Save and Submit live in the same corners a floating panel wants, so getting out of the
+   way has to be one click. */
+.nr-panel.nr-collapsed { width: auto; max-height: none; }
+.nr-panel.nr-collapsed .nr-row,
+.nr-panel.nr-collapsed .nr-out { display: none; }
+
+.nr-head { display: flex; align-items: center; gap: 8px; cursor: move; user-select: none; }
+.nr-head strong { font-weight: 600; }
+
+.nr-fold { cursor: pointer; padding: 0 4px; color: #968e9c; }
+.nr-fold:hover { color: #e8e3ee; }
+/* The loaded version. An unpacked extension needs reloading by hand, so this is how you
+   tell whether a change is actually running. */
+.nr-ver { font-size: 10px; color: #6f6878; }
+/* Visible while folded, which is the point: fold the panel, do the thing on the
+   page, and watch this change. */
+.nr-writes { font-size: 10px; color: #968e9c; }
+/* Whether a run from the app is being watched for, and how far one has got. */
+.nr-watch { font-size: 10px; color: #968e9c; }
+.nr-watch.nr-ok { color: #6fbf8a; }
+.nr-status { margin-left: auto; font-size: 11px; color: #968e9c; }
+.nr-ok { color: #6fcf97; }
+.nr-bad { color: #eb5757; }
+
+.nr-x { cursor: pointer; padding: 0 4px; color: #968e9c; }
+.nr-x:hover { color: #e8e3ee; }
+
+.nr-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+/* The diagnostics are a second row and deliberately quieter: posting is the everyday
+   action, and probes are only for when the site changes under us. */
+.nr-diag { opacity: .6; }
+.nr-diag:hover { opacity: 1; }
+
+.nr-lbl { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #968e9c; }
+.nr-count {
+  width: 48px; padding: 4px 6px; border-radius: 6px;
+  background: #0d0b12; border: 1px solid #3a3446; color: #e8e3ee; font-size: 11px;
+}
+/* The buttons that write to a live site, marked so they are not pressed by accident. */
+.nr-go { border-color: #4a6f4f; }
+.nr-go:hover { background: #2c3a2e; }
+
+.nr-btn {
+  cursor: pointer;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: #2a2531;
+  border: 1px solid #3a3446;
+  font-size: 11px;
+}
+.nr-btn:hover { background: #352f3e; }
+
+.nr-out {
+  display: block;
+  overflow: auto;
+  max-height: 46vh;
+  min-height: 60px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #0d0b12;
+  border: 1px solid #2a2531;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  color: #cfc8d6;
+  user-select: text;
+}

@@ -2,12 +2,17 @@
 client_secret*.json
 token.json
 .env
+# Holds the access key for reaching this app from a phone (see server/remote.py). It is
+# created only when that is switched on, which is exactly why it has to be listed before
+# then rather than after.
+remote.json
 
 # Personal config (holds your settings; copy from config.example.toml)
 config.toml
 
 # Your translated novels & progress (per-user data)
 projects/
+series/
 chapters/
 audit/
 glossary.json

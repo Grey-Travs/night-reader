@@ -370,6 +370,20 @@ def project_config(global_cfg: Config, project: dict) -> Config:
     cfg.paths.glossary_json = pdir / "glossary.json"
     cfg.paths.glossary_md = pdir / "glossary.md"
     cfg.paths.glossary_pending = pdir / "glossary_pending.json"
+    # A novel that is part of a series reads and writes the SERIES glossary, so a
+    # character's locked spelling cannot reset at chapter 101 when the story carries on
+    # into the next Google Doc. Every existing caller — glossary.py, the pipeline, the
+    # pending-approval endpoints — picks this up with no change of its own, which is the
+    # whole reason the redirect lives here. Returns None until the glossaries have
+    # actually been merged, and for every novel that is in no series.
+    #
+    # Imported inside the function because server.series imports this module.
+    from . import series as series_mod
+    sdir = series_mod.glossary_dir_for_project(project["id"])
+    if sdir is not None:
+        cfg.paths.glossary_json = sdir / "glossary.json"
+        cfg.paths.glossary_md = sdir / "glossary.md"
+        cfg.paths.glossary_pending = sdir / "glossary_pending.json"
     cfg.paths.state_file = pdir / "state.json"
     cfg.paths.audit_dir = pdir / "audit"
     # Per-novel style overrides (genre/tone framing, free-form instructions, honorifics).

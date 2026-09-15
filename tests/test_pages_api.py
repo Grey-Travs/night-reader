@@ -50,7 +50,8 @@ def client(monkeypatch, tmp_path):
     A._chapter_cache.clear()
     # The app only trusts localhost/127.0.0.1 (the API is unauthenticated and acts on
     # local files), so the test client has to present an allowed Host.
-    return TestClient(A.app, base_url="http://localhost")
+    return TestClient(A.app, base_url="http://localhost",
+                      client=("127.0.0.1", 50000))
 
 
 def _novel(client) -> str:

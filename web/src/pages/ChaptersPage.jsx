@@ -349,7 +349,7 @@ export default function ChaptersPage() {
                       </td>
                       <td className="px-4 py-2 tabular-nums text-hint">{ch.index}</td>
                       <td className="px-4 py-2 font-medium">
-                        <button onClick={() => openReader(ch.index)} className="text-left hover:text-accent-text hover:underline">{ch.number ? `Chapter ${ch.number}` : ch.title}</button>
+                        <button onClick={() => openReader(ch.index)} className="text-left hover:text-accent-text hover:underline">{(ch.global ?? ch.number) ? `Chapter ${ch.global ?? ch.number}` : ch.title}</button>
                         {ch.has_output && !readSet.has(ch.index) && (
                           <span title="Unread" className="ml-2 inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: 'var(--accent)' }} />
                         )}

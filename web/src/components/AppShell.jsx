@@ -10,6 +10,8 @@ import CommandPalette from './CommandPalette'
 // nothing is buried in per-screen header buttons anymore.
 const NAV = [
   { to: '/', end: true, icon: '📚', label: 'Library' },
+  { to: '/series', icon: '📖', label: 'Series' },
+  { to: '/posting', icon: '📤', label: 'Posting' },
   { to: '/activity', icon: '⚡', label: 'Activity' },
   { to: '/review', icon: '🚩', label: 'Review' },
   { to: '/scans', icon: '📷', label: 'Scans' },

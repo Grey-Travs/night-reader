@@ -14,7 +14,9 @@ import asyncio
 import csv
 import io
 import json
+import os
 import re
+import socket
 import threading
 import time
 import unicodedata
@@ -93,8 +95,12 @@ from . import console
 from . import errors
 from .locks import file_lock
 from . import ocr_build
+from . import glossary_merge
 from . import pages as pages_mod
+from . import posting
+from . import remote
 from . import projects as pj
+from . import series as series_mod
 from . import variants as variants_mod
 from .bulk import MAX_ROWS, MAX_UNTYPED, prepare_bulk_rows, split_flat
 from translation_bot.textsplit import SEP_RE
@@ -103,12 +109,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.toml"
 CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 DIST_DIR = PROJECT_ROOT / "web" / "dist"
+# Only so the app can hand out a link to ITSELF for a phone to open. launch.py
+# serves on 8000; an override exists for anyone running uvicorn by hand.
+PORT = int(os.environ.get("NR_PORT") or 8000)
 
 app = FastAPI(title="Korean Web-Novel Translation Bot")
-# This API is unauthenticated and acts on local data, so lock it to the loopback
-# interface. TrustedHost rejects foreign Host headers (DNS-rebinding defense); CORS
+# This API acts on local data and has no accounts, so loopback binding IS its
+# authentication. TrustedHost rejects foreign Host headers (DNS-rebinding defense); CORS
 # is limited to the local dev origins (in production, frontend + API are same-origin).
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+#
+# remote.allowed_hosts() returns exactly the two loopback names until "use from your phone"
+# is switched on, at which point it adds this machine's own names and addresses - and
+# removes them again when it is switched off. The Host check stays a whitelist either way;
+# it is never opened to "*", because it is the only thing standing between a DNS-rebinding
+# page and a library that trusts loopback. See server/remote.py.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=remote.allowed_hosts())
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -118,6 +133,143 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --- reaching this app from a phone ----------------------------------------
+#
+# Everything below loopback is unauthenticated on purpose: this API acts on local files and
+# being bound to 127.0.0.1 IS the authentication. Starting a posting run from a phone needs
+# the interface reachable from elsewhere, which retires that arrangement, so a token takes
+# over the moment a request does not come from this machine.
+#
+# Loopback is left exactly as it was. That is the path that works today - the desktop app,
+# the Vite dev proxy, and the browser extension's service worker all speak to
+# localhost:8000 - and none of them should acquire a way to break.
+#
+# Added LAST, so it is the outermost middleware and the cheapest, most important check runs
+# first. Note this does not weaken the Host check below it: a DNS-rebinding page's requests
+# arrive FROM loopback and so skip the token, and TrustedHostMiddleware is what stops them.
+
+
+@app.middleware("http")
+async def _remote_gate(request: Request, call_next):
+    client = request.client.host if request.client else None
+    if remote.is_loopback(client):
+        return await call_next(request)
+
+    doc = remote.load()
+    if not doc["enabled"]:
+        return JSONResponse(status_code=403, content={"detail": errors.as_dict(
+            errors.Explained(
+                code="remote-disabled",
+                title="This app is only reachable from the computer it runs on.",
+                what=("Something outside this machine asked for a page. Night Reader acts "
+                      "on local files and has no accounts, so it answers only the computer "
+                      "it runs on until told otherwise."),
+                fixes=["On that computer, open Settings and switch on 'Use from your "
+                       "phone', then open the link it gives you."],
+                status=403))})
+
+    supplied = remote.token_from_request(
+        request.headers, request.cookies, request.query_params)
+    if not remote.token_matches(supplied, doc["token"]):
+        return JSONResponse(status_code=403, content={"detail": errors.as_dict(
+            errors.Explained(
+                code="remote-token",
+                title="That link is missing its access key.",
+                what=("Reaching Night Reader from another device needs the key from its "
+                      "Settings page. Without it the request is refused."),
+                fixes=["On the computer running Night Reader, open Settings and copy the "
+                       "phone link - it has the key in it.",
+                       "If you changed the key recently, the old link stopped working and "
+                       "you need the new one."],
+                status=403))})
+
+    response = await call_next(request)
+    # Arrived in the query string, so plant it. This is what makes the phone need the link
+    # ONCE rather than the frontend having to carry an auth header on every request - which
+    # in turn is why no frontend code knows this exists and none of it can get it wrong.
+    if request.query_params.get(remote.TOKEN_QUERY):
+        response.set_cookie(
+            remote.TOKEN_COOKIE, doc["token"], max_age=remote.COOKIE_MAX_AGE,
+            httponly=True, samesite="lax", path="/")
+    return response
+
+
+class RemoteSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool | None = None
+    # Replace the key. Only from the computer itself: doing it from the phone would revoke
+    # the link that phone is holding.
+    rotate: bool | None = None
+    notify_url: str | None = None
+    extra_hosts: list[str] | None = None
+
+
+def _remote_state(request: Request) -> dict:
+    """What the Settings page needs, minus anything a remote caller should not be handed.
+
+    The key and the link containing it are shown only to the computer itself. A phone that
+    is already connected has no need for them, and a page open on a phone is a page that
+    can be over someone else's shoulder.
+    """
+    doc = remote.load()
+    local = remote.is_loopback(request.client.host if request.client else None)
+    state = {
+        "enabled": doc["enabled"],
+        "has_token": bool(doc["token"]),
+        "notify_url": doc["notify_url"],
+        "extra_hosts": doc["extra_hosts"],
+        "hostname": socket.gethostname(),
+        "addresses": remote.addresses(PORT),
+        "local": local,
+    }
+    if local:
+        state["token"] = doc["token"]
+        state["phone_url"] = remote.phone_url(PORT)
+    return state
+
+
+@app.get("/api/remote")
+def get_remote(request: Request) -> dict:
+    return _remote_state(request)
+
+
+@app.post("/api/remote")
+def set_remote(request: Request, body: RemoteSettings) -> dict:
+    local = remote.is_loopback(request.client.host if request.client else None)
+    doc = remote.load()
+    if body.rotate:
+        if not local:
+            raise HTTPException(403, "Change the access key on the computer itself - doing "
+                                     "it from here would cut this device off.")
+        doc["token"] = remote.new_token()
+    if body.enabled is not None:
+        doc["enabled"] = bool(body.enabled)
+        # Switching it on with no key would mean "reachable, and nothing to prove", so the
+        # key is created here rather than left for a second step somebody could skip.
+        if doc["enabled"] and not doc["token"]:
+            doc["token"] = remote.new_token()
+    if body.notify_url is not None:
+        url = body.notify_url.strip()
+        if url and not url.startswith(("http://", "https://")):
+            raise HTTPException(400, "A notification address should start with http:// or "
+                                     "https://.")
+        doc["notify_url"] = url
+    if body.extra_hosts is not None:
+        doc["extra_hosts"] = [h.strip() for h in body.extra_hosts if h.strip()]
+    remote.save(doc)
+    return _remote_state(request)
+
+
+@app.post("/api/remote/test-notification")
+def test_remote_notification(request: Request) -> dict:
+    """Prove the notification address works, before a run depends on it at 3am."""
+    if not remote.load()["notify_url"]:
+        raise HTTPException(400, "There is no notification address set yet.")
+    remote.notify("Night Reader", "Test notification - this is where a stopped run "
+                                  "would tell you.")
+    return {"sent": True}
 
 
 # Every error leaves through one of these two handlers, so the frontend always receives
@@ -441,7 +593,20 @@ def source_changed(ch: Chapter, rec: dict) -> bool:
                 and stored != ch.metrics.content_hash)
 
 
-def chapter_row(ch: Chapter, cfg: Config, state: State, total: int) -> dict:
+def series_of(pid: str) -> tuple[dict | None, dict | None]:
+    """``(series, mapping)`` for a novel that is part of one, else ``(None, None)``.
+
+    Every novel that is in no series must keep behaving exactly as it did, so callers
+    treat ``None`` as "the old way" rather than as an error.
+    """
+    series = series_mod.series_for_project(pid)
+    if series is None:
+        return None, None
+    return series, series_mod.load_mapping(series["id"])
+
+
+def chapter_row(ch: Chapter, cfg: Config, state: State, total: int,
+                mapped: dict | None = None) -> dict:
     lang = classify(ch, cfg)
     rec = state.get(ch.index) or {}
     m = ch.metrics
@@ -472,6 +637,13 @@ def chapter_row(ch: Chapter, cfg: Config, state: State, total: int) -> dict:
         # by what is actually wrong instead of re-parsing failure sentences client-side.
         "flags": failure_flags(rec.get("failures", [])),
         "has_output": (cfg.paths.output_dir / chapter_filename(ch.index, total)).exists(),
+        # The chapter's number within the whole SERIES, when this novel is part of one.
+        # Read from the stored mapping and never recomputed here: the offline path has no
+        # chapter text to read, so re-deriving would quietly give a different answer.
+        # `number` above is left alone — it is what the source header claimed, which is
+        # not always the global number.
+        "global": (mapped or {}).get("global"),
+        "kind": (mapped or {}).get("kind"),
     }
 
 
@@ -1654,12 +1826,32 @@ def list_chapters(pid: str, refresh: bool = False) -> dict:
         # (a corrupt project.json would otherwise hide the whole novel).
         pj._atomic_write_json(pj.PROJECTS_DIR / pid / "project.json", project)
     state = State.load(cfg.paths.state_file)
-    rows = [chapter_row(ch, cfg, state, file_total) for ch in chapters]
+    series, mapping = series_of(pid)
+    mapped = series_mod.globals_by_index(mapping, pid) if series else {}
+    rows = [chapter_row(ch, cfg, state, file_total, mapped.get(ch.index)) for ch in chapters]
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     return {"project": project, "total": total, "chapters": rows,
-            "counts": counts, "totals": state.totals(), "offline": offline}
+            "counts": counts, "totals": state.totals(), "offline": offline,
+            "series": _series_brief(series, mapping, pid)}
+
+
+def _series_brief(series: dict | None, mapping: dict | None, pid: str) -> dict | None:
+    """Just enough about the series for a chapter list or reader header."""
+    if series is None:
+        return None
+    members = series_mod.member_ids(series)
+    position = members.index(pid) if pid in members else 0
+    return {
+        "id": series["id"],
+        "name": series.get("name") or "",
+        "part": position + 1,
+        "parts": len(members),
+        "resolved": bool(mapping),
+        "first": (mapping or {}).get("first"),
+        "last": (mapping or {}).get("last"),
+    }
 
 
 @app.get("/api/projects/{pid}/chapters/{index}")
@@ -1677,6 +1869,10 @@ def chapter_detail(pid: str, index: int) -> dict:
         # chapter is readable and reviewable instead of appearing untranslated.
         translation = read_audit_translation(cfg.paths.audit_dir, index, total)
     rec = State.load(cfg.paths.state_file).get(index) or {}
+    series, mapping = series_of(pid)
+    prev_ref = next_ref = None
+    if series is not None:
+        prev_ref, next_ref = series_mod.neighbours(series, mapping, pid, index)
     # Show the Korean AS THE MODEL SAW IT — export header (incl. the repeated chapter
     # number) and closing copyright notice removed — so the side-by-side view lines up.
     clean_source, number = strip_source_header(ch.text)
@@ -1701,6 +1897,15 @@ def chapter_detail(pid: str, index: int) -> dict:
         "manual_edit": rec.get("manual_edit", False),
         "has_previous": previous_chapter_path(cfg.paths.output_dir, index, total).exists(),
         "offline": pid in _offline_projects,
+        # In a series, the chapters either side of this one — which may live in a
+        # DIFFERENT Google Doc. Handing the reader resolved refs is what lets chapter 100
+        # flow into the next document's chapter 1 without the reader knowing or caring
+        # that they are separate novels.
+        "series": _series_brief(series, mapping, pid),
+        "global": (series_mod.globals_by_index(mapping, pid).get(index) or {}).get("global")
+                  if series else None,
+        "prev": prev_ref,
+        "next": next_ref,
         # For a scanned novel, the photos this chapter was built from — the truest
         # source there is, and what makes a translation traceable back to the page.
         # Only batch builds attribute pages to a specific chapter; a whole-novel
@@ -3152,6 +3357,581 @@ def export_glossary(pid: str, format: str = "csv") -> Response:
         writer.writerow([e.korean, e.english, e.type, e.pronoun, e.register, e.note])
     return Response(buf.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": _attachment(f"{name}-glossary.csv")})
+
+
+# ----------------------------------------------------------------------------- series
+# A novel longer than ~100 chapters arrives as several Google Docs, which the library
+# otherwise shows as unrelated novels. A series groups those documents in reading order
+# and resolves each chapter's global number. See server/series.py.
+#
+# NOTE ON ROUTE ORDER: the literal path /api/series/suggest MUST stay declared before
+# /api/series/{sid}, or FastAPI captures "suggest" as a series id and the request silently
+# 404s. Same footgun as the scanned-pages block above.
+
+class CreateSeries(BaseModel):
+    name: str = ""
+    project_ids: list[str] = Field(default_factory=list)
+
+
+class UpdateSeries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = None
+    archived: bool | None = None
+    # Member order IS reading order, so reordering is a first-class edit.
+    members: list[str] | None = None
+    starts: dict[str, int] | None = None
+    publish_targets: list[dict] | None = None
+
+
+class MappingOverride(BaseModel):
+    """One confirmed edit from the review table.
+
+    ``index`` identifies the row and is never changed: it is the key tying a chapter to
+    state.json, chapter-NNN.md, previous/, audit/ and variants/.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+    project_id: str
+    index: int
+    global_number: int | None = Field(default=None, alias="global")
+    kind: str | None = None
+    label: str | None = None
+
+
+class PutMapping(BaseModel):
+    overrides: list[MappingOverride] = Field(default_factory=list)
+
+
+def require_series(sid: str) -> dict:
+    series = series_mod.get_series(sid)
+    if series is None:
+        raise HTTPException(404, "That series doesn't exist.")
+    return series
+
+
+def _series_summary(series: dict, mapping: dict | None) -> dict:
+    members = []
+    for m in series.get("members") or []:
+        pid = m.get("project_id")
+        project = pj.get_project(pid) or {}
+        member_map = ((mapping or {}).get("members") or {}).get(pid) or {}
+        members.append({
+            "project_id": pid,
+            "name": project.get("name") or "",
+            "chapter_count": project.get("chapter_count") or 0,
+            "start_chapter": m.get("start_chapter"),
+            "sealed": bool(m.get("sealed")),
+            # A member whose project folder has gone is shown rather than hidden: a
+            # silently shorter series would look like missing chapters instead.
+            "missing": not project,
+            "offline": bool(member_map.get("offline")),
+            "needs_review": sum(
+                1 for r in member_map.get("rows") or [] if r.get("confidence") == "low"
+            ),
+        })
+    return {
+        "id": series["id"],
+        "name": series.get("name") or "",
+        "archived": bool(series.get("archived")),
+        "created_at": series.get("created_at") or "",
+        "members": members,
+        "publish_targets": series.get("publish_targets") or [],
+        "resolved": bool(mapping),
+        # Set once the glossaries have actually been merged. Until then each member still
+        # reads its own, which is what project_config keys the redirect on.
+        "glossary_merged_at": series.get("glossary_merged_at") or "",
+        "first": (mapping or {}).get("first"),
+        "last": (mapping or {}).get("last"),
+        "total": (mapping or {}).get("total") or 0,
+        "gaps": (mapping or {}).get("gaps") or [],
+        "duplicates": (mapping or {}).get("duplicates") or [],
+    }
+
+
+@app.get("/api/series")
+def list_series_route() -> dict:
+    return {"series": [
+        _series_summary(s, series_mod.load_mapping(s["id"]))
+        for s in series_mod.list_series()
+    ]}
+
+
+@app.get("/api/series/suggest")
+def suggest_series_route() -> dict:
+    """Novels that look like several documents of one story, proposed for linking.
+
+    A suggestion only — nothing is written until the caller confirms. Reads project.json
+    alone, so it makes no Google API calls and works offline.
+    """
+    taken = {m for s in series_mod.list_series() for m in series_mod.member_ids(s)}
+    groups = []
+    for g in series_mod.suggest_series():
+        free = [m for m in g["members"] if m["project_id"] not in taken]
+        # Nothing to propose if the group is already linked, or only one document of it
+        # is still unattached.
+        if len(free) < 2:
+            continue
+        groups.append({**g, "members": free})
+    return {"groups": groups}
+
+
+@app.post("/api/series")
+def create_series_route(body: CreateSeries) -> dict:
+    try:
+        series = series_mod.create_series(body.name, body.project_ids)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    # Seed each member's starting chapter so the series is usable immediately: a range
+    # stated in the document's name wins, else it carries on from the member before.
+    seeds = []
+    for pid in body.project_ids:
+        project = pj.get_project(pid) or {}
+        _, _, hint = series_mod.split_title(project.get("name") or "")
+        seeds.append({
+            "chapter_count": project.get("chapter_count") or 0,
+            "start_hint": hint,
+        })
+    series_mod.seed_start_chapters(seeds)
+    for member, seed in zip(series["members"], seeds):
+        member["start_chapter"] = seed["start_chapter"]
+    series_mod.write_series(series)
+    return _series_summary(series, None)
+
+
+@app.get("/api/series/{sid}")
+def get_series_route(sid: str) -> dict:
+    series = require_series(sid)
+    return _series_summary(series, series_mod.load_mapping(sid))
+
+
+@app.post("/api/series/{sid}")
+def update_series_route(sid: str, body: UpdateSeries) -> dict:
+    series = require_series(sid)
+    if body.name is not None:
+        series["name"] = body.name.strip() or series.get("name") or "Untitled series"
+    if body.archived is not None:
+        series["archived"] = bool(body.archived)
+    if body.publish_targets is not None:
+        series["publish_targets"] = body.publish_targets
+    if body.members is not None:
+        current = {m.get("project_id"): m for m in series.get("members") or []}
+        if set(body.members) != set(current):
+            raise HTTPException(400, "Reordering must list exactly the current members.")
+        series["members"] = [current[pid] for pid in body.members]
+    if body.starts is not None:
+        for member in series.get("members") or []:
+            if member.get("project_id") in body.starts:
+                member["start_chapter"] = body.starts[member["project_id"]]
+    series_mod.write_series(series)
+    return _series_summary(series, series_mod.load_mapping(sid))
+
+
+@app.delete("/api/series/{sid}")
+def delete_series_route(sid: str) -> dict:
+    """Unlink a series. The member novels themselves are never touched."""
+    require_series(sid)
+    series_mod.delete_series(sid)
+    return {"ok": True}
+
+
+class MergeGlossaries(BaseModel):
+    # Conflict key -> chosen English spelling. The key is the Korean term, or for an
+    # English-only name its case-folded English.
+    picks: dict[str, str] = Field(default_factory=dict)
+    dry_run: bool = True
+
+
+@app.post("/api/series/{sid}/glossary/merge")
+async def merge_series_glossary(sid: str, body: MergeGlossaries) -> dict:
+    """Merge the members' glossaries into one for the series.
+
+    The dry run is the point of the two-step: it reports every disagreement with its
+    evidence and writes nothing, so the spellings that will be locked in for every future
+    chapter get a human look first. Reads every translated chapter of the series to rank
+    the candidates, hence the threadpool.
+    """
+    require_series(sid)
+    try:
+        return await run_in_threadpool(
+            glossary_merge.merge_glossaries, sid, body.picks, dry_run=body.dry_run
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/series/{sid}/mapping")
+async def series_mapping(sid: str, refresh: bool = False) -> dict:
+    """The resolved chapter numbering, plus the flags the review table needs.
+
+    Served from mapping.json when it exists, because a resolved number must never be
+    silently recomputed — the offline path cannot read chapter text, so re-deriving would
+    quietly produce different answers. Pass ``refresh=true`` to re-resolve.
+    """
+    series = require_series(sid)
+    stored = series_mod.load_mapping(sid)
+    if stored and not refresh:
+        return {"series": _series_summary(series, stored), **stored}
+
+    chapters_by_pid: dict[str, list] = {}
+    for pid in series_mod.member_ids(series):
+        try:
+            _, cfg = project_cfg(pid)
+            chapters_by_pid[pid] = await run_in_threadpool(get_chapters, pid, cfg, False)
+        except Exception as exc:  # noqa: BLE001 — one bad member must not fail the series
+            # Unreachable or unreadable: resolve_mapping keeps this member's existing
+            # rows rather than blanking it, so one bad document can't wipe the series.
+            errors.log_error(errors.explain(exc), where=f"series/{sid}/{pid}")
+    doc = series_mod.resolve_mapping(series, chapters_by_pid)
+    series_mod.save_mapping(sid, doc)
+    return {"series": _series_summary(series, doc), **doc}
+
+
+@app.put("/api/series/{sid}/mapping")
+def put_series_mapping(sid: str, body: PutMapping) -> dict:
+    series = require_series(sid)
+    doc = series_mod.load_mapping(sid)
+    if not doc:
+        raise HTTPException(400, "Resolve the numbering before confirming it.")
+    overrides = []
+    for o in body.overrides:
+        item = {"project_id": o.project_id, "index": o.index}
+        # Only fields the client actually sent are applied, so omitting "global" leaves
+        # the resolved number alone while sending null deliberately clears it (which is
+        # how a row is taken out of the reading sequence).
+        if "global_number" in o.model_fields_set:
+            item["global"] = o.global_number
+        if o.kind is not None:
+            item["kind"] = o.kind
+        if o.label is not None:
+            item["label"] = o.label
+        overrides.append(item)
+    doc = series_mod.apply_overrides(doc, overrides)
+    series_mod.save_mapping(sid, doc)
+    return {"series": _series_summary(series, doc), **doc}
+
+
+# ----------------------------------------------------------------------------- posting
+# Publishing finished chapters to the site that hosts them. The clicking happens in a
+# browser extension running inside the user's own Chrome — the account cannot be shared,
+# and since Chrome 136 nothing outside the browser can drive its everyday session. These
+# endpoints are what that extension talks to: Python decides WHAT to post and records what
+# happened, the extension only drives the page.
+#
+# NOTE ON ROUTE ORDER: all of these are literal paths under /api/posting/, so they cannot
+# collide with a {param} route. Keep it that way.
+
+class PostResult(BaseModel):
+    sid: str
+    target_id: str = "default"
+    title: str
+    project_id: str = ""
+    index: int | None = None
+    global_number: int | None = Field(default=None, alias="global")
+    # posted | failed | skipped | needs-attention
+    status: str = "posted"
+    remote_url: str = ""
+    # The site's own id for the chapter. Kept so a chapter posted in an earlier session can
+    # be changed later without matching it by name against whatever list the page happens
+    # to have fetched.
+    remote_id: str = ""
+    price_coins: int = 0
+    error: str = ""
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@app.get("/api/posting/adapter")
+def posting_adapter(site: str = "meiko") -> dict:
+    """The site's locators and limits.
+
+    Served from a TOML file the user can edit, so a redesign on the site is a one-line fix
+    here rather than a code change plus an extension reload.
+    """
+    try:
+        return posting.load_adapter(site)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+class ImportTargets(BaseModel):
+    # The site's own series export: Title, Type, Status, Views, Admin URL.
+    csv: str = ""
+
+
+class ApplyTargets(BaseModel):
+    assignments: list[dict] = Field(default_factory=list)
+
+
+@app.post("/api/posting/targets/match")
+def posting_targets_match(body: ImportTargets) -> dict:
+    """Pair each linked series with its admin page, from the site's own series export.
+
+    Reports only — nothing is written. Exact title matches are safe to apply in bulk;
+    near-matches are listed separately because a rule should not decide whether
+    "The Loathsome Scapegoat" and "That Loathsome Scapegoat" are the same novel.
+    """
+    return posting.match_targets(body.csv)
+
+
+@app.post("/api/posting/targets/apply")
+def posting_targets_apply(body: ApplyTargets) -> dict:
+    """Write the publishing URLs. Pricing on each series is left untouched."""
+    return posting.apply_targets(body.assignments)
+
+
+@app.get("/api/posting/match")
+def posting_match(url: str) -> dict:
+    """Which series, if any, publishes to the page the extension is looking at.
+
+    The extension knows its own URL and nothing else, so this is how it finds out what it
+    is standing in front of — rather than the user having to copy a series id into the
+    browser. Matched on the target's stored series URL, ignoring a trailing slash.
+    """
+    wanted = (url or "").rstrip("/")
+    for series in series_mod.list_series():
+        for target in series.get("publish_targets") or []:
+            stored = str(target.get("series_url") or "").rstrip("/")
+            # startswith, because the extension may be on a chapter page BELOW the series
+            # URL rather than on the series page itself.
+            if stored and wanted.startswith(stored):
+                mapping = series_mod.load_mapping(series["id"])
+                return {
+                    "found": True,
+                    "sid": series["id"],
+                    "name": series.get("name") or "",
+                    "target_id": target.get("id") or "default",
+                    "free_through": target.get("free_through") or 0,
+                    "coin_price": target.get("coin_price") or 0,
+                    "resolved": bool(mapping),
+                }
+    return {"found": False}
+
+
+@app.get("/api/posting/plan")
+async def posting_plan(sid: str, target_id: str | None = None,
+                       start: int | None = None, end: int | None = None,
+                       site: str = "meiko") -> dict:
+    """Everything a run would post, and every reason a chapter might be held back.
+
+    Writes nothing and opens no browser. Reads each chapter off disk to measure it, hence
+    the threadpool.
+    """
+    require_series(sid)
+    try:
+        return await run_in_threadpool(
+            posting.plan_run, sid, target_id, start=start, end=end, adapter_name=site
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/posting/payload")
+async def posting_payload(sid: str, project_id: str, index: int,
+                          site: str = "meiko") -> dict:
+    """One chapter's title and finished HTML, ready to paste."""
+    require_series(sid)
+    try:
+        return await run_in_threadpool(
+            posting.chapter_payload, sid, project_id, index, adapter_name=site
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/posting/ledger")
+def posting_ledger(sid: str, target_id: str = "default") -> dict:
+    require_series(sid)
+    return posting.load_ledger(sid, target_id)
+
+
+@app.post("/api/posting/result")
+def posting_result(body: PostResult) -> dict:
+    """Record what happened to one chapter.
+
+    Keyed on the chapter's title, because that is what the site displays and what a resume
+    has to match against the live chapter list. A failed attempt is recorded too, and with
+    its title — that is what lets a retry find the half-finished chapter already on the
+    site and continue into it instead of creating a second one, which matters because
+    deleting a chapter there has to be confirmed by retyping its name.
+    """
+    require_series(body.sid)
+    entry = {
+        "title": body.title,
+        "project_id": body.project_id,
+        "index": body.index,
+        "global": body.global_number,
+        "status": body.status,
+        "remote_url": body.remote_url,
+        "remote_id": body.remote_id,
+        "price_coins": body.price_coins,
+        "error": body.error,
+        "at": series_mod.now(),
+    }
+    return posting.record(body.sid, body.target_id, entry)
+
+
+
+# --- the run request -------------------------------------------------------
+# How the app asks the browser to post, which it could not do before: the extension panel
+# on the site's own tab was the only trigger, so the Posting page could preview a run but
+# never start one.
+#
+# A queued run lives in a FILE rather than in the in-memory job registry, because it waits
+# for a browser and so has to survive a restart of this process. That is also what makes
+# triggering from a phone work — the run waits on disk, not in whatever tab pressed Start.
+#
+# Progress is polled, not streamed. See the long note on Job in this file: registration
+# there is welded to spawning a Python coroutine, publish() must happen on the event loop,
+# and the worker's own finally would close the stream before the extension began. Posting
+# emits one event per chapter, roughly every ten to twenty seconds, so a durable file read
+# every two seconds is both simpler and worth more than the latency.
+#
+# EVERY one of these is called from the extension's SERVICE WORKER, never its content
+# script: MV3 grants the worker cross-origin access through host_permissions, so meiko can
+# stay out of this app's CORS list. Adding a call from the content script would force that
+# list open. Keep it in background.js.
+
+class SiteSnapshot(BaseModel):
+    sid: str
+    target_id: str = "default"
+    titles: list[str] = Field(default_factory=list)
+    # The coin value in each paid row. The site export carries no price anywhere, and this
+    # is the only place it is visible, so this is how the app learns what a series charges
+    # instead of the number being typed in once per series.
+    prices: list[int] = Field(default_factory=list)
+
+
+class RunOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start: int | None = None
+    end: int | None = None
+    up_to: int | None = None
+    limit: int | None = None
+    post_state: str = "public"
+
+
+class RunRequest(BaseModel):
+    sid: str
+    target_id: str | None = None
+    options: RunOptions = Field(default_factory=RunOptions)
+
+
+class RunTarget(BaseModel):
+    sid: str
+    target_id: str | None = None
+
+
+class ClaimRequest(BaseModel):
+    # The tab's own URL, so a browser sitting on some other novel never picks up work.
+    url: str = ""
+    # Generated by the extension. The only thing stopping a second tab taking over a live
+    # run, which on a coin platform is what stops a chapter being posted (and charged) twice.
+    token: str = ""
+
+
+class ProgressReport(BaseModel):
+    sid: str
+    target_id: str = "default"
+    token: str = ""
+    event: dict = Field(default_factory=dict)
+
+
+@app.post("/api/posting/site")
+def posting_site(body: SiteSnapshot) -> dict:
+    """Record the chapter list the extension just read off the site.
+
+    Python has no session on the site and no business having one, so this is the only way
+    the plan can know what is already published. Without it, a series that was being posted
+    by hand long before this app existed reads as entirely unposted.
+    """
+    require_series(body.sid)
+    try:
+        return posting.write_site(body.sid, body.target_id, body.titles, body.prices)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/posting/run")
+async def posting_run_start(body: RunRequest) -> dict:
+    """Queue a posting run. Writes nothing to the site.
+
+    Reads every chapter in range off disk to work out what the run covers, hence the
+    threadpool — the same reason /api/posting/plan is async.
+    """
+    require_series(body.sid)
+    try:
+        return await run_in_threadpool(
+            posting.request_run, body.sid, body.target_id,
+            options=body.options.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/posting/run")
+def posting_run_get(sid: str, target_id: str = "default") -> dict:
+    """The current run and its progress, or nothing. Polled by the Posting page.
+
+    Cheap on purpose: one small JSON read, no chapter files touched, so a two-second poll
+    costs nothing. ``stalled`` is worked out here rather than by any timer.
+    """
+    require_series(sid)
+    return {"run": posting.run_view(posting.load_run(sid, target_id)),
+            "stale_after": posting.STALE_AFTER_SECONDS,
+            "poll_seconds": posting.CLAIM_POLL_SECONDS}
+
+
+@app.delete("/api/posting/run")
+def posting_run_cancel(sid: str, target_id: str | None = None) -> dict:
+    """Stop a run. The browser finds out on its next report and stops there.
+
+    A chapter already in flight finishes: interrupting between creating it and filling it
+    is what leaves a half-made chapter on the site, and deleting one there has to be
+    confirmed by retyping its name.
+    """
+    require_series(sid)
+    try:
+        return {"run": posting.cancel_run(sid, target_id)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/posting/run/resume")
+def posting_run_resume(body: RunTarget) -> dict:
+    """Put a stalled or stopped run back in the queue, keeping its progress."""
+    require_series(body.sid)
+    try:
+        return {"run": posting.resume_run(body.sid, body.target_id)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/posting/claim")
+def posting_claim(body: ClaimRequest) -> dict:
+    """Hand this tab the queued run for the series it is on, once.
+
+    Called on a timer by the extension while it sits on the site. A compare-and-set: only
+    a queued run is handed out, and handing it out marks it as taken, so a second tab gets
+    nothing rather than posting the same chapters in parallel.
+    """
+    try:
+        return {"run": posting.claim_run(body.url, body.token)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/posting/progress")
+def posting_progress(body: ProgressReport) -> dict:
+    """A heartbeat and one thing that just happened, from the browser doing the posting.
+
+    Answers with ``cancelled`` so a Cancel pressed in the app reaches the extension on its
+    next report — the same cooperative stop a translation uses, polled instead of awaited.
+    """
+    require_series(body.sid)
+    try:
+        return posting.record_progress(body.sid, body.target_id, body.token, body.event)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ----------------------------------------------------------------------------- translation jobs

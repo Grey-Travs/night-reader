@@ -50,7 +50,8 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(A, "load_global_config", lambda: Config())
     A._chapter_cache.clear()
     A._offline_projects.clear()
-    return TestClient(A.app, base_url="http://localhost")
+    return TestClient(A.app, base_url="http://localhost",
+                      client=("127.0.0.1", 50000))
 
 
 def _novel(client, text=KOREAN):

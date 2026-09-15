@@ -60,7 +60,8 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(Translator, "retranslate_paragraph", _stub)
     monkeypatch.setattr(Translator, "rephrase_paragraph", _stub)
 
-    return TestClient(A.app, base_url="http://localhost")
+    return TestClient(A.app, base_url="http://localhost",
+                      client=("127.0.0.1", 50000))
 
 
 @pytest.fixture
