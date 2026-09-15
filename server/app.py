@@ -96,6 +96,7 @@ from . import errors
 from .locks import file_lock
 from . import ocr_build
 from . import glossary_merge
+from . import importing
 from . import pages as pages_mod
 from . import posting
 from . import remote
@@ -3932,6 +3933,136 @@ def posting_progress(body: ProgressReport) -> dict:
         return posting.record_progress(body.sid, body.target_id, body.token, body.event)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+
+
+# ----------------------------------------------------------------------------- importing
+# Reading a novel that is already published back into the library.
+#
+# About 50 novels are live on the site with no local project, and picking one up meant
+# copying every posted chapter into a Google Doc by hand. The site answers its whole
+# chapter list, text included, in a single request -- so the Doc step disappears rather
+# than being automated.
+#
+# Python cannot read the site: it has no session there and no business having one. The
+# extension reads it from inside the logged-in browser and hands over plain records; every
+# decision about what lands on disk is made in server/importing.py where it can be tested.
+#
+# As with the posting endpoints, the extension calls these from its SERVICE WORKER, never
+# from its content script -- MV3 grants the worker cross-origin access through
+# host_permissions, so meiko stays out of this app's CORS list.
+
+
+class SiteChapter(BaseModel):
+    title: str = ""
+    html: str = ""
+    # The site's own values, kept so the ledger can address a chapter this app never made.
+    remote_id: str = ""
+    remote_uid: str = ""
+    paid: bool = False
+    coins: int = 0
+    state: str = ""
+
+
+class SiteCatalogue(BaseModel):
+    studio_uid: str = ""
+    series: list[dict] = Field(default_factory=list)
+
+
+class ImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = ""
+    series_uid: str = ""
+    series_url: str = ""
+    site: str = "meiko"
+    chapters: list[SiteChapter] = Field(default_factory=list)
+
+
+@app.post("/api/import/catalogue")
+def import_catalogue(body: SiteCatalogue) -> dict:
+    """Record the studio's own series list, so the Import page has something to offer."""
+    try:
+        importing.write_catalogue(body.series, studio_uid=body.studio_uid)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return importing.candidates()
+
+
+@app.get("/api/import/candidates")
+def import_candidates() -> dict:
+    """Every series on the site, each marked with whether it is already in the library.
+
+    Marked rather than filtered: a list that silently omits rows cannot be checked, and
+    "why is that novel missing" is a worse question than "why is that row greyed out".
+    """
+    return importing.candidates()
+
+
+@app.post("/api/import/preview")
+async def import_preview(body: ImportRequest) -> dict:
+    """What importing these chapters would produce. Writes nothing.
+
+    The gate in front of the write: how many chapters, in what order and how that was
+    decided, what could not be represented in Markdown, which chapters Markdown would read
+    back differently, and which ones the numbering resolver will refuse to number.
+    """
+    rows = [c.model_dump() for c in body.chapters]
+    if not rows:
+        raise HTTPException(400, "No chapters were sent.")
+    out = await run_in_threadpool(importing.prepare, rows)
+    already = importing.existing_import(body.series_uid)
+    return {
+        **out,
+        # Dropped from the preview: a whole novel of HTML is megabytes and the page only
+        # needs the counts and the warnings.
+        "chapters": [{k: v for k, v in c.items() if k != "markdown"} for c in out["chapters"]],
+        "chars": sum(len(c["markdown"]) for c in out["chapters"]),
+        "already_imported": already.get("name") if already else None,
+    }
+
+
+@app.post("/api/import/site")
+async def import_site(body: ImportRequest) -> dict:
+    """Create a novel in the library from chapters already published on the site.
+
+    Reads and writes a file per chapter, hence the threadpool -- the same reason
+    /api/posting/plan is async.
+    """
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(400, "Give the novel a name.")
+    rows = [c.model_dump() for c in body.chapters]
+    if not rows:
+        raise HTTPException(400, "No chapters were sent.")
+    try:
+        out = await run_in_threadpool(
+            importing.import_novel, name, rows,
+            series_uid=body.series_uid, series_url=body.series_url, site=body.site,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # A brand-new project cannot be in either cache, but clearing them costs nothing and
+    # means this does not become wrong if importing into an EXISTING novel is added later.
+    _chapter_cache.pop(out["pid"], None)
+    _invalidate_consistency(out["pid"])
+    return {
+        "pid": out["pid"],
+        # The series the novel was linked into, so a caller can go straight to its
+        # numbering and pricing rather than hunting for it.
+        "sid": out["sid"],
+        "name": out["project"]["name"],
+        "imported": out["imported"],
+        "numbered": out["numbered"],
+        "pricing": out["pricing"],
+        "order": out["order"],
+        "losses": out["losses"],
+        "unfaithful": out["unfaithful"],
+        "empty": out["empty"],
+        "demoted": out["demoted"],
+        "unnumbered": out["unnumbered"],
+        "names_queued": out["names_queued"],
+    }
 
 
 # ----------------------------------------------------------------------------- translation jobs

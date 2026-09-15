@@ -1571,6 +1571,202 @@ async function probeDialog() {
   }
 }
 
+// --- reading a novel back off the site -------------------------------------
+//
+// The other direction from posting, and the cheaper one: the site answers a whole novel,
+// text included, in a single request --
+//
+//   GET /app/chapter?studio_uid=&series_uid=&userid=&pages=true
+//
+// `pages=true` is the whole trick, and no amount of guessing found it: four attempts at
+// uid/id/chapter_uid came back with each chapter's settings and no prose. It turned up in
+// the log the moment a chapter's editor was opened by hand.
+//
+// Reading happens here, in the page's own context with the page's own token, because
+// hirayatales.com is deliberately absent from host_permissions. Writing into Night Reader
+// happens in the service worker, for the CORS reason spelled out in background.js. That
+// split is the same one posting uses.
+
+// What the last Check found, so Import can send exactly what was shown rather than
+// fetching again and posting something the user never saw.
+let checked = null
+
+/** Every series in the studio. Without `uid` the site lists them all. */
+async function fetchSeriesList() {
+  const { studio_uid } = uidsFromUrl()
+  const userid = observedParam('userid')
+  const res = await api('GET', '/app/series', { studio_uid, userid })
+  const rows = Array.isArray(res?.data) ? res.data : []
+  return { studio_uid, rows }
+}
+
+/** One series' own record, for its name. */
+async function fetchSeries(studio_uid, series_uid) {
+  const res = await api('GET', '/app/series', { studio_uid, uid: series_uid })
+  const rows = Array.isArray(res?.data) ? res.data : (res?.data ? [res.data] : [])
+  return rows.find((r) => String(r?.uid || '') === series_uid) || rows[0] || null
+}
+
+/** Every chapter of one series, text included. */
+async function fetchChapters(studio_uid, series_uid) {
+  const res = await api('GET', '/app/chapter', {
+    studio_uid, series_uid, userid: observedParam('userid'), pages: true,
+  })
+  const rows = Array.isArray(res?.data) ? res.data : []
+  return rows.filter((r) => recordKind(r) === 'chapter')
+}
+
+/** The site's chapter record as Night Reader wants it. */
+function toRecord(chapter) {
+  return {
+    title: String(chapter.displayName || '').trim(),
+    html: chapterHtml(chapter),
+    remote_id: String(chapter.id || ''),
+    remote_uid: String(chapter.uid || ''),
+    // `paid` is what decides whether `coins` means anything: a free chapter still carries
+    // a coin value, so trusting coins alone prices a free novel at 1.
+    paid: chapter.paid === true || Number(chapter.paid) === 1,
+    coins: Number(chapter.coins) || 0,
+    state: String(chapter.state || ''),
+  }
+}
+
+/**
+ * Tell Night Reader which novels exist on the site, so its Import page has a list.
+ *
+ * Quiet and best-effort: it is a convenience for a page somewhere else, and must never
+ * interrupt what this tab is doing.
+ */
+let cataloguePushed = false
+
+async function pushCatalogue({ force = false } = {}) {
+  if (cataloguePushed && !force) return 0
+  try {
+    const { studio_uid, rows } = await fetchSeriesList()
+    const series = rows
+      .filter((r) => r && r.uid && r.displayName)
+      .map((r) => ({
+        uid: String(r.uid), name: String(r.displayName), slug: String(r.slug || ''),
+        views: Number(r.view_count) || 0,
+      }))
+    if (!series.length) return 0
+    await ask('catalogue', { studioUid: studio_uid, series })
+    cataloguePushed = true
+    return series.length
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Read this series and report what importing it would do. Writes nothing, either side.
+ *
+ * Two presses on purpose. A hundred and fifty chapters arriving under the wrong name, or
+ * in the wrong order, is tedious to undo -- so what will happen is printed first, and the
+ * second button sends exactly what was printed.
+ */
+async function checkThisNovel() {
+  if (busy) return
+  busy = true
+  checked = null
+  startLog('# What importing this novel would do')
+  try {
+    const { studio_uid, series_uid } = uidsFromUrl()
+    const series = await fetchSeries(studio_uid, series_uid)
+    const name = String(series?.displayName || '').trim()
+    say(`\n${name || '(unnamed series)'}  ·  ${series_uid}`)
+
+    const chapters = await fetchChapters(studio_uid, series_uid)
+    say(`${chapters.length} chapters on the site`)
+    const records = chapters.map(toRecord)
+    const withText = records.filter((r) => r.html)
+    say(`${withText.length} of them came back with their text`)
+    if (!withText.length) {
+      throw new Error('none of them carried any text, so there is nothing to import')
+    }
+
+    const out = await ask('importPreview', {
+      name, seriesUid: series_uid, chapters: records,
+    })
+    if (out.already_imported) {
+      say(`\nAlready in the library as "${out.already_imported}".`)
+      say('Delete it there first if you want to import it again.')
+      return
+    }
+
+    say(`\nwould import  ${out.count} chapters`)
+    say(`order         ${out.order}`)
+    say(`text          ${(out.chars / 1000).toFixed(1)}k characters of Markdown`)
+    const losses = Object.entries(out.losses || {})
+    if (losses.length) {
+      say(`\ncould not be kept: ${losses.map(([k, n]) => `${n}x ${k}`).join(', ')}`)
+      say('(the words survive; only the formatting is lost)')
+    }
+    if (out.empty?.length) {
+      say(`\nno text, so skipped: ${out.empty.join(', ')}`)
+    }
+    if (out.demoted?.length) {
+      say(`\n${out.demoted.length} will not get a chapter number:`)
+      for (const d of out.demoted.slice(0, 8)) {
+        say(`  ${d.title} — ${d.kind}${d.kind === 'extra' ? ` (only ${d.chars} chars)` : ''}`)
+      }
+      say('Those stay out of the reading order until confirmed in Night Reader.')
+    }
+    if (out.unfaithful?.length) {
+      say(`\n${out.unfaithful.length} contain text Markdown reads differently:`)
+      for (const t of out.unfaithful.slice(0, 8)) say(`  ${t}`)
+      say('The words are kept exactly; how they are formatted may shift.')
+    }
+
+    checked = { name, series_uid, records }
+    say('\nLooks right? Press "Import it" to bring it in.')
+  } catch (e) {
+    say(`\nStopped: ${e.message}`)
+    if (isAuthFailure(e.message)) {
+      say('That is the site session expiring. Refresh the page and try again.')
+    }
+  } finally {
+    busy = false
+  }
+}
+
+/** Bring in exactly what the last Check printed. */
+async function importThisNovel() {
+  if (busy) return
+  if (!checked) {
+    startLog('# Import')
+    say('\nPress "Check this novel" first, so you can see what would happen.')
+    return
+  }
+  busy = true
+  const { name, series_uid, records } = checked
+  startLog(`# Importing ${name}`)
+  try {
+    const out = await ask('importSite', {
+      name,
+      seriesUid: series_uid,
+      seriesUrl: location.href.split('?')[0],
+      chapters: records,
+    })
+    say(`\nImported ${out.imported} chapters as "${out.name}".`)
+    say(`numbering   ${out.numbered} of ${out.imported} got a chapter number`)
+    say(`pricing     free through ${out.pricing.free_through}`
+      + ` · ${out.pricing.coin_price} coins after that`
+      + ` (${out.pricing.paid_chapters} paid chapters on the site)`)
+    say('\nNight Reader also recorded every chapter as already posted, so its Posting')
+    say('page will not offer to publish them again.')
+    if (out.demoted?.length) {
+      say(`\n${out.demoted.length} chapters have no number yet — confirm them on the`)
+      say('series page if you want them to post later.')
+    }
+    checked = null
+  } catch (e) {
+    say(`\nStopped: ${e.message}`)
+  } finally {
+    busy = false
+  }
+}
+
 // --- the panel -------------------------------------------------------------
 
 let panel, out, busy = false
@@ -1764,6 +1960,7 @@ async function checkForWork() {
       setWatch('open the chapter list to post')
       return
     }
+    pushCatalogue()
     const { run } = await ask('claim', { url: location.href, token: TOKEN })
     if (!run) {
       setWatch(`watching · ${ctx.name}`, true)
@@ -2158,6 +2355,11 @@ function build() {
       <button class="nr-btn" data-act="posted">Posted so far</button>
       <button class="nr-btn nr-go" data-act="publish">Publish private</button>
     </div>
+    <div class="nr-row">
+      <button class="nr-btn" data-act="check">Check this novel</button>
+      <button class="nr-btn nr-go" data-act="import">Import it</button>
+      <button class="nr-btn" data-act="catalogue">Send novel list</button>
+    </div>
     <div class="nr-row nr-diag">
       <button class="nr-btn" data-act="probe">Probe page</button>
       <button class="nr-btn" data-act="paste">Test paste</button>
@@ -2250,6 +2452,14 @@ function build() {
     if (act === 'net') showRequests()
     if (act === 'api') showApi()
     if (act === 'reads') showReads()
+    if (act === 'check') checkThisNovel()
+    if (act === 'import') importThisNovel()
+    if (act === 'catalogue') {
+      startLog('# Sending the novel list to Night Reader')
+      pushCatalogue({ force: true }).then((n) => say(n
+        ? `\nSent ${n} novels. They are on the Import page now.`
+        : '\nCould not read the list. Open the studio page and try again.'))
+    }
     if (act === 'fetch1') probeChapterFetch()
     if (act === 'private' || act === 'public') {
       const box = panel.querySelector('.nr-count')

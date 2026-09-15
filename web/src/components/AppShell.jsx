@@ -12,6 +12,7 @@ const NAV = [
   { to: '/', end: true, icon: '📚', label: 'Library' },
   { to: '/series', icon: '📖', label: 'Series' },
   { to: '/posting', icon: '📤', label: 'Posting' },
+  { to: '/import', icon: '📥', label: 'Import' },
   { to: '/activity', icon: '⚡', label: 'Activity' },
   { to: '/review', icon: '🚩', label: 'Review' },
   { to: '/scans', icon: '📷', label: 'Scans' },

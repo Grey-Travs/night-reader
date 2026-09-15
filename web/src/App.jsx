@@ -8,6 +8,7 @@ import LibraryPage from './pages/LibraryPage'
 import SeriesPage from './pages/SeriesPage'
 import SeriesDetailPage from './pages/SeriesDetailPage'
 import PostingPage from './pages/PostingPage'
+import ImportPage from './pages/ImportPage'
 import ActivityPage from './pages/ActivityPage'
 import ArchivePage from './pages/ArchivePage'
 import ReviewPage from './pages/ReviewPage'
@@ -70,6 +71,7 @@ export default function App() {
           <Route path="series" element={<SeriesPage />} />
           <Route path="series/:sid" element={<SeriesDetailPage />} />
           <Route path="posting" element={<PostingPage />} />
+          <Route path="import" element={<ImportPage />} />
           <Route path="activity" element={<ActivityPage />} />
           <Route path="review" element={<ReviewPage />} />
           <Route path="scans" element={<ScansPage />} />

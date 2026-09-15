@@ -192,6 +192,10 @@ export const api = {
   resumePostingRun: (sid, targetId = 'default') =>
     post('/api/posting/run/resume', { sid, target_id: targetId }),
 
+  // Novels already published but not in the library. The extension does the reading, so
+  // all this needs is the candidate list it pushed.
+  importCandidates: () => get('/api/import/candidates'),
+
   // Reaching this app from a phone, so a run can be started from anywhere. The access key
   // rides in a cookie once the phone has opened the link, so nothing here has to carry it.
   remote: () => get('/api/remote'),

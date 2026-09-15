@@ -87,6 +87,20 @@ const HANDLERS = {
   site: ({ sid, targetId = 'default', titles, prices }) => post('/api/posting/site', {
     sid, target_id: targetId, titles, prices,
   }),
+
+  // --- reading a published novel back into the library --------------------
+  //
+  // Same reason these live here rather than in the content script: the worker has
+  // cross-origin access through host_permissions, so the app's CORS list stays shut.
+  catalogue: ({ studioUid, series }) => post('/api/import/catalogue', {
+    studio_uid: studioUid, series,
+  }),
+  importPreview: ({ name, seriesUid, chapters }) => post('/api/import/preview', {
+    name, series_uid: seriesUid, chapters,
+  }),
+  importSite: ({ name, seriesUid, seriesUrl, chapters }) => post('/api/import/site', {
+    name, series_uid: seriesUid, series_url: seriesUrl, chapters,
+  }),
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
