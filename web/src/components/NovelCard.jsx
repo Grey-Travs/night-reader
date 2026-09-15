@@ -9,6 +9,12 @@ export default function NovelCard({ p, archived = false, onOpen, onToggleArchive
   const total = p.chapter_count
   const cont = getLastRead(p.id)
   const [menu, setMenu] = useState(false)
+  // A novel read back off the publishing site rather than translated here. Worth saying on
+  // the card, because such a novel genuinely behaves differently and all three differences
+  // read as faults unless something explains them: its chapters cannot be translated (the
+  // source is already English, so the queue skips them), Refresh has no document to fetch,
+  // and the reader shows the same text as source and translation.
+  const imported = !!p.imported_from
 
   return (
     <div className="card p-5">
@@ -16,8 +22,18 @@ export default function NovelCard({ p, archived = false, onOpen, onToggleArchive
         <button onClick={() => onOpen(p.id)} className="text-left font-reading text-lg font-medium leading-snug hover:text-accent-text hover:underline">{p.name}</button>
         <button onClick={() => onRemove(p.id, p.name)} className="tap -m-2 shrink-0 p-2 text-hint hover:text-danger" title="Remove from library">✕</button>
       </div>
+      {imported && (
+        <div className="mt-2">
+          <span className="pill pill-muted" title={`Read off ${p.imported_from.site || 'the site'} — these chapters are already published, so they are not translated here`}>
+            imported
+          </span>
+        </div>
+      )}
       <div className="mt-3 text-sm text-muted">
-        {p.translated} translated{total ? ` · ${total} tabs` : ''}
+        {/* "tabs" is a Google Docs word. An imported novel has no document, so it has
+            chapters and nothing else. */}
+        {p.translated} {imported ? 'chapters' : 'translated'}
+        {total && !imported ? ` · ${total} tabs` : ''}
         {p.needs_review ? ` · ${p.needs_review} to review` : ''}
         {p.cost_usd > 0 ? ` · ${fmtCost(p.cost_usd)}` : ''}
       </div>
@@ -28,8 +44,10 @@ export default function NovelCard({ p, archived = false, onOpen, onToggleArchive
         <button onClick={() => onToggleArchive(p)} className="btn btn-ghost px-3 py-2" title={archived ? 'Move back to your library' : 'Move to the archive'}>
           {archived ? '↩ Restore' : '📦 Archive'}
         </button>
-        {/* Overflow rather than a fifth button — the row is already full at this width. */}
-        {onRetranslate && (
+        {/* Overflow rather than a fifth button — the row is already full at this width.
+            Never offered for an imported novel: its chapters are English, the translate
+            queue only accepts Korean, so it would queue zero and look broken. */}
+        {onRetranslate && !imported && (
           <div className="relative">
             <button onClick={() => setMenu((v) => !v)} className="btn btn-ghost px-2.5 py-2" title="More actions" aria-haspopup="menu" aria-expanded={menu}>⋯</button>
             {menu && (
