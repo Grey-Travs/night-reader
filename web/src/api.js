@@ -31,7 +31,10 @@ const del = (p) => req(p, { method: 'DELETE' })
 export const api = {
   status: () => get('/api/status'),
   initConfig: () => post('/api/init'),
-  googleLogin: () => post('/api/google/login'),
+  // write=true also asks for permission to CREATE documents, which the Doc export needs.
+  // Kept opt-in: a cached read-only token is perfectly valid, so this is the only thing
+  // that actually reaches the consent screen for the wider permission.
+  googleLogin: (write = false) => post(`/api/google/login${write ? '?write=true' : ''}`),
   settings: () => get('/api/settings'),
   updateSettings: (body) => post('/api/settings', body),
 
@@ -105,6 +108,15 @@ export const api = {
   acceptChapter: (pid, i) => post(`/api/projects/${pid}/chapters/${i}/accept`),
   searchChapters: (pid, q) => get(`/api/projects/${pid}/search?q=${encodeURIComponent(q)}`),
   exportUrl: (pid, format) => `/api/projects/${pid}/export?format=${format}`,
+  // Writing a novel out to a Google Doc, one tab per chapter. The plan writes nothing and
+  // reports how many documents it needs (English runs ~1.6x the characters of its Korean,
+  // so a finished 100-chapter novel is already past Google's 1,020,000 cap) plus any
+  // chapter that would not come back byte-identical. Creating one points NOTHING at it —
+  // it is a readable copy, never a novel's source.
+  planDocExport: (pid, content = 'translation') =>
+    get(`/api/projects/${pid}/export/doc?content=${content}`),
+  exportToDoc: (pid, content = 'translation') =>
+    post(`/api/projects/${pid}/export/doc?content=${content}`),
 
   // Per-paragraph rewrites. Generating writes only to the variant history — nothing
   // reaches the chapter until applyParagraph — so these run inline rather than

@@ -60,6 +60,61 @@ def test_google_statuses_map_to_distinct_causes():
     assert errors.explain(exc).action == errors.ACTION_RECONNECT_GOOGLE
 
 
+# ---- Google failures must not be reported as Claude failures --------------
+#
+# Two rules that match on message text -- `\b400\b` and "rate limit" -- sat ABOVE the
+# Google section, so a Docs batchUpdate 400 was reported as "Claude rejected the request"
+# and told the user to change their model settings, and a Docs 429 as their Claude plan's
+# usage limit being reached. Both confirmed against real googleapiclient HttpError objects
+# before the fix. Latent until now only because nothing in the app ever WROTE to Google.
+
+
+def _google(status, message="request failed"):
+    exc = Exception(message)
+    exc.resp = SimpleNamespace(status=status)
+    return exc
+
+
+def test_a_docs_rejection_is_not_blamed_on_claude():
+    e = errors.explain(_google(400, "Invalid requests[0].insertText"))
+    assert e.code == "google-rejected"
+    # The specific wrong turn: sending someone to Settings to change their model over a
+    # problem that has nothing to do with the model.
+    assert "claude" not in e.title.lower()
+    assert e.action != errors.ACTION_SETTINGS
+
+
+def test_a_docs_quota_is_not_blamed_on_the_claude_plan():
+    e = errors.explain(_google(429, "Quota exceeded: rate limit"))
+    assert e.code == "google-quota"
+    assert e.retryable is True
+    assert "claude" not in e.title.lower()
+
+
+def test_a_missing_scope_is_not_reported_as_a_sharing_problem():
+    # The advice is the opposite of the sharing 403's: nothing is wrong with the document
+    # or the account, so "share it with the account you signed in with" sends someone to
+    # re-share a document they already own.
+    e = errors.explain(_google(403, "Request had insufficient authentication scopes."))
+    assert e.code == "google-scope"
+    assert e.action == errors.ACTION_RECONNECT_GOOGLE
+    assert not any("share" in f.lower() for f in e.fixes)
+
+
+def test_a_sharing_403_still_says_to_share_it():
+    e = errors.explain(_google(403, "The caller does not have permission"))
+    assert e.code == "google-forbidden"
+    assert any("share" in f.lower() for f in e.fixes)
+
+
+def test_claudes_own_rejections_are_still_claudes():
+    # The other half: narrowing those two rules must not stop them catching what they
+    # were written for.
+    assert errors.explain(Exception("Agent error: 400 bad thinking config")).code \
+        == "agent-rejected"
+    assert errors.explain(Exception("API rate limit exceeded")).code == "rate-limited"
+
+
 def test_rate_limit_keeps_its_own_code_and_429():
     e = errors.explain(T.RateLimitedError(SimpleNamespace(rate_limit_type="usage", resets_at=None)))
     assert e.code == "rate-limited"

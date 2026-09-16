@@ -69,6 +69,24 @@ def _trace(exc: BaseException) -> str:
         return _detail(exc)
 
 
+def _is_google(exc: BaseException) -> bool:
+    """Whether this came from a Google client, decided without importing one.
+
+    Load-bearing, because several rules below key on an HTTP status and Claude's SDK
+    errors carry one too. Without this a Docs ``batchUpdate`` 400 was reported as "Claude
+    rejected the request" — sending someone to change their model settings over a Google
+    problem — and a Docs 429 as the Claude plan's usage limit. Both were confirmed against
+    real ``HttpError`` objects before this was written.
+    """
+    module = type(exc).__module__ or ""
+    if module.startswith("googleapiclient") or module.startswith("google."):
+        return True
+    # The httplib2 response object a googleapiclient HttpError carries. Claude's SDK
+    # exposes `status_code` and an httpx `response` instead, never `resp.status`, so
+    # this identifies a Google failure without claiming one of Claude's.
+    return getattr(getattr(exc, "resp", None), "status", None) is not None
+
+
 def _http_status(exc: BaseException) -> int | None:
     """Pull the status code out of a googleapiclient HttpError without importing it
     (the import is heavy and this module is used on paths that never touch Google)."""
@@ -102,6 +120,9 @@ def _classify(exc: BaseException) -> Explained:
     msg = _message(exc)
     low = msg.lower()
     detail, trace = _detail(exc), _trace(exc)
+    # Decided once, up here, because two of the Claude rules below match on text that a
+    # Google error also carries.
+    google = _is_google(exc)
 
     def out(**kw) -> Explained:
         return Explained(detail=detail, trace=trace, **kw)
@@ -155,7 +176,8 @@ def _classify(exc: BaseException) -> Explained:
             action=ACTION_RETRY, retryable=True, status=502,
         )
 
-    if name == "RateLimitedError" or "usage limit" in low or "rate limit" in low:
+    if not google and (name == "RateLimitedError" or "usage limit" in low
+                       or "rate limit" in low):
         return out(
             code="rate-limited",
             title="Your Claude plan's limit was reached",
@@ -195,7 +217,7 @@ def _classify(exc: BaseException) -> Explained:
             action=ACTION_RETRY, retryable=True, status=502,
         )
 
-    if "agent error" in low or re.search(r"\b400\b", msg):
+    if not google and ("agent error" in low or re.search(r"\b400\b", msg)):
         return out(
             code="agent-rejected",
             title="Claude rejected the request",
@@ -223,6 +245,57 @@ def _classify(exc: BaseException) -> Explained:
             fixes=["Click Reconnect Google and sign in again.",
                    "Then retry what you were doing."],
             action=ACTION_RECONNECT_GOOGLE, retryable=False, status=401,
+        )
+
+    # MissingScope is the pre-flight refusing a write before anything is created; the 403
+    # is Google refusing one that got through. Same cause, same advice.
+    if name == "MissingScope" or (
+            status == 403 and ("insufficient" in low or "scope" in low)):
+        # Distinct from the sharing 403 below, and checked first, because the advice is
+        # the opposite. Nothing is wrong with the document or the account: the app was
+        # never granted permission to do this KIND of thing, so re-sharing a document
+        # you already own would not help and only wastes the time of someone following
+        # instructions in good faith.
+        return out(
+            code="google-scope",
+            title="Night Reader was never given permission to write to Google Docs",
+            what="The signed-in account is right and the document is fine — this app "
+                 "only ever asked Google for read access, so it cannot create or change "
+                 "a document until you grant that separately.",
+            fixes=[
+                "Click Reconnect Google and approve the additional permission when the "
+                "consent screen asks.",
+                "Reading and translating carry on working either way.",
+            ],
+            action=ACTION_RECONNECT_GOOGLE, retryable=False, status=403,
+        )
+
+    if google and status == 429:
+        # Google's own quota, not Claude's. Writing a long novel out tab by tab is
+        # exactly the shape of request that meets the Docs per-minute write limit, and
+        # unlike the Claude limit it clears in about a minute.
+        return out(
+            code="google-quota",
+            title="Google is asking Night Reader to slow down",
+            what="The Docs API's own rate limit was reached. This has nothing to do with "
+                 "your Claude plan, and it clears on its own within a minute or so.",
+            fixes=["Wait a minute and try again.",
+                   "Nothing was lost — the parts already written are still there."],
+            action=ACTION_RETRY, retryable=True, status=429,
+        )
+
+    if google and status == 400:
+        return out(
+            code="google-rejected",
+            title="Google refused that change to the document",
+            what="The Docs API rejected the request as malformed. That points at a fault "
+                 "in Night Reader rather than anything you did — most often a document "
+                 "that was edited while it was being written to.",
+            fixes=[
+                "Close the document if you have it open elsewhere, then try again.",
+                "If it keeps happening, copy the report below — nothing was written.",
+            ],
+            action=ACTION_RETRY, retryable=False, status=400,
         )
 
     if status == 403:

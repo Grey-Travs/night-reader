@@ -64,6 +64,7 @@ from translation_bot.glossary import (
     normalize_pronoun,
     save_pending,
 )
+from translation_bot import google_auth
 from translation_bot.google_auth import build_docs_service, get_credentials, load_saved_credentials
 from translation_bot.pipeline import (
     chapter_filename,
@@ -92,6 +93,7 @@ from translation_bot.translator import (
 from translation_bot.validate import validate_translation
 
 from . import console
+from . import docexport as doc_export
 from . import errors
 from .locks import file_lock
 from . import ocr_build
@@ -649,6 +651,20 @@ def chapter_row(ch: Chapter, cfg: Config, state: State, total: int,
 
 
 # ----------------------------------------------------------------------------- status / settings
+def _google_can_write(token_file) -> bool:
+    """Whether the saved token was actually granted permission to write, not just read.
+
+    Every failure answers False on purpose: this feeds a status flag, and a token that
+    cannot be read is, for the purpose of offering an export, one that cannot write.
+    """
+    try:
+        creds = google_auth._load_token(Path(token_file))
+        return bool(creds) and not google_auth.missing_scopes(
+            creds, google_auth.WRITE_SCOPES)
+    except Exception:  # noqa: BLE001 — a status flag must never break the first call
+        return False
+
+
 @app.get("/api/status")
 def status() -> dict:
     cfg_exists = CONFIG_PATH.exists()
@@ -668,6 +684,11 @@ def status() -> dict:
         "config_error": config_error,
         "google_client_secret_present": Path(creds_file).exists(),
         "google_logged_in": Path(token_file).exists(),
+        # Separate from being signed in, because they are genuinely different states: the
+        # app has always asked Google for read access only, so every existing token is
+        # signed in and unable to write. Offering an export behind the same green dot
+        # would promise something that fails at the last step.
+        "google_can_write": _google_can_write(token_file),
         "claude_logged_in": CLAUDE_CREDENTIALS.exists(),
         "model": cfg.anthropic.model if cfg else None,
     }
@@ -743,10 +764,24 @@ def init_config() -> dict:
 
 
 @app.post("/api/google/login")
-async def google_login() -> dict:
+async def google_login(write: bool = False) -> dict:
+    """Sign in to Google. ``write=true`` also asks for permission to create documents.
+
+    Kept opt-in rather than always asking, because the two are genuinely different
+    promises: reading source documents is what this app has always done, and creating
+    files in someone's Drive is not something to start requesting of everyone because one
+    optional export exists. The export's own error asks for it by name when it is wanted.
+
+    There is one trap this closes. A cached read-only token stays perfectly VALID, so
+    widening the scope list alone changes nothing at all — ``get_credentials`` short-
+    circuits and the consent screen is never reached. Passing the wider scopes down is
+    what actually opens the browser; see the note in ``google_auth.get_credentials``.
+    """
     cfg = load_global_config()
-    await run_in_threadpool(get_credentials, cfg.google.credentials_file, cfg.google.token_file)
-    return {"ok": True}
+    scopes = google_auth.WRITE_SCOPES if write else google_auth.SCOPES
+    await run_in_threadpool(
+        get_credentials, cfg.google.credentials_file, cfg.google.token_file, scopes)
+    return {"ok": True, "can_write": _google_can_write(cfg.google.token_file)}
 
 
 # ----------------------------------------------------------------------------- projects
@@ -1772,6 +1807,48 @@ def _translated_chapters_local(cfg: Config) -> list[tuple[int, str, str]]:
         out.append((idx, title, text))
     out.sort(key=lambda r: r[0])
     return out
+
+
+@app.get("/api/projects/{pid}/export/doc")
+def plan_doc_export(pid: str, content: str = "translation") -> dict:
+    """What writing this novel to a Google Doc would produce. Writes nothing.
+
+    Separate from doing it, for the same reason the posting plan is separate from a
+    posting run: the chapter count, how many documents it needs and any chapter that
+    would not come back byte-identical are all worth seeing first.
+    """
+    try:
+        out = doc_export.plan(pid, content=content)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    out.pop("_parts", None)
+    out["can_write"] = _google_can_write(load_global_config().google.token_file)
+    return out
+
+
+@app.post("/api/projects/{pid}/export/doc")
+async def run_doc_export(pid: str, content: str = "translation") -> dict:
+    """Write this novel out to a new Google Doc, one tab per chapter.
+
+    Creates a document and points nothing at it — no project is flipped to it, no
+    ``source.json`` is rewritten, no hash re-stamped. That is why this can be offered
+    without the care the posting run needs: the worst outcome is a document in Drive that
+    the user deletes.
+
+    Uses the SAVED credentials rather than ``get_credentials``, so it can never open a
+    consent window from inside a request. A token without the write scope is refused by
+    ``require_scopes`` before anything is created, and the error layer explains it as a
+    permission to grant rather than as a document to re-share.
+    """
+    cfg = load_global_config()
+    creds = await run_in_threadpool(load_saved_credentials, cfg.google.token_file)
+    google_auth.require_scopes(creds, google_auth.WRITE_SCOPES)
+    service = build_docs_service(creds)
+    try:
+        return await run_in_threadpool(
+            doc_export.export_novel, pid, service, content=content)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/projects/{pid}/export")

@@ -37,6 +37,7 @@ export default function ProjectLayout() {
   const [pendingCount, setPendingCount] = useState(0)
   const [glossary, setGlossary] = useState([]) // locked terms, for reader tooltips
   const [showExport, setShowExport] = useState(false)
+  const [docExport, setDocExport] = useState({ busy: false, documents: null })
 
   const [running, setRunning] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -379,6 +380,24 @@ export default function ProjectLayout() {
   // within a message or two rather than instantly.
   const stopAll = () => cancelQueue({ stopCurrent: true })
 
+  // Write this novel out to a Google Doc, one tab per chapter. Nothing is ever pointed at
+  // the result — it is a readable copy, not a source — so unlike every other action here
+  // it cannot damage the novel. A long novel needs more than one document, because
+  // English runs about 1.6x the characters of the Korean it came from and Google caps a
+  // document at 1,020,000.
+  async function exportToDoc() {
+    setShowExport(false)
+    setDocExport({ busy: true, documents: null })
+    try {
+      const out = await api.exportToDoc(pid)
+      setDocExport({ busy: false, documents: out.documents || [] })
+    } catch (e) {
+      setDocExport({ busy: false, documents: null })
+      setError(e)
+      showError(e, { context: 'exporting to a Google Doc', onRetry: exportToDoc })
+    }
+  }
+
   function setProjectMeta(updated) {
     setData((d) => d && { ...d, project: { ...d.project, ...updated } })
   }
@@ -440,6 +459,9 @@ export default function ProjectLayout() {
                         <a key={fmt} href={api.exportUrl(pid, fmt)} onClick={() => setShowExport(false)} className="block rounded-btn px-3 py-2 hover:bg-[color-mix(in_oklab,var(--ink)_6%,transparent)]">{label}</a>
                       ))}
                       <div className="my-1 border-t border-line" />
+                      <button type="button" onClick={exportToDoc} disabled={docExport.busy} className="block w-full rounded-btn px-3 py-2 text-left hover:bg-[color-mix(in_oklab,var(--ink)_6%,transparent)] disabled:opacity-50" title="Create a new Google Doc with one tab per chapter. A copy to read or edit — this novel keeps reading from where it always did.">
+                        {docExport.busy ? 'Writing to Google…' : 'Google Doc (a tab per chapter)'}
+                      </button>
                       <a href={api.bundleUrl(pid)} onClick={() => setShowExport(false)} className="block rounded-btn px-3 py-2 hover:bg-[color-mix(in_oklab,var(--ink)_6%,transparent)]" title="Download this whole novel as a .zip to move to another device or keep as a backup">Back up / move (.zip)</a>
                     </div>
                   )}
@@ -466,6 +488,44 @@ export default function ProjectLayout() {
           </nav>
         </div>
       </header>
+
+      {docExport.documents && (
+        <div className="mx-auto mt-4 max-w-6xl px-6">
+          <div className="rounded-card border border-line px-3 py-2 text-sm">
+            <div className="flex flex-wrap items-center gap-2">
+              <span>
+                {docExport.documents.length === 1
+                  ? 'Written to a new Google Doc.'
+                  : `Written to ${docExport.documents.length} Google Docs — one document `
+                    + 'cannot hold the whole novel.'}
+              </span>
+              {docExport.documents.map((d, i) => (
+                <a key={d.id} href={d.url} target="_blank" rel="noreferrer"
+                   className="underline hover:no-underline">
+                  {docExport.documents.length === 1 ? 'Open it' : `Part ${i + 1}`}
+                </a>
+              ))}
+              <div className="flex-1" />
+              <button
+                onClick={() => setDocExport({ busy: false, documents: null })}
+                className="shrink-0 text-xs text-hint underline hover:no-underline"
+              >
+                Dismiss
+              </button>
+            </div>
+            {/* Nothing points at these documents, so a difference costs a paragraph mark
+                in a copy rather than un-validating a finished chapter. Still said out
+                loud: "it exported fine" about a document that quietly differs is exactly
+                the wrong answer to give. */}
+            {docExport.documents.some((d) => d.check && !d.check.ok) && (
+              <p className="mt-1 text-xs text-hint">
+                Some chapters read back slightly differently — a paragraph that already
+                contained a line break becomes two. This novel itself is untouched.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="mx-auto mt-4 max-w-6xl px-6">

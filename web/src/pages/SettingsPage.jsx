@@ -34,10 +34,14 @@ export default function SettingsPage() {
     }
   }
 
-  async function reconnectGoogle() {
-    setConnecting(true); setError(null)
+  // `write` also asks for permission to CREATE documents, which the Google Doc export
+  // needs. It has to be passed all the way down: a cached read-only token stays perfectly
+  // valid, so without it the consent screen is never reached and pressing this appears to
+  // do nothing at all.
+  async function reconnectGoogle(write = false) {
+    setConnecting(write ? 'write' : 'read'); setError(null)
     try {
-      await api.googleLogin()
+      await api.googleLogin(write)
       setStatus?.(await api.status())
     } catch (e) {
       setError(String(e.message || e))
@@ -101,10 +105,21 @@ export default function SettingsPage() {
           <span className="flex items-center gap-1.5"><Dot ok={status?.claude_logged_in} /> Claude {status?.claude_logged_in ? 'connected' : 'not connected'}</span>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button onClick={reconnectGoogle} disabled={connecting} className="btn btn-ghost px-4 py-2 text-sm">{connecting ? 'Opening Google…' : 'Reconnect Google'}</button>
+          <button onClick={() => reconnectGoogle(false)} disabled={!!connecting} className="btn btn-ghost px-4 py-2 text-sm">{connecting === 'read' ? 'Opening Google…' : 'Reconnect Google'}</button>
+          {status?.google_logged_in && !status?.google_can_write && (
+            <button onClick={() => reconnectGoogle(true)} disabled={!!connecting} className="btn btn-ghost px-4 py-2 text-sm" title="Asks Google for permission to create documents, which the Google Doc export needs. It reaches only files this app creates — never anything already in your Drive.">
+              {connecting === 'write' ? 'Opening Google…' : 'Allow writing to Docs'}
+            </button>
+          )}
           <button onClick={() => onSetup?.()} className="btn btn-ghost px-4 py-2 text-sm">Run full setup…</button>
         </div>
-        <p className="text-xs text-hint">Google is needed only for reading Google Docs. Pasted-text novels work without it.</p>
+        <p className="text-xs text-hint">
+          Google is needed only for reading Google Docs. Pasted-text novels work without it.
+          {status?.google_logged_in && !status?.google_can_write
+            && ' Writing is a separate permission, asked for only if you want the Google Doc export.'}
+          {status?.google_can_write
+            && ' Night Reader can also create documents — it reaches only the files it creates itself.'}
+        </p>
       </section>
 
       <RemoteAccess />
