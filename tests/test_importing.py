@@ -407,6 +407,62 @@ def test_the_posting_page_immediately_knows_it_is_all_published(library):
         assert any("already" in b for b in item["blockers"]), item
 
 
+# ---- continuing an imported novel -----------------------------------------
+#
+# An imported novel has no Google Doc, so its next chapters arrive in a new one that is
+# added to the series the importer gave it. What must not break is the ledger: the
+# imported chapters are already live on the site, and a run that offered them again would
+# re-post the entire back catalogue.
+
+KOREAN = "그는 천천히 고개를 돌려 나를 바라보았다. " * 12
+
+
+def _continuation(name, numbers):
+    """A Korean continuation document, of the kind pasted into a new Doc by hand."""
+    from translation_bot.docs_extract import Chapter
+    chapters = [
+        Chapter(index=i, title=f"Tab {i}", paragraphs=[
+            f"ridibooks.com/books/{2000 + i}/view\n\n노벨 제목 {n}화", KOREAN])
+        for i, n in enumerate(numbers, 1)
+    ]
+    return pj.create_text_project(name, chapters)["id"]
+
+
+def _reresolve(sid):
+    series = series_mod.get_series(sid)
+    chapters = {pid: pj.load_text_chapters(pid)
+                for pid in series_mod.member_ids(series)}
+    return series_mod.save_mapping(sid, series_mod.resolve_mapping(series, chapters))
+
+
+def test_the_imported_chapters_stay_published_after_a_document_is_added(library):
+    out = importing.import_novel("Novel", _records(6, paid_from=4),
+                                 series_url="https://meiko.studio/page/x/series/y/")
+    series_mod.add_member(out["sid"], _continuation("Novel 2", [7, 8]))
+    _reresolve(out["sid"])
+    plan = posting.plan_run(out["sid"], "t1")
+    published = [i for i in plan["items"] if i["global"] in range(1, 7)]
+    assert len(published) == 6
+    for item in published:
+        assert any("already" in b for b in item["blockers"]), item
+
+
+def test_the_added_document_continues_the_numbering(library):
+    out = importing.import_novel("Novel", _records(6, paid_from=4),
+                                 series_url="https://meiko.studio/page/x/series/y/")
+    pid = _continuation("Novel 2", [7, 8])
+    series_mod.add_member(out["sid"], pid)
+    _reresolve(out["sid"])
+    plan = posting.plan_run(out["sid"], "t1")
+    fresh = [i for i in plan["items"] if i["global"] in (7, 8)]
+    assert len(fresh) == 2
+    # New chapters, so nothing about them is "already" anything. They are held only
+    # because they have not been translated yet, which is the ordinary state of a
+    # chapter that was pasted in five minutes ago.
+    for item in fresh:
+        assert not any("already" in b for b in item["blockers"]), item
+
+
 def test_the_free_and_paid_split_matches_the_site(library):
     out = importing.import_novel("Novel", _records(10, paid_from=6))
     plan = posting.plan_run(out["sid"], "t1", use_site=False)

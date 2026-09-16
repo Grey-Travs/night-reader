@@ -151,6 +151,13 @@ export const api = {
   updateSeries: (sid, body) => post(`/api/series/${sid}`, body),
   // Unlinks the series only — the member novels are never deleted.
   deleteSeries: (sid) => del(`/api/series/${sid}`),
+  // The novels in no series, which is what can be added to one.
+  unlinkedNovels: () => get('/api/series/unlinked'),
+  // How a novel carries on once its document is full — and the only way an imported
+  // novel, which has no document at all, ever gets a next chapter. The numbering has to
+  // be re-resolved afterwards: the stored mapping predates the document being added.
+  addSeriesMember: (sid, projectId) =>
+    post(`/api/series/${sid}/members`, { project_id: projectId }),
   // refresh=true re-reads the documents; without it the stored numbering is served as-is,
   // because a resolved chapter number must never be silently recomputed.
   seriesMapping: (sid, refresh = false) =>

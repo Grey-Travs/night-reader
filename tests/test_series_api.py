@@ -58,6 +58,15 @@ def _novel(client, name, numbers):
     """
     pid = client.post("/api/projects/text", json={
         "name": name, "text": "seed", "split_mode": "single"}).json()["id"]
+    return _write_tabs(pid, numbers)
+
+
+def _write_tabs(pid, numbers):
+    """Replace a project's tabs, in the same shape ``_novel`` creates them.
+
+    Split out so a test can GROW a document and re-resolve, which is the only way to
+    check that preserving confirmed rows has not frozen the rest of the mapping.
+    """
     records = []
     for i, n in enumerate(numbers, 1):
         head = f"ridibooks.com/books/{1000 + i}/view\n\n노벨 제목"
@@ -404,6 +413,170 @@ def test_a_novel_in_no_series_is_unaffected(client):
     r = client.get(f"/api/projects/{pid}/chapters")
     assert r.status_code == 200
     assert r.json()["total"] == 3
+
+
+# ---- adding a document to a series ----------------------------------------
+#
+# How a novel carries on once its document is full. It matters most for an IMPORTED
+# novel, which has no document at all: the importer puts each one in a series of its own,
+# so adding the continuation document to that series is the only way it ever gets a next
+# chapter. Nothing is converted and nothing is rewritten -- the numbering, the merged
+# glossary and the publishing ledger all live on the series already.
+
+
+def test_unlinked_is_not_captured_as_a_series_id(client):
+    # Same trap as /api/series/suggest: it must be declared before /api/series/{sid}.
+    r = client.get("/api/series/unlinked")
+    assert r.status_code == 200 and "novels" in r.json()
+
+
+def test_unlinked_lists_only_novels_in_no_series(client):
+    a = _novel(client, "Joined", [1, 2])
+    b = _novel(client, "Spare", [1, 2])
+    _series(client, "Joined", [a])
+    ids = [n["id"] for n in client.get("/api/series/unlinked").json()["novels"]]
+    assert b in ids and a not in ids
+
+
+def test_a_novel_stops_being_offered_once_it_is_added(client):
+    a = _novel(client, "Gone", [1, 2])
+    b = _novel(client, "Gone Next", [3, 4])
+    sid = _series(client, "Gone", [a])
+    client.post(f"/api/series/{sid}/members", json={"project_id": b})
+    ids = [n["id"] for n in client.get("/api/series/unlinked").json()["novels"]]
+    assert b not in ids
+
+
+def test_adding_a_document_puts_it_last_in_reading_order(client):
+    a = _novel(client, "Carry", [1, 2, 3])
+    b = _novel(client, "Carry Next", [1, 2])
+    sid = _series(client, "Carry", [a])
+    out = client.post(f"/api/series/{sid}/members", json={"project_id": b}).json()
+    assert [m["project_id"] for m in out["members"]] == [a, b]
+    # The stored mapping predates this document, so the page has to be told to re-resolve
+    # rather than render a series that looks like it lost chapters.
+    assert out["needs_resolve"] is True
+
+
+def test_the_added_document_starts_where_the_series_left_off(client):
+    a = _novel(client, "Cont", [1, 2, 3])
+    b = _novel(client, "Cont Next", [1, 2])
+    sid = _series(client, "Cont", [a])
+    out = client.post(f"/api/series/{sid}/members", json={"project_id": b}).json()
+    assert out["members"][1]["start_chapter"] == 4
+
+
+def test_the_start_skips_rows_confirmed_out_of_the_sequence(client):
+    # The resolved mapping wins over counting tabs, because only it knows which rows a
+    # person took out of the sequence. Counting tabs would start the next document one
+    # number too high and leave a phantom gap behind it.
+    a = _novel(client, "Side", [1, 2, 3])
+    sid = _series(client, "Side", [a])
+    client.put(f"/api/series/{sid}/mapping", json={"overrides": [
+        {"project_id": a, "index": 3, "global": None, "kind": "side"}]})
+    b = _novel(client, "Side Next", [1, 2])
+    out = client.post(f"/api/series/{sid}/members", json={"project_id": b}).json()
+    assert out["members"][1]["start_chapter"] == 3
+
+
+def test_a_range_in_the_documents_own_name_wins(client):
+    a = _novel(client, "Named", [1, 2, 3])
+    sid = _series(client, "Named", [a])
+    b = _novel(client, "Named 101-124", [None, None])
+    out = client.post(f"/api/series/{sid}/members", json={"project_id": b}).json()
+    assert out["members"][1]["start_chapter"] == 101
+
+
+def test_a_novel_already_in_another_series_is_refused(client):
+    a = _novel(client, "Owned", [1, 2])
+    b = _novel(client, "Spoken For", [1, 2])
+    sid = _series(client, "Owned", [a])
+    _series(client, "Another Story", [b])
+    r = client.post(f"/api/series/{sid}/members", json={"project_id": b})
+    assert r.status_code == 400
+    # The OTHER series is named, so the message says where to go and undo it. detail is
+    # the shaped error object the whole API returns, not a bare string.
+    assert "Another Story" in r.json()["detail"]["title"]
+
+
+def test_a_novel_already_in_this_series_is_refused(client):
+    a = _novel(client, "Twice", [1, 2])
+    sid = _series(client, "Twice", [a])
+    r = client.post(f"/api/series/{sid}/members", json={"project_id": a})
+    assert r.status_code == 400
+    assert len(client.get(f"/api/series/{sid}").json()["members"]) == 1
+
+
+def test_an_unknown_project_cannot_be_added(client):
+    a = _novel(client, "Ghost", [1, 2])
+    sid = _series(client, "Ghost", [a])
+    r = client.post(f"/api/series/{sid}/members", json={"project_id": "0" * 12})
+    assert r.status_code == 400
+
+
+def test_adding_did_not_loosen_the_reorder_guard(client):
+    # Adding got its own endpoint precisely so that reordering still cannot drop a
+    # document: a member list that is not a permutation is still refused.
+    a = _novel(client, "Keep", [1, 2])
+    b = _novel(client, "Keep2", [3, 4])
+    sid = _series(client, "Keep", [a, b])
+    assert client.post(f"/api/series/{sid}", json={"members": [a]}).status_code == 400
+
+
+def test_the_series_numbers_straight_through_the_added_document(client):
+    # The continuation document states no numbers of its own -- a hand-pasted Doc often
+    # does not -- so this is the seeded start doing the work.
+    a = _novel(client, "Through", [1, 2, 3])
+    b = _novel(client, "Through Next", [None, None])
+    sid = _series(client, "Through", [a])
+    client.post(f"/api/series/{sid}/members", json={"project_id": b})
+    m = client.get(f"/api/series/{sid}/mapping?refresh=true").json()
+    assert [r["global"] for r in _rows(m, b)] == [4, 5]
+    assert m["last"] == 5 and m["gaps"] == []
+
+
+def test_reading_crosses_into_the_added_document(client):
+    a = _novel(client, "Seam", [1, 2, 3])
+    b = _novel(client, "Seam Next", [None, None])
+    sid = _series(client, "Seam", [a])
+    client.post(f"/api/series/{sid}/members", json={"project_id": b})
+    client.get(f"/api/series/{sid}/mapping?refresh=true")
+    d = _detail(client, a, 3)
+    assert d["next"]["project_id"] == b and d["next"]["index"] == 1
+    assert d["next"]["global"] == 4
+
+
+# ---- a confirmed row survives re-resolving --------------------------------
+#
+# ``apply_overrides`` promises that a human decision is final and that a later re-resolve
+# leaves it alone. That was NOT true: re-resolving rebuilt every row from the document
+# and silently renumbered the confirmed ones. It went unnoticed because the only test of
+# it re-READ the stored mapping instead of re-resolving, and because re-resolving was
+# rare. Adding a document makes it routine, so it would have fired on first use.
+
+
+def test_a_confirmed_row_survives_a_real_re_resolve(client):
+    a = _novel(client, "Final", [1, 2, 3])
+    sid = _series(client, "Final", [a])
+    client.put(f"/api/series/{sid}/mapping", json={"overrides": [
+        {"project_id": a, "index": 3, "global": None, "kind": "side"}]})
+    m = client.get(f"/api/series/{sid}/mapping?refresh=true").json()
+    row = next(r for r in _rows(m, a) if r["index"] == 3)
+    assert row["global"] is None and row["kind"] == "side"
+    assert row["source"] == "manual" and row["confidence"] == "high"
+
+
+def test_preserving_confirmed_rows_does_not_freeze_the_rest(client):
+    # The other half, and the reason this is not just "never re-resolve": rows nobody
+    # confirmed are still re-read from the document, including tabs added since.
+    a = _novel(client, "Grow", [1, 2, 3])
+    sid = _series(client, "Grow", [a])
+    client.put(f"/api/series/{sid}/mapping", json={"overrides": [
+        {"project_id": a, "index": 1, "global": 1}]})
+    _write_tabs(a, [1, 2, 3, 4])
+    m = client.get(f"/api/series/{sid}/mapping?refresh=true").json()
+    assert [r["global"] for r in _rows(m, a)] == [1, 2, 3, 4]
+    assert [r["source"] == "manual" for r in _rows(m, a)] == [True, False, False, False]
 
 
 if __name__ == "__main__":

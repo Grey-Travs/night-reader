@@ -3476,6 +3476,27 @@ def suggest_series_route() -> dict:
     return {"groups": groups}
 
 
+@app.get("/api/series/unlinked")
+def unlinked_novels_route() -> dict:
+    """Novels in no series — what can be added to one.
+
+    Declared before ``/api/series/{sid}`` on purpose. FastAPI matches in registration
+    order, so the other way round "unlinked" is captured as a series id and this silently
+    404s — the same trap ``/api/series/suggest`` already has a test for.
+    """
+    taken = {m for s in series_mod.list_series() for m in series_mod.member_ids(s)}
+    rows = [p for p in pj.list_projects() if p.get("id") not in taken]
+    rows.sort(key=lambda p: (p.get("name") or "").casefold())
+    return {"novels": [{
+        "id": p.get("id"),
+        "name": p.get("name") or "",
+        "chapter_count": int(p.get("chapter_count") or 0),
+        # Worth showing: a continuation document is a Google Doc, so a text project in
+        # this list is more likely to be an imported novel than the next volume.
+        "source_type": p.get("source_type") or "gdoc",
+    } for p in rows]}
+
+
 @app.post("/api/series")
 def create_series_route(body: CreateSeries) -> dict:
     try:
@@ -3526,6 +3547,34 @@ def update_series_route(sid: str, body: UpdateSeries) -> dict:
                 member["start_chapter"] = body.starts[member["project_id"]]
     series_mod.write_series(series)
     return _series_summary(series, series_mod.load_mapping(sid))
+
+
+class AddMember(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: str
+
+
+@app.post("/api/series/{sid}/members")
+def add_series_member_route(sid: str, body: AddMember) -> dict:
+    """Attach an existing novel to the end of a series.
+
+    Kept separate from the reorder in ``POST /api/series/{sid}`` rather than loosening
+    that route's member-set check, because the two are different operations: reordering
+    must not change who is in the series, and adding must seed a start chapter and refuse
+    a project that already belongs somewhere else.
+    """
+    require_series(sid)
+    try:
+        series = series_mod.add_member(sid, body.project_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    mapping = series_mod.load_mapping(sid)
+    out = _series_summary(series, mapping)
+    # The stored mapping was resolved before this document existed, so it has no rows for
+    # it and the totals are short by a document. Said plainly, because a series that
+    # silently looks shorter reads as lost chapters.
+    out["needs_resolve"] = bool(mapping)
+    return out
 
 
 @app.delete("/api/series/{sid}")

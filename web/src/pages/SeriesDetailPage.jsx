@@ -37,6 +37,8 @@ export default function SeriesDetailPage() {
   const [edits, setEdits] = useState({})
   const [onlyFlagged, setOnlyFlagged] = useState(true)
   const [busy, setBusy] = useState('')
+  const [unlinked, setUnlinked] = useState([])
+  const [addPid, setAddPid] = useState('')
 
   const load = useCallback(async (refresh = false) => {
     try {
@@ -49,7 +51,36 @@ export default function SeriesDetailPage() {
     }
   }, [sid])
 
+  const loadUnlinked = useCallback(() => {
+    // A failure here only empties the picker, so it must not take the numbering table
+    // down with it.
+    api.unlinkedNovels().then((d) => setUnlinked(d.novels || [])).catch(() => {})
+  }, [])
+
   useEffect(() => { load() }, [load])
+  useEffect(() => { loadUnlinked() }, [loadUnlinked])
+
+  // Adding a document is how a novel carries on once its own is full — and the only way
+  // an imported novel, which has no Google Doc at all, ever gets a next chapter.
+  async function addMember() {
+    if (!addPid) return
+    const added = unlinked.find((n) => n.id === addPid)
+    setBusy('add')
+    try {
+      const out = await api.addSeriesMember(sid, addPid)
+      setAddPid('')
+      loadUnlinked()
+      // The stored mapping was resolved before this document existed, so it holds no
+      // rows for it. Re-resolving here rather than leaving the page showing a series
+      // that looks like it just lost chapters.
+      await load(out.needs_resolve)
+      toast(`Added ${added?.name || 'the novel'}`)
+    } catch (e) {
+      setError(e)
+    } finally {
+      setBusy('')
+    }
+  }
 
   // One flat list in READING order — member order, then index within the member. Not
   // sorted by global number: a side story sits where it actually lives in the document,
@@ -150,6 +181,45 @@ export default function SeriesDetailPage() {
                 </li>
               ))}
             </ol>
+
+            <div className="mt-3 border-t border-line pt-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  aria-label="Add a document"
+                  className="min-w-0 flex-1 rounded border border-line bg-transparent px-2 py-1 text-xs"
+                  value={addPid}
+                  onChange={(e) => setAddPid(e.target.value)}
+                  disabled={!!busy || unlinked.length === 0}
+                >
+                  <option value="">
+                    {unlinked.length === 0 ? 'No novel is free to add' : 'Add a document…'}
+                  </option>
+                  {unlinked.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.name} · {n.chapter_count}
+                      {n.source_type === 'text' ? ' chapters' : ' tabs'}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn btn-ghost px-3 py-1.5 text-xs"
+                  disabled={!addPid || !!busy}
+                  onClick={addMember}
+                >
+                  {busy === 'add' ? 'Adding…' : 'Add'}
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-hint">
+                {unlinked.length === 0
+                  ? 'Every novel is already in a series.'
+                  : `Paste the next chapters into a new Google Doc, add it to the library,`
+                    + ` then add it here — it carries on from chapter`
+                    + ` ${(data.last ?? 0) + 1}.`}
+                {series.glossary_merged_at && unlinked.length > 0
+                  && ' It will read this series’ glossary, so the names stay consistent.'}
+              </p>
+            </div>
+
             {(data.gaps?.length > 0 || data.duplicates?.length > 0) && (
               <p className="mt-2 text-xs text-hint">
                 {data.gaps?.length > 0 && (

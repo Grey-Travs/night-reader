@@ -314,6 +314,67 @@ def write_series(series: dict) -> dict:
     return series
 
 
+def next_start_chapter(sid: str, series: dict) -> int:
+    """The global number a document added to the end of this series would start at.
+
+    The resolved mapping wins when there is one, because it is the only source that knows
+    which rows were confirmed as side stories and excluded from the sequence -- counting
+    tabs would put the new document several numbers too high. Otherwise this walks the
+    members exactly as ``seed_start_chapters`` does.
+    """
+    last = (load_mapping(sid) or {}).get("last")
+    if isinstance(last, int):
+        return last + 1
+    running = 0
+    for m in series.get("members") or []:
+        project = pj.get_project(m.get("project_id")) or {}
+        start = m.get("start_chapter") or (running + 1)
+        running = start - 1 + int(project.get("chapter_count") or 0)
+    return running + 1
+
+
+def add_member(sid: str, pid: str) -> dict:
+    """Attach an existing novel to a series, at the end of the reading order.
+
+    This is how a novel carries on once its document is full -- and, since the importer
+    puts every imported novel in a series of its own, it is the only way an imported
+    novel gets a next chapter at all. Everything that makes a chapter continue rather
+    than restart lives on the series (the numbering, the merged glossary, the publishing
+    ledger), so joining one is the whole of it: no conversion, and nothing rewritten.
+
+    The new member's ``start_chapter`` is a SEED, like every other one -- it is what the
+    mapping review table then confirms. The caller must re-resolve afterwards, because
+    the stored mapping does not know this document exists.
+    """
+    series = get_series(sid)
+    if not series:
+        raise ValueError(f"no such series: {sid}")
+    project = pj.get_project(pid)
+    if not project:
+        raise ValueError(f"unknown project: {pid}")
+    name = project.get("name") or pid
+    if pid in member_ids(series):
+        raise ValueError(f"{name} is already in this series")
+    # One project, one series. Two would give one set of chapters two different global
+    # numbers, and the glossary redirection could not resolve which series owns it.
+    other = series_for_project(pid)
+    if other:
+        raise ValueError(
+            f"{name} is already in the series "
+            f"{other.get('name') or other.get('id')} — remove it from that one first")
+
+    # A range stated in the document's own name wins, exactly as it does on create:
+    # "Unintentional Transmigration Operations 101-124" knows where it starts better
+    # than any arithmetic does.
+    _, _, hint = split_title(project.get("name") or "")
+    start = hint or next_start_chapter(sid, series)
+    series.setdefault("members", []).append({
+        "project_id": pid, "start_chapter": start, "sealed": False,
+    })
+    write_series(series)
+    return series
+
+
 def delete_series(sid: str) -> bool:
     """Unlink a series. The member novels are never touched.
 
@@ -416,6 +477,48 @@ def save_mapping(sid: str, doc: dict) -> dict:
     return doc
 
 
+def _keep_manual(fresh: list[dict], previous: dict | None) -> list[dict]:
+    """Carry a member's confirmed rows through a re-resolve.
+
+    ``apply_overrides`` promises that "a human decision is final: a later re-resolve has
+    to leave it alone", and until this existed that was simply not true -- re-resolving
+    rebuilt every row from the document and silently renumbered the ones a person had
+    already settled. Nobody noticed because the only test of it re-READ the stored
+    mapping rather than re-resolving, and re-resolving is rare. Adding a document to a
+    series makes it routine, which is what turned this from a latent bug into one that
+    would fire on the first use of the feature.
+
+    Matched on ``index``, which is the one field that never moves: it keys ``state.json``,
+    ``chapter-NNN.md``, ``previous/``, ``audit/`` and ``variants/``. A confirmed row whose
+    index is no longer in the document has lost its chapter, so it is dropped with it.
+    """
+    manual = {
+        row.get("index"): row
+        for row in (previous or {}).get("rows") or []
+        if row.get("source") == "manual"
+    }
+    if not manual:
+        return fresh
+    out = []
+    for row in fresh:
+        kept = manual.get(row.get("index"))
+        if not kept:
+            out.append(row)
+            continue
+        # The decision, not the whole stored row: everything else (the label the
+        # resolver derives, the duplicate it detected) is re-read from the document,
+        # which is the point of re-resolving.
+        out.append({
+            **row,
+            "global": kept.get("global"),
+            "kind": kept.get("kind", row.get("kind")),
+            "label": kept.get("label", row.get("label")),
+            "source": "manual",
+            "confidence": "high",
+        })
+    return out
+
+
 def resolve_mapping(series: dict, chapters_by_pid: dict[str, list]) -> dict:
     """Resolve every member's chapters to global numbers.
 
@@ -427,7 +530,7 @@ def resolve_mapping(series: dict, chapters_by_pid: dict[str, list]) -> dict:
     rows the stored mapping already had, so one unreachable document cannot blank out the
     numbering for the whole series.
     """
-    from translation_bot.chapter_numbers import detect_gaps_duplicates, infer_mapping
+    from translation_bot.chapter_numbers import infer_mapping
 
     previous = (load_mapping(series["id"]) or {}).get("members") or {}
     members: dict[str, dict] = {}
@@ -456,14 +559,18 @@ def resolve_mapping(series: dict, chapters_by_pid: dict[str, list]) -> dict:
             running = max(numbers) if numbers else running
             continue
 
-        rows = infer_mapping(chapters, start_hint=start)
+        inferred = infer_mapping(chapters, start_hint=start)
+        rows = _keep_manual([r.as_dict() for r in inferred], previous.get(pid))
         members[pid] = {
             "offline": False,
             "start_chapter": start,
-            "rows": [r.as_dict() for r in rows],
+            "rows": rows,
         }
-        info = detect_gaps_duplicates(rows)
-        running = info["last"] or running
+        # From the FINAL rows rather than the freshly inferred ones, so a confirmed
+        # exclusion actually lowers where the next member starts. Taking it from the
+        # inference would ignore every human decision made on this member.
+        numbers = [r.get("global") for r in rows if isinstance(r.get("global"), int)]
+        running = max(numbers) if numbers else running
 
     doc = {"members": members}
     doc.update(_series_totals(doc))
