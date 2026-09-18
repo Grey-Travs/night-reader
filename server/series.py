@@ -48,7 +48,12 @@ _SERIES_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 # Fields a user may edit on a series. Everything else (id, created_at, and the resolved
 # chapter mapping) is server-managed.
-EDITABLE_FIELDS = {"name", "archived"}
+#
+# ``status`` is the ongoing/completed/hiatus label from ``pj.NOVEL_STATUSES``. It belongs
+# here rather than only on the project because a four-document series is ONE novel to the
+# person reading it -- "This Priest ...", "...2", "...3" are not three stories with three
+# separate fates. A standalone project keeps its own.
+EDITABLE_FIELDS = {"name", "archived", "status"}
 
 # ---------------------------------------------------------------------------
 # Title matching

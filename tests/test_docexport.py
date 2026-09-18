@@ -300,7 +300,15 @@ def client(monkeypatch, library):
     from translation_bot.config import Config
 
     monkeypatch.setattr(P, "PROJECTS_DIR", pj.PROJECTS_DIR)
-    monkeypatch.setattr(A, "load_global_config", lambda: Config())
+    # token_file must point inside the sandbox. Config()'s default is the RELATIVE path
+    # "token.json", which resolves against the working directory -- the repository root --
+    # so a bare Config() reads the developer's own signed-in token. That is how
+    # test_the_plan_endpoint_says_whether_it_could_actually_write passed for years while
+    # asserting the opposite of what it measured: the real token merely happened to lack
+    # the write scope, and the day that scope was granted the test failed. Point it at a
+    # path that does not exist and the premise ("no token at all") becomes true.
+    cfg = Config(google={"token_file": library.parent / "token.json"})
+    monkeypatch.setattr(A, "load_global_config", lambda: cfg)
     A._chapter_cache.clear()
     # The remote-access gate exempts loopback, and TestClient's default client host is
     # the literal string "testclient", which is not one.
@@ -329,6 +337,20 @@ def test_the_plan_endpoint_says_whether_it_could_actually_write(client):
     # read-only, so offering an export behind the same green dot promises something that
     # fails at the last step.
     assert client.get(f"/api/projects/{out['pid']}/export/doc").json()["can_write"] is False
+
+
+def test_the_plan_endpoint_reports_a_write_scoped_token_as_writable(client, tmp_path):
+    """The other direction, so the assertion above means something.
+
+    Without this, `can_write is False` would keep passing if the endpoint were changed to
+    return False unconditionally -- which is exactly the failure mode that hid here for
+    real: the test read the developer's own token instead of the configured one, so it
+    was measuring an accident rather than the code.
+    """
+    out = importing.import_novel("Novel", _records(2))
+    _token(tmp_path, ["https://www.googleapis.com/auth/documents.readonly",
+                      "https://www.googleapis.com/auth/drive.file"])
+    assert client.get(f"/api/projects/{out['pid']}/export/doc").json()["can_write"] is True
 
 
 def test_exporting_an_unknown_novel_is_a_clean_400(client):

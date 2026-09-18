@@ -7,6 +7,7 @@ import { useError } from '../components/ErrorDialog'
 import { errorTitle } from '../errors'
 import { useToast } from '../toast'
 import { useConfirm } from '../confirm'
+import { STATUS_LABEL, STATUSES } from '../status'
 
 // The library / bookshelf: add a novel, search every translation, open a novel.
 // The live cross-novel queue lives on its own Activity page now; here we just show
@@ -37,6 +38,7 @@ export default function LibraryPage() {
   const [searching, setSearching] = useState(false)
   const [sortBy, setSortBy] = useState('default')
   const [nameFilter, setNameFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState('all')
   const [queued, setQueued] = useState(0)
   const [queueNovels, setQueueNovels] = useState(0)
   const showError = useError()
@@ -178,11 +180,30 @@ export default function LibraryPage() {
   const shownProjects = (() => {
     const nf = nameFilter.trim().toLowerCase()
     let list = nf ? active.filter((p) => (p.name || '').toLowerCase().includes(nf)) : active.slice()
+    // A novel saved before this feature has no status at all, so an absent one counts as
+    // ongoing here exactly as it does on the server. Without that, "Ongoing" would show
+    // an empty shelf on a library that predates the label.
+    if (statusFilter !== 'all') {
+      list = list.filter((p) => (p.status || 'ongoing') === statusFilter)
+    }
     if (sortBy === 'name') list.sort((a, b) => (a.name || '').localeCompare(b.name || ''))
     else if (sortBy === 'progress') list.sort((a, b) => (b.translated || 0) - (a.translated || 0))
     else if (sortBy === 'review') list.sort((a, b) => (b.needs_review || 0) - (a.needs_review || 0))
     return list
   })()
+
+  // Writing it onto a member of a series sets it for the whole novel — the server routes
+  // it to the series, so parts 1-4 cannot end up disagreeing about whether the story is
+  // finished. That is also why this reloads rather than patching one card in place.
+  async function setStatus(p, status) {
+    try {
+      await api.updateProject(p.id, { status })
+      toast(p.status_from === 'series'
+        ? `“${p.series_name}” is now ${STATUS_LABEL[status].toLowerCase()}`
+        : `“${p.name}” is now ${STATUS_LABEL[status].toLowerCase()}`)
+      await load()
+    } catch (e) { setError(String(e.message || e)) }
+  }
 
   async function toggleArchive(p) {
     try {
@@ -337,6 +358,12 @@ export default function LibraryPage() {
         {active.length > 1 && (
           <div className="flex flex-wrap items-center gap-2">
             <input value={nameFilter} onChange={(e) => setNameFilter(e.target.value)} placeholder="Filter…" className="input !py-1 text-xs" />
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="input !py-1 text-xs" aria-label="Filter by status">
+              <option value="all">All novels</option>
+              {STATUSES.map((s) => (
+                <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+              ))}
+            </select>
             <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="input !py-1 text-xs" aria-label="Sort novels">
               <option value="default">Sort: default</option>
               <option value="name">Name (A–Z)</option>
@@ -363,7 +390,7 @@ export default function LibraryPage() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {shownProjects.map((p) => (
-            <NovelCard key={p.id} p={p} onOpen={open} onToggleArchive={toggleArchive} onRemove={remove} onRetranslate={retranslateNovel} />
+            <NovelCard key={p.id} p={p} onOpen={open} onToggleArchive={toggleArchive} onRemove={remove} onRetranslate={retranslateNovel} onSetStatus={setStatus} />
           ))}
         </div>
       )}

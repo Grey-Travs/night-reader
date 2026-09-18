@@ -218,6 +218,82 @@ def _tailscale_addresses() -> list[str]:
     return [line.strip() for line in (out.stdout or "").splitlines() if line.strip()]
 
 
+def _tailscale_json(args: list[str]) -> dict:
+    exe = _tailscale_exe()
+    if not exe:
+        return {}
+    try:
+        out = subprocess.run([exe, *args], capture_output=True, text=True,
+                             timeout=6, check=False)
+        loaded = json.loads(out.stdout or "{}")
+        return loaded if isinstance(loaded, dict) else {}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def tailnet_name() -> str:
+    """This machine's name on the tailnet, e.g. ``desktop-abc.tailnet.ts.net``.
+
+    Worth having on its own because it is the ONLY name this app can be reached at over
+    HTTPS. A tailnet IP cannot have a certificate; the DNS name can, and Tailscale issues
+    one for it.
+    """
+    name = str(((_tailscale_json(["status", "--json"]).get("Self") or {})
+                .get("DNSName")) or "")
+    return name.strip().rstrip(".")
+
+
+# Where to put the HTTPS listener when 443 is already spoken for. Any port works -- a
+# secure context is about the scheme and the certificate, not the number.
+ALTERNATE_HTTPS_PORT = 8443
+
+
+def serve_state(port: int = 8000) -> dict:
+    """Whether ``tailscale serve`` already fronts this app, and what to run if not.
+
+    This exists because of a limit that has nothing to do with Tailscale: Chrome will only
+    install a web app from a **secure origin**, and a tailnet address over plain http is
+    not one. So on Android the phone link can only ever make a browser shortcut, and the
+    thing that turns it into a real installable app is a certificate. ``tailscale serve``
+    is the one way to get a genuine one here without putting the port on the internet.
+
+    Deliberately read-only. Running ``serve`` is left to the user because this machine may
+    already be serving something else -- and it is, in the case that prompted this: port
+    443 proxies a different app entirely. Reconfiguring that from under them to make an
+    icon slightly nicer would be a bad trade, so the command offered avoids the conflict
+    rather than overwriting it.
+    """
+    name = tailnet_name()
+    doc = _tailscale_json(["serve", "status", "--json"])
+    ours, taken = "", {}
+    for host_port, cfg in (doc.get("Web") or {}).items():
+        handler = (cfg.get("Handlers") or {}).get("/") or {}
+        proxy = str(handler.get("Proxy") or "")
+        origin = f"https://{host_port}".replace(":443", "", 1) \
+            if host_port.endswith(":443") else f"https://{host_port}"
+        if proxy.endswith(f":{port}"):
+            ours = origin
+        else:
+            taken[origin] = proxy
+
+    # 443 gives the tidiest URL, so prefer it -- but only when nothing else has it.
+    root_taken = any(o.count(":") == 1 for o in taken)  # https://name  (no explicit port)
+    https_port = ALTERNATE_HTTPS_PORT if root_taken else 443
+    flag = "" if https_port == 443 else f" --https={https_port}"
+    return {
+        "tailnet_name": name,
+        # The https origin already pointing at this app, if there is one. When set, the
+        # phone can install properly today and nothing needs running.
+        "https_url": ours,
+        # What else is being served, so the UI can explain why it is suggesting a port.
+        "serving_other": taken,
+        "command": (f"tailscale serve --bg{flag} http://127.0.0.1:{port}"
+                    if name else ""),
+        "would_be": (f"https://{name}" if https_port == 443 else
+                     f"https://{name}:{https_port}") if name else "",
+    }
+
+
 def _own_addresses() -> list[str]:
     found: list[str] = []
     try:
@@ -280,20 +356,31 @@ def allowed_hosts() -> list[str]:
     if not doc["enabled"]:
         return hosts
     name = socket.gethostname()
-    for host in [name, f"{name}.local", *(row["host"] for row in addresses()),
-                 *doc["extra_hosts"]]:
+    # The tailnet DNS name matters even though it resolves to an address already listed:
+    # a request arriving through `tailscale serve` carries the NAME in its Host header,
+    # and is proxied from loopback -- so this check is the only thing standing in its way.
+    # It is also the only name that can hold a certificate, and so the only way the phone
+    # gets a real installable app rather than a browser shortcut.
+    for host in [name, f"{name}.local", tailnet_name(),
+                 *(row["host"] for row in addresses()), *doc["extra_hosts"]]:
         if host and host not in hosts:
             hosts.append(host)
     return hosts
 
 
 def phone_url(port: int = 8000) -> str:
-    """The one link to open on the phone, token and all, or empty if not set up."""
+    """The one link to open on the phone, token and all, or empty if not set up.
+
+    Points at ``/phone`` rather than the library root: opening this on a phone should
+    land on the one page built for it, not on the desktop app scaled down. The desktop
+    is still reachable by editing the address, which is the right way round -- the rare
+    case costs a moment, the common one costs nothing.
+    """
     doc = load()
     rows = addresses(port)
     if not (doc["enabled"] and doc["token"] and rows):
         return ""
-    return f'{rows[0]["url"]}/?{TOKEN_QUERY}={doc["token"]}'
+    return f'{rows[0]["url"]}/phone?{TOKEN_QUERY}={doc["token"]}'
 
 
 # ---------------------------------------------------------------------------

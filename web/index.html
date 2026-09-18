@@ -2,9 +2,25 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover is what makes env(safe-area-inset-*) report real numbers.
+         Without it they are always 0, and the phone console's header sits under the
+         status bar once it is launched from the home screen with no browser chrome. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
     <title>Web-Novel Translator</title>
+
+    <!-- The home-screen icon. `crossorigin="use-credentials"` is load-bearing rather
+         than decorative: a manifest is fetched with credentials OMITTED by default, so
+         without it the phone's access-key cookie is not sent, the request is refused by
+         the remote gate, and the browser never offers to install anything. -->
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" content="#181520" />
+    <!-- iOS reads these instead of the manifest for "Add to Home Screen". -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Night Reader" />
     <script>
       // Apply the saved theme before paint to avoid a flash. Dark is the default.
       try {

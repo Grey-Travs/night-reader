@@ -212,6 +212,49 @@
 .page { margin-inline: auto; width: 100%; max-width: 72rem; padding: 1.75rem 1.5rem 3rem; }
 .page-narrow { max-width: 48rem; }
 
+/* The phone console (/phone) — a page with no app around it.
+   Its own layout rather than `.page` at a narrow width, because it is a fixed header and
+   footer with one scrolling strip between them, and because it is what the home-screen
+   icon opens: launched from the icon there is no browser chrome, so the safe-area insets
+   below are the only thing keeping the bar out from under the status bar and the footer
+   out from under the gesture handle. They are zero in an ordinary tab. */
+.phone-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100svh;          /* svh, not vh: vh counts the retracting URL bar twice */
+  background: var(--page);
+}
+.phone-bar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+  padding: .5rem 1rem;
+  padding-top: calc(.5rem + env(safe-area-inset-top));
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.phone-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem;
+  padding-left: calc(1rem + env(safe-area-inset-left));
+  padding-right: calc(1rem + env(safe-area-inset-right));
+}
+.phone-foot {
+  position: sticky;
+  bottom: 0;
+  padding: .75rem 1rem;
+  padding-bottom: calc(.75rem + env(safe-area-inset-bottom));
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
 /* Gentle entrance for live-console rows (the one orchestrated moment). */
 @keyframes rowIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 .row-in { animation: rowIn .28s ease both; }

@@ -5,6 +5,7 @@ import { SkeletonRows } from '../components/ui'
 import SeriesGlossaryMerge from '../components/SeriesGlossaryMerge'
 import SeriesPublishTarget from '../components/SeriesPublishTarget'
 import { useToast } from '../toast'
+import { STATUS_LABEL, STATUSES } from '../status'
 
 // Confirming a series' chapter numbering.
 //
@@ -134,6 +135,21 @@ export default function SeriesDetailPage() {
     setBusy('')
   }
 
+  // The series is the novel, so this is where its status naturally belongs — the library
+  // cards for its documents all read from here.
+  async function setStatus(status) {
+    setBusy('status')
+    try {
+      const updated = await api.updateSeries(sid, { status })
+      setData((d) => (d ? { ...d, series: { ...d.series, status: updated.status } } : d))
+      toast(`Now ${STATUS_LABEL[status].toLowerCase()}`)
+    } catch (e) {
+      setError(e)
+    } finally {
+      setBusy('')
+    }
+  }
+
   const series = data?.series
   const flaggedCount = rows.filter(isFlagged).length
   const visible = onlyFlagged ? rows.filter(isFlagged) : rows
@@ -143,7 +159,25 @@ export default function SeriesDetailPage() {
     <div className="page">
       <div className="mb-4">
         <Link to="/series" className="text-xs text-hint hover:underline">← Series</Link>
-        <h1 className="font-reading text-2xl font-medium">{series?.name || 'Series'}</h1>
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="font-reading text-2xl font-medium">{series?.name || 'Series'}</h1>
+          {series && (
+            <label className="flex items-center gap-1.5 text-xs text-hint">
+              Status
+              <select
+                className="input !py-1 text-xs"
+                value={series.status || 'ongoing'}
+                disabled={busy === 'status'}
+                onChange={(e) => setStatus(e.target.value)}
+                aria-label="Novel status"
+              >
+                {STATUSES.map((s) => (
+                  <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
         <p className="text-sm text-hint">
           {!data ? 'Loading…'
             : `${series.members.length} documents · chapters ${data.first}–${data.last}`

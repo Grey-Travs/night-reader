@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { api } from './api'
 import AppShell from './components/AppShell'
 import SetupWizard from './components/SetupWizard'
@@ -8,6 +8,7 @@ import LibraryPage from './pages/LibraryPage'
 import SeriesPage from './pages/SeriesPage'
 import SeriesDetailPage from './pages/SeriesDetailPage'
 import PostingPage from './pages/PostingPage'
+import PhonePage from './pages/PhonePage'
 import ImportPage from './pages/ImportPage'
 import ActivityPage from './pages/ActivityPage'
 import ArchivePage from './pages/ArchivePage'
@@ -37,14 +38,25 @@ export default function App() {
   const [skipSetup, setSkipSetup] = useState(false)
   const [hintsOn, setHintsOnState] = useState(() => getHintsOn())
   const navigate = useNavigate()
+  // The phone console is a page with no app around it, so two things that are right for
+  // the desktop have to be switched off for it: the first-run guide redirect, and the
+  // setup wizard. Both assume a big screen and a person who came here to configure
+  // something; a phone opening the link came to press one button.
+  const isPhoneRoute = useLocation().pathname.startsWith('/phone')
 
   function toggleHints(on) { setHintsOnState(on); setHintsOn(on) }
 
   useEffect(() => { api.status().then(setStatus).catch(() => setStatus({})) }, [])
 
   // Send the user to the guide the very first time (then never again unless asked).
+  //
+  // Never from /phone. "First time" is really "this browser has an empty localStorage",
+  // which is exactly what a phone opening the link has — so without this guard the phone
+  // link and the home-screen icon would both land on the desktop guide instead of the
+  // page they name, and the one tap the icon exists to save would be spent going back.
   useEffect(() => {
     if (status === undefined) return
+    if (isPhoneRoute) return
     if (isReady(status) && !getGuideSeen()) { setGuideSeen(); navigate('/guide') }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status])
@@ -57,7 +69,7 @@ export default function App() {
 
   const hints = { on: hintsOn, setOn: toggleHints }
 
-  const body = (forceSetup || (!ready && !skipSetup)) ? (
+  const body = (!isPhoneRoute && (forceSetup || (!ready && !skipSetup))) ? (
     <SetupWizard
       status={status}
       setStatus={setStatus}
@@ -66,6 +78,9 @@ export default function App() {
   ) : (
     <ErrorBoundary>
       <Routes>
+        {/* Outside AppShell on purpose: no sidebar, no top bar, nothing of the desktop
+            site. This is what the phone link and the home-screen icon open. */}
+        <Route path="phone" element={<PhonePage />} />
         <Route element={<AppShell status={status} setStatus={setStatus} onSetup={() => setForceSetup(true)} />}>
           <Route index element={<LibraryPage />} />
           <Route path="series" element={<SeriesPage />} />

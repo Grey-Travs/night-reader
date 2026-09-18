@@ -31,10 +31,22 @@ from translation_bot.text_source import chapters_to_records, records_to_chapters
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = PROJECT_ROOT / "projects"
 
+# Where a novel is in its life, as the person running this app thinks of it. Purely a
+# label: nothing in the pipeline reads it, and a completed novel still translates, posts
+# and exports exactly as before. It exists because a shelf of 58 documents gives no way to
+# tell the three you are actively working on from the forty that are finished.
+#
+# Deliberately not ``archived``, which already exists and means something else -- archived
+# hides a novel from the shelf. "Completed" is the opposite: a finished novel is the kind
+# you most want to still see.
+NOVEL_STATUSES = ("ongoing", "completed", "hiatus")
+DEFAULT_STATUS = "ongoing"
+
 # Project fields a user may edit at runtime (everything else is server-managed).
 # ``archived`` is a bool: an archived novel is hidden from the main library shelf but
 # otherwise behaves normally (still translates, reads, exports).
-EDITABLE_FIELDS = {"name", "style_note", "instructions", "honorific_note", "archived"}
+EDITABLE_FIELDS = {"name", "style_note", "instructions", "honorific_note", "archived",
+                   "status"}
 
 _DOC_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]{20,})")
 _BARE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{20,}$")

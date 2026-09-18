@@ -275,14 +275,150 @@ def test_the_phone_link_carries_the_key(monkeypatch):
     monkeypatch.setattr(remote, "_tailscale_addresses", lambda: ["100.101.102.103"])
     monkeypatch.setattr(remote, "_own_addresses", lambda: [])
     token = _enable()
+    # Lands on the phone console, not the library root: opening this on a phone should
+    # give the one page built for it rather than the desktop app scaled down.
     assert remote.phone_url(8000) == (
-        f"http://100.101.102.103:8000/?{remote.TOKEN_QUERY}={token}")
+        f"http://100.101.102.103:8000/phone?{remote.TOKEN_QUERY}={token}")
 
 
 def test_there_is_no_phone_link_before_it_is_set_up(monkeypatch):
     monkeypatch.setattr(remote, "_tailscale_addresses", lambda: ["100.101.102.103"])
     monkeypatch.setattr(remote, "_own_addresses", lambda: [])
     assert remote.phone_url() == ""
+
+
+# ---- https, which is what makes the icon a real app -----------------------
+
+
+def _serving(monkeypatch, web):
+    """Fake the two Tailscale CLI reads serve_state does."""
+    def fake(args):
+        if args[0] == "status":
+            return {"Self": {"DNSName": "box.tailnet.ts.net."}}
+        return {"Web": web}
+    monkeypatch.setattr(remote, "_tailscale_json", fake)
+
+
+def test_the_tailnet_name_loses_its_trailing_dot(monkeypatch):
+    # DNSName comes back fully qualified ("box.tailnet.ts.net."), and a trailing dot in a
+    # URL is not something to hand to a person to type.
+    _serving(monkeypatch, {})
+    assert remote.tailnet_name() == "box.tailnet.ts.net"
+
+
+def test_with_nothing_served_it_suggests_the_tidy_443_url(monkeypatch):
+    _serving(monkeypatch, {})
+    state = remote.serve_state(8000)
+    assert state["https_url"] == ""
+    assert state["command"] == "tailscale serve --bg http://127.0.0.1:8000"
+    assert state["would_be"] == "https://box.tailnet.ts.net"
+
+
+def test_an_app_already_on_443_is_routed_around_not_over(monkeypatch):
+    # The real case this was written against: 443 already proxies a different app. Taking
+    # it would break that app to make an icon slightly nicer, which is a bad trade — so
+    # the suggestion moves to another port and says why.
+    _serving(monkeypatch, {"box.tailnet.ts.net:443": {
+        "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}}})
+    state = remote.serve_state(8000)
+    assert state["command"] == (
+        f"tailscale serve --bg --https={remote.ALTERNATE_HTTPS_PORT} http://127.0.0.1:8000")
+    assert state["would_be"] == f"https://box.tailnet.ts.net:{remote.ALTERNATE_HTTPS_PORT}"
+    assert state["serving_other"] == {"https://box.tailnet.ts.net": "http://127.0.0.1:8787"}
+
+
+def test_an_app_already_served_reports_its_https_url(monkeypatch):
+    # Nothing to run: the phone can install properly today.
+    _serving(monkeypatch, {"box.tailnet.ts.net:443": {
+        "Handlers": {"/": {"Proxy": "http://127.0.0.1:8000"}}}})
+    state = remote.serve_state(8000)
+    assert state["https_url"] == "https://box.tailnet.ts.net"
+    assert state["serving_other"] == {}
+
+
+def test_a_non_standard_https_port_keeps_its_port_in_the_url(monkeypatch):
+    _serving(monkeypatch, {"box.tailnet.ts.net:8443": {
+        "Handlers": {"/": {"Proxy": "http://127.0.0.1:8000"}}}})
+    assert remote.serve_state(8000)["https_url"] == "https://box.tailnet.ts.net:8443"
+
+
+def test_without_tailscale_there_is_nothing_to_suggest(monkeypatch):
+    monkeypatch.setattr(remote, "_tailscale_exe", lambda: None)
+    state = remote.serve_state(8000)
+    assert state == {"tailnet_name": "", "https_url": "", "serving_other": {},
+                     "command": "", "would_be": ""}
+
+
+def test_a_broken_tailscale_cli_is_not_an_error(monkeypatch):
+    # It is consulted on every Settings load. A crash here must not take the page with it.
+    monkeypatch.setattr(remote, "_tailscale_exe", lambda: "tailscale")
+    def boom(*a, **k):
+        raise OSError("no")
+    monkeypatch.setattr(remote.subprocess, "run", boom)
+    assert remote.serve_state(8000)["command"] == ""
+
+
+def test_the_tailnet_name_is_trusted_only_while_remote_access_is_on(monkeypatch):
+    # A request proxied by `tailscale serve` arrives FROM loopback and carries the tailnet
+    # NAME in its Host header — so TrustedHostMiddleware is the only thing in its way, and
+    # it has to close back down when the feature is switched off.
+    monkeypatch.setattr(remote, "tailnet_name", lambda: "box.tailnet.ts.net")
+    monkeypatch.setattr(remote, "addresses", lambda port=8000: [])
+    assert "box.tailnet.ts.net" not in remote.allowed_hosts()
+    _enable()
+    assert "box.tailnet.ts.net" in remote.allowed_hosts()
+
+
+# ---- the home-screen icon -------------------------------------------------
+
+
+def test_the_manifest_never_hands_the_key_to_a_stranger(away):
+    # The whole reason the manifest is generated rather than a static file is that its
+    # start_url can carry the key -- which makes it exactly the kind of file that must
+    # stay behind the gate. An unauthenticated fetch gets the same 403 as anything else.
+    token = _enable()
+    r = away.get("/manifest.webmanifest")
+    assert r.status_code == 403
+    assert token not in r.text
+
+
+def test_an_authenticated_phone_gets_a_start_url_that_carries_the_key(away):
+    # Why it carries the key at all: a launcher icon is opened months after it was made,
+    # by which time the cookie planted on the first visit may be long evicted. An app
+    # icon that opens onto "that link is missing its access key" is worse than no icon.
+    token = _enable()
+    doc = away.get(f"/manifest.webmanifest?{remote.TOKEN_QUERY}={token}").json()
+    assert doc["start_url"] == f"/phone?{remote.TOKEN_QUERY}={token}"
+    assert doc["display"] == "standalone"
+
+
+def test_this_computer_gets_a_plain_start_url(here):
+    # No key exists on the desktop path and none is needed, so none is invented.
+    assert here.get("/manifest.webmanifest").json()["start_url"] == "/phone"
+
+
+def test_the_manifest_is_not_cached(here):
+    # It can carry a secret and it changes when the key is rotated.
+    r = here.get("/manifest.webmanifest")
+    assert r.headers["cache-control"] == "no-store"
+    assert r.headers["content-type"].startswith("application/manifest+json")
+
+
+def test_every_icon_the_manifest_promises_actually_exists(here):
+    # A manifest listing a 404 is not an install error the browser explains -- it just
+    # silently declines to offer the install.
+    public = remote.PROJECT_ROOT / "web" / "public"
+    for icon in here.get("/manifest.webmanifest").json()["icons"]:
+        assert (public / icon["src"].lstrip("/")).exists(), icon["src"]
+
+
+def test_the_maskable_icon_is_listed_separately(here):
+    # Listing one file as both "any" and "maskable" is the classic mistake: a launcher
+    # crops a maskable icon to its own shape, so the rounded artwork loses its corners.
+    icons = here.get("/manifest.webmanifest").json()["icons"]
+    purposes = {i["src"]: i["purpose"] for i in icons}
+    assert "maskable" in purposes.values()
+    assert not any(p == "any maskable" for p in purposes.values())
 
 
 def test_notifying_nowhere_does_nothing(monkeypatch):

@@ -230,6 +230,10 @@ def _remote_state(request: Request) -> dict:
     if local:
         state["token"] = doc["token"]
         state["phone_url"] = remote.phone_url(PORT)
+        # Only on the computer, and only when the feature is on: this shells out to the
+        # Tailscale CLI twice, which is not something to do on every poll from a phone.
+        if doc["enabled"]:
+            state["serve"] = remote.serve_state(PORT)
     return state
 
 
@@ -263,6 +267,59 @@ def set_remote(request: Request, body: RemoteSettings) -> dict:
         doc["extra_hosts"] = [h.strip() for h in body.extra_hosts if h.strip()]
     remote.save(doc)
     return _remote_state(request)
+
+
+@app.get("/manifest.webmanifest")
+def web_app_manifest(request: Request) -> Response:
+    """What turns the phone link into an icon on the home screen.
+
+    Served from here rather than as a static file for one reason: ``start_url`` can then
+    carry the access key. A launcher icon is opened months after it was made, by which
+    time the cookie planted on the first visit may well have been evicted -- and an app
+    icon that opens onto "that link is missing its access key" is worse than no icon. So
+    a request that already proved it has the key gets a start_url that carries it, and
+    keeps working regardless of the cookie.
+
+    That is also why the key is safe to put here: this response goes through the same
+    gate as everything else, so an unauthenticated caller is refused before reaching it.
+    The ``crossorigin="use-credentials"`` on the <link> in index.html is what makes the
+    browser send the cookie -- a manifest is fetched WITHOUT credentials by default, and
+    without that attribute this 403s on the phone and no install is ever offered.
+    """
+    doc = remote.load()
+    start = "/phone"
+    supplied = remote.token_from_request(
+        request.headers, request.cookies, request.query_params)
+    if doc["enabled"] and remote.token_matches(supplied, doc["token"]):
+        start = f"/phone?{remote.TOKEN_QUERY}={doc['token']}"
+    return JSONResponse(
+        {
+            "id": "/phone",
+            "name": "Night Reader",
+            "short_name": "Night Reader",
+            "description": "Start a posting run from anywhere.",
+            "start_url": start,
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#181520",
+            "theme_color": "#181520",
+            "icons": [
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png",
+                 "purpose": "any"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png",
+                 "purpose": "any"},
+                # Kept separate from the two above: a launcher crops a maskable icon to
+                # its own shape, so the same artwork listed as both would get clipped.
+                {"src": "/icon-maskable-512.png", "sizes": "512x512",
+                 "type": "image/png", "purpose": "maskable"},
+            ],
+        },
+        media_type="application/manifest+json",
+        # The start_url can carry a secret, and it changes with the access key, so this
+        # must never sit in a shared cache or survive a key rotation.
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/remote/test-notification")
@@ -812,6 +869,28 @@ def project_summary(project: dict) -> dict:
         "style_note": cfg.translation.style_note,
         "instructions": cfg.translation.extra_instruction,
         "honorific_note": cfg.translation.honorific_note,
+        # The EFFECTIVE status, which for a series member is the series'. A four-document
+        # novel shows four cards on the shelf and they must not be able to disagree about
+        # whether the story is finished. ``status_from`` lets the UI say where it is set
+        # instead of silently ignoring an edit. Spread after ``**project`` deliberately,
+        # so a stale per-project status left on a member cannot win.
+        **_effective_status(project),
+    }
+
+
+def _effective_status(project: dict) -> dict:
+    """A novel's status, taken from its series when it has one.
+
+    Kept next to ``project_summary`` because the same rule has to hold on the way back in:
+    ``update_project`` writes to whichever of the two this reads from.
+    """
+    series = series_mod.series_for_project(project.get("id") or "")
+    source = series if series else project
+    return {
+        "status": source.get("status") or pj.DEFAULT_STATUS,
+        "status_from": "series" if series else "novel",
+        "series_id": series["id"] if series else None,
+        "series_name": (series.get("name") or "") if series else "",
     }
 
 
@@ -822,6 +901,8 @@ def _safe_summary(project: dict) -> dict:
     except Exception as exc:  # noqa: BLE001 — defensive: keep the library loading
         return {**project, "counts": {}, "translated": 0, "needs_review": 0,
                 "cost_usd": 0.0, "chapter_count": project.get("chapter_count"),
+                "status": project.get("status") or pj.DEFAULT_STATUS,
+                "status_from": "novel", "series_id": None, "series_name": "",
                 "error": f"could not load: {exc}"}
 
 
@@ -1694,20 +1775,46 @@ def update_page(pid: str, page_id: str, body: PageUpdate) -> dict:
     return updated
 
 
+def _checked_status(value: str | None) -> str | None:
+    """Refuse a status this app does not define, rather than storing it.
+
+    An unknown value would persist happily, show as a blank pill, and match no filter --
+    a typo that looks like data loss. One shared check because the same field is settable
+    on a project and on a series.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text not in pj.NOVEL_STATUSES:
+        raise HTTPException(
+            400, f"status must be one of {', '.join(pj.NOVEL_STATUSES)}")
+    return text
+
+
 class ProjectUpdate(BaseModel):
     name: str | None = None
     style_note: str | None = None
     instructions: str | None = None
     honorific_note: str | None = None
     archived: bool | None = None
+    status: str | None = None
 
 
 @app.post("/api/projects/{pid}")
 def update_project(pid: str, body: ProjectUpdate) -> dict:
     """Rename a novel and/or edit its per-novel translation style settings."""
-    require_project(pid)
+    project = require_project(pid)
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
-    project = pj.update_project(pid, **fields)
+    if "status" in fields:
+        fields["status"] = _checked_status(fields["status"])
+        # A member's status lives on its series, so write it there instead of onto the
+        # document. Otherwise marking part 2 "completed" would leave parts 1, 3 and 4
+        # saying "ongoing", and the shelf would contradict itself about one novel.
+        series = series_mod.series_for_project(pid)
+        if series:
+            series["status"] = fields.pop("status")
+            series_mod.write_series(series)
+    project = pj.update_project(pid, **fields) if fields else project
     return project_summary(project)
 
 
@@ -3455,6 +3562,7 @@ class UpdateSeries(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = None
     archived: bool | None = None
+    status: str | None = None
     # Member order IS reading order, so reordering is a first-class edit.
     members: list[str] | None = None
     starts: dict[str, int] | None = None
@@ -3511,6 +3619,7 @@ def _series_summary(series: dict, mapping: dict | None) -> dict:
         "id": series["id"],
         "name": series.get("name") or "",
         "archived": bool(series.get("archived")),
+        "status": series.get("status") or pj.DEFAULT_STATUS,
         "created_at": series.get("created_at") or "",
         "members": members,
         "publish_targets": series.get("publish_targets") or [],
@@ -3611,6 +3720,8 @@ def update_series_route(sid: str, body: UpdateSeries) -> dict:
         series["name"] = body.name.strip() or series.get("name") or "Untitled series"
     if body.archived is not None:
         series["archived"] = bool(body.archived)
+    if body.status is not None:
+        series["status"] = _checked_status(body.status)
     if body.publish_targets is not None:
         series["publish_targets"] = body.publish_targets
     if body.members is not None:

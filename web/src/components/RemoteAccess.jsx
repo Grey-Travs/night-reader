@@ -11,6 +11,96 @@ import { useToast } from '../toast'
 // Which is also the risk, and why this screen is wordy. The API has no accounts; being
 // bound to loopback IS its authentication. Switching this on gives it an access key and
 // starts refusing anything from another device that does not carry it.
+// Turning the phone link into an icon on the home screen.
+//
+// The catch is not Night Reader's: Chrome will only install a web app from a **secure
+// origin**, and a tailnet address over plain http is not one. So on Android the link as it
+// stands can only make a browser shortcut that opens in a tab — the icon is there, but the
+// address bar comes with it. A certificate is what upgrades it, and `tailscale serve` is
+// the one way to get a real one here without putting the port on the internet.
+//
+// This only ever shows the command. Running it is the user's, because this machine may
+// already be serving something else on 443 — and in the case that prompted this, it is.
+function HomeScreen({ serve, local, onCopy }) {
+  if (!local || !serve) return null
+  const { tailnet_name: name, https_url: httpsUrl, serving_other: other, command, would_be: wouldBe } = serve
+
+  if (!name) {
+    return (
+      <div className="space-y-1 border-t border-line pt-4 text-xs text-hint">
+        <div className="text-sm font-medium text-ink">Put it on your home screen</div>
+        <p>
+          Tailscale isn’t reporting a name for this computer yet. Once it is connected,
+          this is where the one command for a proper app icon appears.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-2 border-t border-line pt-4">
+      <div className="text-sm font-medium">Put it on your home screen</div>
+
+      {httpsUrl ? (
+        <>
+          <p className="text-xs text-hint">
+            Ready. Open this on the phone, then use Chrome’s menu → <b>Install app</b>. It
+            gets its own icon and opens with no address bar.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="min-w-0 flex-1 truncate rounded px-2 py-1.5 font-mono text-xs"
+              style={{ background: 'var(--b-muted-bg)' }}>{httpsUrl}/phone</code>
+            <button className="btn btn-primary px-3 py-1.5 text-xs"
+              onClick={() => onCopy(`${httpsUrl}/phone`, 'Link copied')}>
+              Copy
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p className="text-xs text-hint">
+            Android only installs an app from an <b>https</b> address, and the link above is
+            plain http — so as it stands you’d get a shortcut that opens in a browser tab.
+            Tailscale can issue a real certificate for this computer. Run this once:
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="min-w-0 flex-1 truncate rounded px-2 py-1.5 font-mono text-xs"
+              style={{ background: 'var(--b-muted-bg)' }}>{command}</code>
+            <button className="btn btn-ghost px-3 py-1.5 text-xs"
+              onClick={() => onCopy(command, 'Command copied — run it in a terminal')}>
+              Copy
+            </button>
+          </div>
+          <p className="text-xs text-hint">
+            Then open <code className="font-mono">{wouldBe}/phone</code> on the phone and
+            choose <b>Install app</b>.
+          </p>
+          {Object.keys(other || {}).length > 0 && (
+            <p className="text-xs text-hint">
+              Using port {String(wouldBe).split(':').pop()} because{' '}
+              <code className="font-mono">{Object.keys(other)[0]}</code> is already serving{' '}
+              <code className="font-mono">{Object.values(other)[0]}</code> — that stays
+              exactly as it is.
+            </p>
+          )}
+          <p className="text-xs text-hint">
+            Needs <b>HTTPS Certificates</b> switched on once for your tailnet, under{' '}
+            <a className="text-accent-text hover:underline"
+              href="https://login.tailscale.com/admin/dns" target="_blank" rel="noreferrer">
+              DNS in the Tailscale admin console
+            </a>. If the command complains about a certificate, that is what it wants.
+          </p>
+          <p className="text-xs text-hint">
+            One thing worth knowing: requests arriving this way come from Tailscale on this
+            machine, so they skip the access key — the tailnet itself is what keeps them
+            out. Only your own signed-in devices can reach it.
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
 export default function RemoteAccess() {
   const toast = useToast()
   const [state, setState] = useState(null)
@@ -145,6 +235,8 @@ export default function RemoteAccess() {
             </div>
           )}
 
+          <HomeScreen serve={state.serve} local={local} onCopy={copy} />
+
           <div className="space-y-2 border-t border-line pt-4">
             <div className="text-sm font-medium">Tell me when a run stops</div>
             <p className="text-xs text-hint">
@@ -219,6 +311,12 @@ export default function RemoteAccess() {
             </details>
           )}
         </>
+      )}
+
+      {enabled && !local && (
+        <p className="text-xs text-hint">
+          Add this page to your home screen from the browser menu.
+        </p>
       )}
 
       {!enabled && (
