@@ -243,8 +243,22 @@ def tailnet_name() -> str:
     return name.strip().rstrip(".")
 
 
-# Where to put the HTTPS listener when 443 is already spoken for. Any port works -- a
-# secure context is about the scheme and the certificate, not the number.
+# Where to put the HTTPS listener when 443 is already spoken for.
+#
+# A port is enough for the WEB security model -- https://host and https://host:8443 are
+# separate origins, with separate storage and separate service workers -- and that was the
+# reasoning that picked 8443. It is not enough for the two layers that actually decide what
+# opens on a phone, and both are blind to ports:
+#
+#   * an installed PWA's Android intent filter carries scheme, host and path prefix but no
+#     port, and Android treats an absent port as ANY port -- so an app installed from
+#     https://host claims https://host:8443 as well, and a tapped link opens IT;
+#   * cookies are not port-scoped either (RFC 6265 sec 8.5), so the access key set here is
+#     sent to whatever answers :443 on the same host.
+#
+# So this is a way to avoid a *tailscale serve* conflict, not a way to be a separate app.
+# Sharing a hostname with something else means sharing both of those with it. A hostname of
+# our own -- a Tailscale Service -- is the only thing that actually separates them.
 ALTERNATE_HTTPS_PORT = 8443
 
 

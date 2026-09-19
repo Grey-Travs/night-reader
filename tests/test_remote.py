@@ -452,6 +452,46 @@ def test_every_icon_the_manifest_promises_actually_exists(here):
         assert (public / icon["src"].lstrip("/")).exists(), icon["src"]
 
 
+def test_the_scope_does_not_claim_the_whole_hostname(here):
+    """Narrow on purpose, and the reason is off-web.
+
+    Installing this mints an Android WebAPK whose intent filter carries scheme, host and
+    path prefix but NO port -- and Android treats an absent port as any port. A scope of
+    "/" would therefore register Night Reader as a handler for every URL on this hostname,
+    including another app's, which is exactly how the other app captured ours.
+    """
+    doc = here.get("/manifest.webmanifest").json()
+    assert doc["scope"] == "/phone"
+    # start_url and id must both sit inside the scope or the install is rejected.
+    assert doc["start_url"].startswith("/phone")
+    assert doc["id"].startswith("/phone")
+
+
+def test_the_key_cookie_is_secure_over_https(monkeypatch):
+    # The key is the only authentication this app has, and it is set on a hostname that
+    # may be shared with another app. Secure at least keeps it off plain http.
+    from fastapi.testclient import TestClient
+    token = _enable()
+    tls = TestClient(A.app, base_url="https://localhost", client=ELSEWHERE)
+    r = tls.get(f"/api/status?{remote.TOKEN_QUERY}={token}")
+    assert r.status_code == 200
+    assert "secure" in r.headers["set-cookie"].lower()
+
+
+def test_the_key_cookie_is_still_set_over_plain_http(away):
+    """Secure is conditional, and this is why.
+
+    The plain-http tailnet link is still a supported way in. An unconditional Secure flag
+    is silently dropped over http, so the phone would go back to needing ?k= on every
+    request -- the one thing the cookie exists to prevent.
+    """
+    token = _enable()
+    r = away.get(f"/api/status?{remote.TOKEN_QUERY}={token}")
+    assert r.status_code == 200
+    assert "secure" not in r.headers["set-cookie"].lower()
+    assert r.cookies.get(remote.TOKEN_COOKIE) == token
+
+
 def test_the_maskable_icon_is_listed_separately(here):
     # Listing one file as both "any" and "maskable" is the classic mistake: a launcher
     # crops a maskable icon to its own shape, so the rounded artwork loses its corners.

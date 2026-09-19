@@ -193,9 +193,21 @@ async def _remote_gate(request: Request, call_next):
     # ONCE rather than the frontend having to carry an auth header on every request - which
     # in turn is why no frontend code knows this exists and none of it can get it wrong.
     if request.query_params.get(remote.TOKEN_QUERY):
+        # Secure only when this request itself came over https. Unconditional would be
+        # wrong: the plain-http tailnet link is still a supported way in, and a Secure
+        # cookie is simply not stored over http -- the phone would silently go back to
+        # needing ?k= on every request, which is the one thing the cookie exists to avoid.
+        #
+        # What this does NOT do is give the cookie port isolation. Nothing can: RFC 6265
+        # sec 8.5 says plainly that "cookies do not provide isolation by port", so a token
+        # set on host:8443 is sent to host:443 as well. While this app shares a hostname
+        # with another, that other app receives this key on every request the phone makes
+        # to it. The only real fix is a hostname of our own; this just stops the key also
+        # going out in clear text.
         response.set_cookie(
             remote.TOKEN_COOKIE, doc["token"], max_age=remote.COOKIE_MAX_AGE,
-            httponly=True, samesite="lax", path="/")
+            httponly=True, secure=request.url.scheme == "https",
+            samesite="lax", path="/")
     return response
 
 
@@ -304,7 +316,14 @@ def web_app_manifest(request: Request) -> Response:
             "short_name": "Night Reader",
             "description": "Start a posting run from anywhere.",
             "start_url": start,
-            "scope": "/",
+            # "/phone", not "/". Installing this mints an Android WebAPK, and the
+            # intent filter Chrome generates for it carries scheme, host and PATH PREFIX
+            # but NO port -- so a scope of "/" would register this app as a handler for
+            # every URL on this hostname, and start swallowing the OTHER app's links the
+            # way its app currently swallows ours. Narrow scope keeps the filter to
+            # /phone. start_url and id both sit inside it, and the page has no navigation
+            # out of that route, so nothing is pushed into a browser tab.
+            "scope": "/phone",
             "display": "standalone",
             "orientation": "portrait",
             "background_color": "#181520",
