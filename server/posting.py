@@ -108,6 +108,44 @@ def chapter_title(row: dict, adapter: dict, side_ordinal: int | None = None) -> 
     return template.replace("{n}", str(row.get("global")))
 
 
+def audit_pricing(items: list[dict], site: dict) -> list[dict]:
+    """Chapters already on the site that do not match what this series says they cost.
+
+    The question the free cutoff cannot answer on its own. A series set to "free through
+    50, then 55 coins" says what chapter 63 OUGHT to be; only the site says what it is. A
+    chapter that went up free when it should be paid is revenue quietly gone, and one left
+    Private is a chapter nobody can read -- and neither shows up anywhere today, because
+    the plan only ever asked "is this title present?".
+
+    Each item already carries its own expected ``paid`` and ``coins``, worked out from the
+    cutoff, so this is a comparison rather than a second pricing rule.
+
+    A row whose ``paid`` is None is NOT reported. Every snapshot written before rows
+    existed knows titles alone, and calling that "free" would report a whole library as
+    mispriced on the strength of a field the file never contained.
+    """
+    by_key = {site_title_key(r["title"]): r for r in site.get("rows") or []}
+    out = []
+    for item in items:
+        row = by_key.get(site_title_key(item["title"]))
+        if row is None or row.get("paid") is None:
+            continue
+        problems = []
+        if bool(row["paid"]) != bool(item["paid"]):
+            problems.append("is free on the site but should cost coins" if item["paid"]
+                            else "costs coins on the site but should be free")
+        elif item["paid"] and isinstance(row.get("coins"), int)                 and row["coins"] != item["coins"]:
+            problems.append(f"costs {row['coins']} coins on the site, "
+                            f"not {item['coins']}")
+        state = row.get("state") or ""
+        if state and state != "public":
+            problems.append(f"is {state} on the site, so readers cannot see it")
+        if problems:
+            out.append({"title": item["title"], "global": item["global"],
+                        "problems": problems})
+    return out
+
+
 def _side_ordinals(rows: list[dict]) -> dict[tuple[str, int], int]:
     """Number the side stories within each run, so they read 1, 2, 3 rather than by index."""
     out: dict[tuple[str, int], int] = {}
@@ -269,7 +307,11 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
                   # Whether this reading can be believed at all. False means every chapter
                   # is blocked, so the page must explain rather than show a bare zero.
                   "trusted": bool(site.get("trusted", True)),
-                  "why": site.get("why") or ""},
+                  "why": site.get("why") or "",
+                  "source": site.get("source") or ""},
+        # Chapters already up that do not match this series' own pricing. Empty until a
+        # reading carries the site's paid/coins/state, which title-only snapshots do not.
+        "audit": audit_pricing(items, site),
         # What the run would actually charge for, spelled out. Getting this backwards is
         # the mistake worth one extra click to avoid.
         "summary": {
@@ -529,6 +571,32 @@ def snapshot_looks_wrong(sid: str, titles: list[str]) -> str | None:
     return None
 
 
+def clean_row(row) -> dict | None:
+    """One chapter as the site describes it, or None if it is not one.
+
+    Accepts a bare string so the original title-only callers keep working unchanged.
+
+    ``paid`` and ``coins`` are None when unknown, which is NOT the same as free at zero.
+    Every snapshot written before this knew titles only, and reading those back as "free"
+    would invent an answer the file never contained -- and the pricing audit built on top
+    would then confidently report a whole library as mispriced.
+    """
+    if isinstance(row, str):
+        row = {"title": row}
+    if not isinstance(row, dict):
+        return None
+    title = str(row.get("title") or row.get("displayName") or "").strip()
+    if not title:
+        return None
+    paid = row.get("paid")
+    paid = None if paid is None else bool(paid is True or paid == 1 or paid == "1")
+    coins = row.get("coins")
+    coins = int(coins) if isinstance(coins, (int, float)) and not isinstance(coins, bool)         else None
+    return {"title": title, "paid": paid, "coins": coins,
+            "state": str(row.get("state") or "").strip().lower(),
+            "remote_id": str(row.get("remote_id") or row.get("id") or "")}
+
+
 def load_site(sid: str, target_id: str) -> dict:
     """The chapter names last read off the site, or an empty snapshot.
 
@@ -547,8 +615,8 @@ def load_site(sid: str, target_id: str) -> dict:
     helper cannot tell them apart.
     """
     path = site_path(sid, target_id)
-    empty = {"titles": [], "fetched_at": None, "observed_coins": None,
-             "trusted": True, "why": ""}
+    empty = {"titles": [], "rows": [], "source": "", "fetched_at": None,
+             "observed_coins": None, "trusted": True, "why": ""}
     if not path.exists():
         return empty
     try:
@@ -563,11 +631,26 @@ def load_site(sid: str, target_id: str) -> dict:
         return {**empty, "trusted": False,
                 "why": "the last reading of this novel could not be read back"}
 
-    titles = doc.get("titles")
-    titles = [str(t) for t in titles] if isinstance(titles, list) else []
+    stored = doc.get("rows")
+    if isinstance(stored, list) and stored:
+        rows = [r for r in (clean_row(r) for r in stored) if r]
+        source = str(doc.get("source") or "")
+    else:
+        # A title-only file, which is every snapshot written before rows existed. Read it
+        # as titles with everything else unknown rather than migrating it: a migration is a
+        # write over the only record of what is published, and these upgrade themselves on
+        # the next push anyway.
+        titles = doc.get("titles")
+        rows = [r for r in (clean_row(t) for t in
+                            (titles if isinstance(titles, list) else [])) if r]
+        source = "legacy"
+
+    titles = [r["title"] for r in rows]
     coins = doc.get("observed_coins")
     why = snapshot_looks_wrong(sid, titles)
     return {"titles": titles,
+            "rows": rows,
+            "source": source,
             "fetched_at": doc.get("fetched_at"),
             "observed_coins": coins if isinstance(coins, int) and coins > 0 else None,
             "trusted": why is None,
@@ -597,59 +680,109 @@ def _modal_price(prices: list[int] | None) -> int | None:
     return min(counts, key=lambda p: (-counts[p], p))
 
 
-def write_site(sid: str, target_id: str, titles: list[str],
-               prices: list[int] | None = None) -> dict:
+def _merge_rows(previous: list[dict], incoming: list[dict]) -> list[dict]:
+    """Incoming rows win field by field, but only where they actually know something.
+
+    A DOM reading carries a title and a price; an API reading carries the remote id and
+    the state as well. Letting a thinner reading blank what a richer one already
+    established would lose exactly the fields the pricing audit needs.
+    """
+    by_key = {site_title_key(r["title"]): dict(r) for r in previous}
+    order = [site_title_key(r["title"]) for r in previous]
+    for row in incoming:
+        key = site_title_key(row["title"])
+        old = by_key.get(key)
+        if old is None:
+            by_key[key] = dict(row)
+            order.insert(0, key)   # newest first, the way the site lists them
+            continue
+        merged = dict(old)
+        for field, value in row.items():
+            if value not in (None, ""):
+                merged[field] = value
+        by_key[key] = merged
+    seen: set[str] = set()
+    out = []
+    for key in order:
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(by_key[key])
+    return out
+
+
+def write_site(sid: str, target_id: str, rows, prices: list[int] | None = None,
+               mode: str = "merge", source: str = "") -> dict:
     """Record the site's own chapter list, pushed here by the extension.
 
     Python cannot read the site — it has no session and no business having one — so this is
     the only way the plan can know what is already published. Without it a series posted
     before Night Reader existed reads as entirely unposted.
 
+    ``rows`` may be bare titles (the original shape, still accepted) or dicts carrying the
+    site's own ``paid``, ``coins``, ``state`` and ``remote_id``. The richer form is what
+    lets the plan say a chapter went up at the wrong price, or is still private.
+
+    **Merge is the default, and the asymmetry is the reason.** A merge that never shrinks
+    can leave a deleted chapter's ghost in the snapshot, which BLOCKS a post that should
+    have gone out — annoying, and it fails closed. A wrong replace drops a chapter that is
+    really there, which PERMITS a duplicate — and that fails open, onto a live paid site.
+    ``replace`` is for a reading known to be complete, and is still subject to the shrink
+    guard below.
+
     Three ways a push is refused, each learned from a real file:
 
     * **Empty.** Storing it would clear a good snapshot and report everything as postable.
-    * **The wrong page.** The original version of this docstring claimed an empty result
-      was "the one way" to have scraped the wrong page. It is not: two snapshots on disk
-      hold 94 perfectly well-formed titles that are the names of other novels, read off
-      the studio's series list. See ``snapshot_looks_wrong``.
+    * **The wrong page.** An earlier version of this docstring claimed an empty result was
+      "the one way" to have scraped the wrong page. It is not: two snapshots on disk hold
+      94 perfectly well-formed titles that are the names of other novels, read off the
+      studio's series list. See ``snapshot_looks_wrong``.
     * **A suspicious shrink.** A partial render, a paginated table or a scrape taken
-      mid-load yields a SHORT list, which the empty check waves through — and because a
-      write replaces, 114 chapters can become 1 with nothing to say so.
+      mid-load yields a SHORT list, which the empty check waves through — and on a replace
+      114 chapters can become 1 with nothing to say so.
     """
-    clean = [t for t in (str(x).strip() for x in titles or []) if t]
-    if not clean:
+    if mode not in ("merge", "replace"):
+        raise ValueError("Write the site list either by merging or by replacing.")
+    incoming = [r for r in (clean_row(r) for r in rows or []) if r]
+    if not incoming:
         raise ValueError("Empty chapter list — refusing to overwrite the last snapshot.")
-    wrong = snapshot_looks_wrong(sid, clean)
+
+    wrong = snapshot_looks_wrong(sid, [r["title"] for r in incoming])
     if wrong:
         raise ValueError(
             f"This does not look like one novel's chapter list — {wrong}. Open the novel's "
             f"own page (the one listing its chapters) and let it finish loading.")
-    previous = load_site(sid, target_id)["titles"]
-    if previous and len(clean) < SHRINK_FLOOR * len(previous):
+
+    before = load_site(sid, target_id)
+    if (mode == "replace" and before["rows"]
+            and len(incoming) < SHRINK_FLOOR * len(before["rows"])):
         raise ValueError(
-            f"Only {len(clean)} chapters were read where the last reading had "
-            f"{len(previous)} — refusing to shrink the snapshot on what looks like a "
+            f"Only {len(incoming)} chapters were read where the last reading had "
+            f"{len(before['rows'])} — refusing to shrink the snapshot on what looks like a "
             f"partial page. Let the chapter list finish loading and try again.")
-    # De-duplicated, preserving the site's own order (newest first) so the file reads the
-    # way the page it came from does.
-    seen: set[str] = set()
-    ordered = []
-    for title in clean:
-        key = title.casefold()
-        if key not in seen:
-            seen.add(key)
-            ordered.append(title)
-    doc = {"fetched_at": _now(), "titles": ordered}
-    observed = _modal_price(prices)
+
+    ordered = (_merge_rows(before["rows"], incoming) if mode == "merge"
+               else _merge_rows([], incoming))
+
+    doc = {"version": 2, "fetched_at": _now(),
+           "source": source or before.get("source") or "",
+           "rows": ordered,
+           # Kept alongside the rows, always derived from them. Every existing reader --
+           # plan_run, the page's count, the tests -- goes through this, so the richer
+           # format costs them nothing.
+           "titles": [r["title"] for r in ordered]}
+
+    # The coin price, preferring what this reading actually saw.
+    observed = _modal_price(prices if prices is not None else
+                            [r["coins"] for r in ordered
+                             if r["paid"] and isinstance(r["coins"], int)])
     if observed is not None:
         doc["observed_coins"] = observed
-    else:
+    elif before.get("observed_coins"):
         # Keep what an earlier reading learned. A page showing only free chapters says
         # nothing about the price of the paid ones, and treating that as "no price" would
         # throw away a good answer.
-        previous = load_site(sid, target_id).get("observed_coins")
-        if previous:
-            doc["observed_coins"] = previous
+        doc["observed_coins"] = before["observed_coins"]
     return _write_json(site_path(sid, target_id), doc)
 
 

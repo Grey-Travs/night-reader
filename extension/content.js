@@ -1506,34 +1506,68 @@ function setWatch(text, ok) {
  */
 let lastPushed = ''
 
-async function pushSiteList(rows) {
-  if (!ctx.found || !rows?.length) return 0
-  const titles = rows.map((r) => r.title)
-  // The coin value of each PAID chapter, which the site export carries nowhere. It is only
-  // visible here, so sending it is how the app comes to know what a series charges without
-  // the number being typed in once per series.
-  //
-  // Taken from the site's own chapter records rather than from the coins box in the row,
-  // because the box does not draw the distinction that matters: a FREE chapter still
-  // carries a coin value (paid 0 alongside coins 1, observed on a real series), so reading
-  // the box alone had a mostly-free series priced at 1 coin. A row whose record this tab
-  // has not seen contributes nothing rather than a guess — write_site keeps whatever an
-  // earlier reading learned, so silence is safe and a wrong number is not.
-  // Scoped to THIS series: "Chapter 1" is not a unique name, and the map outlives the
-  // navigation that filled it.
+/** One of the site's own chapter records, as the app stores it. */
+function toSiteRow(ch) {
+  return {
+    title: String(ch.displayName || '').trim(),
+    // `paid` is what decides whether `coins` means anything: a FREE chapter still carries
+    // a coin value (paid 0 alongside coins 1, observed on a real series), so trusting
+    // coins alone prices a free novel at 1.
+    paid: ch.paid === true || Number(ch.paid) === 1,
+    coins: Number(ch.coins) || 0,
+    state: String(ch.state || '').toLowerCase(),
+    remote_id: String(ch.id || ''),
+  }
+}
+
+/**
+ * What this tab knows about the novel's chapters, best source first.
+ *
+ * The site's own records beat the table every time. Scraping the page renders a chapter's
+ * name and its coin badge as ONE text run, so the title arrives as "Chapter 61 55" and is
+ * only repaired when the row's coins box happens to read non-zero — miss that and every
+ * paid chapter in the series reads as a title nothing can match. The records carry the
+ * name as the site holds it, plus the paid flag, the state and the id, and they include
+ * chapters the table paginates away.
+ */
+function siteRowsFor(seriesUid, domRows) {
+  const fromApi = []
+  for (const ch of CHAPTERS.values()) {
+    if (String(ch.series_uid || '') === seriesUid && ch.displayName) {
+      fromApi.push(toSiteRow(ch))
+    }
+  }
+  // Merge, never replace. This map is filled from whatever requests the page happened to
+  // make plus whatever this run posted, so it is not guaranteed to be the whole novel --
+  // and replacing on a partial reading DROPS chapters, which is the direction that permits
+  // a duplicate. A merge can at worst leave a deleted chapter's ghost, which only blocks.
+  if (fromApi.length) return { rows: fromApi, source: 'api', mode: 'merge' }
+  return {
+    // No records yet, so the table is all there is. `paid` is left NULL rather than false:
+    // the table cannot tell a free chapter from an unpriced one, and guessing "free" here
+    // would have the app report a whole novel as mispriced.
+    rows: (domRows || []).map((r) => ({
+      title: r.title, paid: null, coins: Number(r.coins) || null, state: r.state || '',
+    })),
+    source: 'dom',
+    mode: 'merge',
+  }
+}
+
+async function pushSiteList(domRows, { force = false } = {}) {
+  if (!ctx.found) return 0
   const uid = seriesUidOrEmpty()
-  const prices = rows.map((r) => {
-    const rec = chapterFor(uid, r.title)
-    if (!rec) return 0
-    const isPaid = rec.paid === true || Number(rec.paid) === 1
-    return isPaid ? Number(rec.coins) || 0 : 0
-  }).filter((n) => n > 0)
-  const signature = JSON.stringify([titles, prices])
-  if (signature === lastPushed) return titles.length
+  if (!uid) return 0
+  const { rows, source, mode } = siteRowsFor(uid, domRows)
+  if (!rows.length) return 0
+  const signature = JSON.stringify([rows, source, mode])
+  if (!force && signature === lastPushed) return rows.length
   try {
-    await ask('site', { sid: ctx.sid, targetId: ctx.target_id, titles, prices })
+    await ask('site', {
+      sid: ctx.sid, targetId: ctx.target_id, rows, mode, source,
+    })
     lastPushed = signature
-    return titles.length
+    return rows.length
   } catch {
     // Syncing the list is a convenience for the app; never let it interrupt a run or
     // shout at the user from a page they were only passing through.
@@ -1833,6 +1867,9 @@ async function postBatch({ count, state, upTo, run = null }) {
           CHAPTERS.set(chapterKey(pinned.series_uid, payload.title), {
             id: done.id, displayName: payload.title, series_uid: pinned.series_uid,
             state: want.state.toLowerCase(), coins: Number(item.coins) || 0,
+            // Spelled out: without it toSiteRow reads `undefined` as false and pushes a
+            // paid chapter to the app as free.
+            paid: Number(item.coins) > 0,
           })
         }
         await ask('result', {
@@ -1854,6 +1891,11 @@ async function postBatch({ count, state, upTo, run = null }) {
       }
     }
     if (!cancelled) await report({ kind: 'finished' })
+    // The list pushed before the run described the site as it was BEFORE any of this went
+    // out, and the app stores what it is told -- so without this the chapters just posted
+    // immediately lose their "already on the site" mark, and the next run is guarded by
+    // the ledger alone. Forced, because the pre-run push already set the signature.
+    if (posted.length) await pushSiteList(null, { force: true })
   } catch (e) {
     stopped = e.message
     if (current) {

@@ -4056,6 +4056,17 @@ def posting_result(body: PostResult) -> dict:
 class SiteSnapshot(BaseModel):
     sid: str
     target_id: str = "default"
+    # The site's own chapter records: title plus paid/coins/state/remote_id. Richer than
+    # titles alone, which is what lets the plan say a chapter went up at the wrong price
+    # or is still private.
+    rows: list[dict] = Field(default_factory=list)
+    # How to fold this into what is already stored. Merge is the default and the safe
+    # direction -- see write_site.
+    mode: str = "merge"
+    # Where the reading came from: "api" for the site's own records, "dom" for a scrape of
+    # the page. Recorded so a thin reading is recognisable later.
+    source: str = ""
+    # Still accepted so an extension that has not been reloaded keeps working.
     titles: list[str] = Field(default_factory=list)
     # The coin value in each paid row. The site export carries no price anywhere, and this
     # is the only place it is visible, so this is how the app learns what a series charges
@@ -4107,8 +4118,12 @@ def posting_site(body: SiteSnapshot) -> dict:
     by hand long before this app existed reads as entirely unposted.
     """
     require_series(body.sid)
+    # Rows when the extension sends them, titles when it is an older build that does not.
+    rows = body.rows or body.titles
     try:
-        return posting.write_site(body.sid, body.target_id, body.titles, body.prices)
+        return posting.write_site(body.sid, body.target_id, rows,
+                                  body.prices or None, mode=body.mode,
+                                  source=body.source)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

@@ -603,19 +603,146 @@ def test_an_untrusted_snapshot_blocks_everything_rather_than_nothing(client, tmp
     assert r.status_code == 400
 
 
-def test_a_partial_page_cannot_shrink_the_snapshot(client):
-    # A paginated table, a lazy render, or a scrape taken mid-load yields a SHORT list.
-    # The empty check waves it through, and a write replaces — so 114 becomes 1 silently.
+def test_a_short_reading_cannot_lose_chapters(client):
+    """A partial page must never take chapters OUT of the snapshot.
+
+    A paginated table, a lazy render or a scrape taken mid-load yields a SHORT list. The
+    empty check waves it through, so before merging existed a reading of 1 chapter replaced
+    a reading of 20 and the other 19 became postable again.
+
+    Merging is the default precisely because of the asymmetry: a merge that never shrinks
+    can leave a deleted chapter's ghost, which BLOCKS a post that should have gone out and
+    fails closed; a wrong replace drops a chapter that is really there, which PERMITS a
+    duplicate onto a live paid site.
+    """
     a = _novel(client, "Shrink", [1], translated=[(1, "One.\n")])
     sid = _series(client, "Shrink", [a])
     posting.write_site(sid, "t1", [f"Chapter {n}" for n in range(1, 21)])
+
+    posting.write_site(sid, "t1", ["Chapter 20"])          # merge: the default
+    assert len(posting.load_site(sid, "t1")["titles"]) == 20
+
     with pytest.raises(ValueError) as caught:
-        posting.write_site(sid, "t1", ["Chapter 20"])
+        posting.write_site(sid, "t1", ["Chapter 20"], mode="replace")
     assert "partial" in str(caught.value)
     assert len(posting.load_site(sid, "t1")["titles"]) == 20
-    # A believable amount of shrinkage still goes through: chapters do get deleted.
-    posting.write_site(sid, "t1", [f"Chapter {n}" for n in range(1, 18)])
+
+    # A believable amount of shrinkage still replaces: chapters do get deleted.
+    posting.write_site(sid, "t1", [f"Chapter {n}" for n in range(1, 18)], mode="replace")
     assert len(posting.load_site(sid, "t1")["titles"]) == 17
+
+
+def test_a_merge_keeps_what_a_thinner_reading_does_not_know(client):
+    # The DOM carries a title and a price; the site's own records carry the remote id and
+    # the state as well. A later, thinner reading must not blank the richer fields — they
+    # are exactly what the pricing audit needs.
+    a = _novel(client, "Fields", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Fields", [a])
+    posting.write_site(sid, "t1", [
+        {"title": "Chapter 1", "paid": True, "coins": 55, "state": "public",
+         "remote_id": "abc"}], source="api")
+    posting.write_site(sid, "t1", [{"title": "Chapter 1"}], source="dom")
+    row = posting.load_site(sid, "t1")["rows"][0]
+    assert row["remote_id"] == "abc"
+    assert row["paid"] is True and row["coins"] == 55 and row["state"] == "public"
+
+
+def test_a_title_only_snapshot_reads_back_as_unknown_not_free(client):
+    """Every snapshot written before rows existed knows titles and nothing else.
+
+    Reading those back as "free at zero coins" would invent an answer the file never
+    contained, and a pricing audit built on it would report a whole library as mispriced.
+    """
+    a = _novel(client, "Legacy", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Legacy", [a])
+    path = posting.site_path(sid, "t1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"fetched_at": "2026-09-19T00:00:00+00:00",
+                                "titles": ["Chapter 1"]}), encoding="utf-8")
+    site = posting.load_site(sid, "t1")
+    assert site["source"] == "legacy"
+    assert site["rows"][0]["paid"] is None and site["rows"][0]["coins"] is None
+    assert site["titles"] == ["Chapter 1"]
+
+
+# ---- what the site charges, against what this series says --------------
+
+# The free cutoff says what chapter 63 OUGHT to cost. Only the site says what it does. A
+# chapter that went up free when it should be paid is revenue quietly gone; one left
+# private is a chapter nobody can read. Neither was visible before, because the plan only
+# ever asked whether a title was present.
+
+
+def _priced(client, name, coins=55, free_through=1):
+    a = _novel(client, name, [1, 2], translated=[(1, "One.\n"), (2, "Two.\n")])
+    sid = _series(client, name, [a])
+    series = series_mod.get_series(sid)
+    series["publish_targets"] = [{"id": "t1", "site": "meiko",
+                                  "series_url": "https://meiko.studio/page/x/series/y/",
+                                  "free_through": free_through, "coin_price": coins}]
+    series_mod.write_series(series)
+    return sid
+
+
+def test_a_chapter_live_at_the_wrong_price_is_reported(client):
+    sid = _priced(client, "Wrongprice")
+    posting.write_site(sid, "t1", [
+        {"title": "Chapter 1", "paid": False, "coins": 0, "state": "public"},
+        {"title": "Chapter 2", "paid": True, "coins": 5, "state": "public"}],
+        source="api")
+    audit = {a["title"]: a["problems"] for a in _plan(client, sid)["audit"]}
+    assert "Chapter 1" not in audit            # free, and free is right below the cutoff
+    assert "5 coins" in audit["Chapter 2"][0]
+
+
+def test_a_chapter_that_should_cost_coins_but_is_free_is_reported(client):
+    sid = _priced(client, "Freebie")
+    posting.write_site(sid, "t1", [
+        {"title": "Chapter 2", "paid": False, "coins": 0, "state": "public"}],
+        source="api")
+    problems = _plan(client, sid)["audit"][0]["problems"]
+    assert "should cost coins" in problems[0]
+
+
+def test_a_chapter_still_private_is_reported(client):
+    sid = _priced(client, "Hidden")
+    posting.write_site(sid, "t1", [
+        {"title": "Chapter 2", "paid": True, "coins": 55, "state": "private"}],
+        source="api")
+    problems = _plan(client, sid)["audit"][0]["problems"]
+    assert "readers cannot see it" in problems[0]
+
+
+def test_a_title_only_snapshot_reports_nothing(client):
+    """Unknown is not the same as wrong.
+
+    Every snapshot written before rows existed knows titles alone. Reading those as "free
+    at zero coins" would report an entire library as mispriced on a field the file never
+    contained.
+    """
+    sid = _priced(client, "Quiet")
+    posting.write_site(sid, "t1", ["Chapter 1", "Chapter 2"])
+    assert _plan(client, sid)["audit"] == []
+
+
+def test_the_endpoint_takes_the_rows_the_extension_sends(client):
+    sid = _priced(client, "Endpoint")
+    r = client.post("/api/posting/site", json={
+        "sid": sid, "target_id": "t1", "source": "api", "mode": "merge",
+        "rows": [{"title": "Chapter 1", "paid": True, "coins": 55, "state": "public",
+                  "remote_id": "abc"}]})
+    assert r.status_code == 200
+    row = posting.load_site(sid, "t1")["rows"][0]
+    assert row["remote_id"] == "abc" and row["coins"] == 55
+
+
+def test_the_endpoint_still_takes_bare_titles(client):
+    # An extension that has not been reloaded keeps working.
+    sid = _priced(client, "Oldext")
+    r = client.post("/api/posting/site", json={
+        "sid": sid, "target_id": "t1", "titles": ["Chapter 1"], "prices": [55]})
+    assert r.status_code == 200
+    assert posting.load_site(sid, "t1")["titles"] == ["Chapter 1"]
 
 
 # ---- the run request ------------------------------------------------------
