@@ -671,27 +671,105 @@ function writePending(value) {
 }
 
 /**
+ * What to do about a chapter we started and did not finish.
+ *
+ * Three outcomes, and telling them apart is the point -- the old code assumed the middle
+ * one and could not see the others:
+ *
+ *   create : nothing by that name is there, so the create never landed. Post normally.
+ *   resume : it is there and EMPTY -- a shell. Fill it; do not make a second one.
+ *   done   : it is there WITH TEXT. It finished and only the reply was lost, so record
+ *            it and move on. Never re-save, which would overwrite live content.
+ *
+ * The shell test is reliable because apiCreateChapter always creates private with no
+ * pages, so 'present but empty' cannot mean anything else.
+ */
+async function reconcilePending(pinned, title) {
+  const live = await alreadyOnSite(pinned, title)
+  if (!live) return { action: 'create' }
+  const uid = String(live.uid || '')
+  // There, but not readable back by uid: treat as a shell rather than create a second
+  // one. Filling a finished chapter is recoverable; two chapters sharing a name means
+  // retyping a name on the site to delete one.
+  if (!uid) return { action: 'resume', record: live }
+
+  let full = null
+  try {
+    const res = await api('GET', '/app/chapter', {
+      studio_uid: pinned.studio_uid, series_uid: pinned.series_uid, uid, pages: true,
+    })
+    const rows = Array.isArray(res?.data) ? res.data
+      : res?.data && typeof res.data === 'object' ? [res.data] : []
+    full = rows.find((r) => String(r?.uid || '') === uid) || rows[0] || null
+  } catch (e) {
+    throw new Error(`could not read back the half-made "${title}" (${e.message}) — `
+      + 'stopping rather than risk a second copy')
+  }
+  if (!full) return { action: 'create' }
+  return chapterHtml(full).length > 0
+    ? { action: 'done', record: full }
+    : { action: 'resume', record: full }
+}
+
+/**
  * Post one chapter: create it, then save its fields and text together.
  *
  * `state` stays a parameter so a trial run can leave the chapter Private and invisible to
  * readers. The text goes in the SAME call that publishes it, so there is no window in which
  * an empty chapter is public.
  */
-async function postViaApi({ payload, coins, state }) {
+async function postViaApi({ payload, coins, state, pinned, resume = false }) {
   say(`\n## ${payload.title}  (${state}, ${coins ? `${coins} coins` : 'free'})`)
 
   const pending = readPending()
+  const resuming = resume
+    || (pending && nrTitleKey(pending.title) === nrTitleKey(payload.title))
   let created
-  if (pending && nrTitleKey(pending.title) === nrTitleKey(payload.title)
-      && pending.data?.id) {
+  if (resuming && pinned) {
+    const what = await reconcilePending(pinned, payload.title)
+    if (what.action === 'done') {
+      // It was finished all along and only the reply went missing. Recording it is the
+      // whole fix; re-saving would overwrite text a reader may already have moved past.
+      say('1/3 this chapter finished earlier — only its reply was lost. Recording it.')
+      writePending(null)
+      return {
+        title: payload.title, id: String(what.record.id || ''),
+        chars: chapterHtml(what.record).length, alreadyComplete: true,
+      }
+    }
+    if (what.action === 'resume') {
+      created = what.record
+      say(`1/3 filling the empty chapter created earlier (id ${created.id})`)
+    }
+  } else if (resuming && pending.data?.id) {
+    // No series pinned (a panel run), so fall back to what this tab remembers.
     say(`1/3 resuming the chapter created earlier (id ${pending.data.id})`)
     created = pending.data
-  } else {
+  }
+  if (!created) {
+    // The intent is recorded BEFORE the request goes out, in two places.
+    //
+    // Writing it after the create -- which is what this did -- leaves one window with no
+    // record at all: the site makes the chapter, the reply is lost to a timeout or a
+    // suspended tab, and an empty chapter sits there that nothing knows about. Worse, once
+    // its title reaches the snapshot it blocks the real chapter from ever being posted.
+    //
+    // sessionStorage is the fast path but dies with the tab, so the same intent goes to
+    // the app's ledger, which does not. It never blocks a post: plan_run counts only
+    // "posted", and record() upserts on the title so the later "posted" replaces it.
+    writePending({ title: payload.title, phase: 'creating' })
+    try {
+      await ask('result', {
+        sid: ctx.sid, target_id: ctx.target_id, title: payload.title,
+        project_id: payload.project_id || '', index: payload.index ?? null,
+        status: 'creating',
+      })
+    } catch { /* best effort; sessionStorage still has it */ }
+
     say('1/3 creating the chapter')
     created = await apiCreateChapter(payload.title)
     say(`    created id ${created.id} · uid ${created.uid}`)
-    // Written BEFORE the save is attempted: the point is to survive a failure in the save.
-    writePending({ title: payload.title, data: created })
+    writePending({ title: payload.title, phase: 'created', data: created })
   }
 
   say('2/3 saving its settings and text')
@@ -1700,8 +1778,18 @@ function buildQueue(plan, adapter, count, upTo) {
   if (upTo) fresh = fresh.filter((i) => i.global != null && i.global <= upTo)
 
   const pending = readPending()
-  const resumable = pending
-    && ready.find((i) => nrTitleKey(i.title) === nrTitleKey(pending.title))
+  // The app's own record of a half-made chapter, for when the tab that made it is gone --
+  // sessionStorage dies with the tab, and that is the case this exists for.
+  const wanted = pending?.title || (plan.creating || [])[0]
+  // Searched in plan.items, NOT in ready.
+  //
+  // This is the bug that made resuming impossible. A shell is by definition already on
+  // the site, so the plan blocks it -- which meant `resumable` was always null and the
+  // empty chapter sat there blocking the real one from ever being posted. Looking in the
+  // full list finds it; reconcilePending then decides whether to fill it, record it, or
+  // ignore it.
+  const resumable = wanted
+    && plan.items.find((i) => nrTitleKey(i.title) === nrTitleKey(wanted))
   const queue = resumable
     && !fresh.some((i) => nrTitleKey(i.title) === nrTitleKey(resumable.title))
     ? [resumable, ...fresh]
@@ -1846,9 +1934,11 @@ async function postBatch({ count, state, upTo, run = null }) {
         //
         // The one exception is a chapter we created earlier and did not finish: there,
         // "already on the site" is the shell we mean to fill, not a duplicate.
-        const resuming = readPending()
-        const isResume = resuming
-          && nrTitleKey(resuming.title) === nrTitleKey(payload.title)
+        const remembered = readPending()
+        const isResume = !!(q.resumable
+          && nrTitleKey(q.resumable.title) === nrTitleKey(payload.title))
+          || !!(remembered
+            && nrTitleKey(remembered.title) === nrTitleKey(payload.title))
         if (!isResume) {
           const live = await alreadyOnSite(pinned, payload.title)
           if (live) {
@@ -1860,10 +1950,17 @@ async function postBatch({ count, state, upTo, run = null }) {
           }
         }
 
-        const done = await postViaApi({ payload, coins: item.coins, state: want.state })
+        const done = await postViaApi({
+          payload, coins: item.coins, state: want.state, pinned, resume: isResume,
+        })
         // Record it locally straight away, so the guard is right BETWEEN refreshes and the
         // same run can never post one title twice.
-        if (done?.id) {
+        //
+        // Skipped for a recovered chapter: reconcilePending read that one off the site, so
+        // the map already holds its REAL state and price. Writing what this run merely
+        // intended would replace observed facts with assumptions, and the pricing audit
+        // reads exactly those fields.
+        if (done?.id && !done.alreadyComplete) {
           CHAPTERS.set(chapterKey(pinned.series_uid, payload.title), {
             id: done.id, displayName: payload.title, series_uid: pinned.series_uid,
             state: want.state.toLowerCase(), coins: Number(item.coins) || 0,
@@ -1880,7 +1977,12 @@ async function postBatch({ count, state, upTo, run = null }) {
           // matching it by name against a list the page happens to have fetched.
           remote_id: done.id || '',
         })
-        posted.push({ title: payload.title, coins: item.coins, chars: done.chars })
+        // A chapter that turned out to have finished earlier is recorded, not re-sent,
+        // and says so in the summary rather than being counted as newly published.
+        posted.push({
+          title: payload.title, coins: item.coins, chars: done.chars,
+          recovered: !!done.alreadyComplete,
+        })
         current = null
         await report({
           kind: 'posted', title: payload.title, global: item.global, coins: item.coins,
@@ -1921,7 +2023,8 @@ async function postBatch({ count, state, upTo, run = null }) {
   if (posted.length) {
     say(`POSTED ${posted.length} chapter${posted.length === 1 ? '' : 's'} as ${want.state}:`)
     for (const p of posted) {
-      say(`  ✓ ${p.title}  ${p.coins ? `${p.coins} coins` : 'free'}  ${p.chars} chars`)
+      say(`  ✓ ${p.title}  ${p.coins ? `${p.coins} coins` : 'free'}  ${p.chars} chars`
+        + `${p.recovered ? '  (was already finished — recorded, not re-sent)' : ''}`)
     }
   } else {
     say('POSTED nothing.')

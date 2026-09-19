@@ -3890,7 +3890,12 @@ class PostResult(BaseModel):
     project_id: str = ""
     index: int | None = None
     global_number: int | None = Field(default=None, alias="global")
-    # posted | failed | skipped | needs-attention
+    # posted | failed | skipped | needs-attention | creating
+    #
+    # "creating" is written BEFORE the site is asked to make the chapter, and is the only
+    # durable trace of an attempt whose reply never came back. It never blocks a post --
+    # plan_run counts only "posted" -- and the later "posted" replaces it, because record()
+    # upserts on the title.
     status: str = "posted"
     remote_url: str = ""
     # The site's own id for the chapter. Kept so a chapter posted in an earlier session can

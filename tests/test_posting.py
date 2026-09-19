@@ -745,6 +745,53 @@ def test_the_endpoint_still_takes_bare_titles(client):
     assert posting.load_site(sid, "t1")["titles"] == ["Chapter 1"]
 
 
+# ---- a chapter we started and did not finish ------------------------------
+
+# The window: the site makes the chapter, the reply is lost to a timeout or a suspended
+# tab, and the only record of it lived in one tab's sessionStorage. Close the tab and an
+# empty chapter sits on the site that nothing knows about -- and once its title reaches
+# the snapshot it blocks the real chapter from ever being posted.
+
+
+def _intent(client, sid, title, status="creating"):
+    return client.post("/api/posting/result", json={
+        "sid": sid, "target_id": "t1", "title": title, "status": status})
+
+
+def test_an_intent_to_create_is_remembered_across_tabs(client):
+    a = _novel(client, "Intent", [1, 2], translated=[(1, "One.\n"), (2, "Two.\n")])
+    sid = _series(client, "Intent", [a])
+    assert _plan(client, sid)["creating"] == []
+    _intent(client, sid, "Chapter 2")
+    assert _plan(client, sid)["creating"] == ["Chapter 2"]
+
+
+def test_an_intent_never_blocks_the_chapter_it_names(client):
+    """An intent is not a chapter.
+
+    Blocking on it would let a create that never landed veto the real post -- the exact
+    permanent-block this feature exists to undo, just arriving by another route.
+    """
+    a = _novel(client, "Unblocked", [1, 2], translated=[(1, "One.\n"), (2, "Two.\n")])
+    sid = _series(client, "Unblocked", [a])
+    _intent(client, sid, "Chapter 2")
+    by_number = {i["global"]: i for i in _plan(client, sid)["items"]}
+    assert by_number[2]["blockers"] == []
+
+
+def test_finishing_the_chapter_clears_the_intent(client):
+    # record() upserts on the title, so the later "posted" replaces the "creating" rather
+    # than leaving both.
+    a = _novel(client, "Finish", [1, 2], translated=[(1, "One.\n"), (2, "Two.\n")])
+    sid = _series(client, "Finish", [a])
+    _intent(client, sid, "Chapter 2")
+    _intent(client, sid, "Chapter 2", status="posted")
+    plan = _plan(client, sid)
+    assert plan["creating"] == []
+    by_number = {i["global"]: i for i in plan["items"]}
+    assert "already in the ledger as posted" in by_number[2]["blockers"]
+
+
 # ---- the run request ------------------------------------------------------
 
 # How the app asks the browser to post. Everything here is checkable without a browser,

@@ -255,6 +255,17 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     ledger = load_ledger(sid, target["id"])
     posted = {site_title_key(e["title"])
               for e in ledger.get("entries", []) if e.get("status") == "posted"}
+    # Chapters the browser said it was ABOUT to create and never reported finishing.
+    #
+    # The window this closes: the create succeeds on the site, the reply is lost, and the
+    # only record of it lived in one tab's sessionStorage. Close the tab and an empty
+    # chapter sits on the site that nothing knows about -- and once its title reaches the
+    # snapshot, the real chapter is blocked by it forever.
+    #
+    # Deliberately NOT part of `posted`: an intent is not a chapter, and blocking on it
+    # would let a create that never happened veto the real post.
+    creating = [e["title"] for e in ledger.get("entries", [])
+                if e.get("status") == "creating"]
     # What the site itself says it has, which outranks the ledger: it reflects reality
     # including anything posted by hand, from another machine, or before this app existed.
     #
@@ -312,6 +323,8 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
         # Chapters already up that do not match this series' own pricing. Empty until a
         # reading carries the site's paid/coins/state, which title-only snapshots do not.
         "audit": audit_pricing(items, site),
+        # Half-made chapters to reconcile before anything new is created.
+        "creating": creating,
         # What the run would actually charge for, spelled out. Getting this backwards is
         # the mistake worth one extra click to avoid.
         "summary": {
