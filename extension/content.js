@@ -109,18 +109,41 @@ function showWriteCount() {
 }
 
 
-// The site's own chapter records, learned from the list it fetches for itself. Keyed by
-// nrTitleKey(displayName), because the display name is the only handle shared between
-// Night Reader's ledger and the site — the ids are the site's alone — and the key is the
-// one normalisation both halves of this app agree on (see server/titles.py).
+// The site's own chapter records, learned from the list it fetches for itself.
 //
 // Needed because a chapter can only be changed by PUTting its whole record back, so editing
 // one created in an earlier session means knowing its `id`, `uid`, `createdAt` and the rest.
+//
+// Keyed by SERIES AND TITLE, never title alone: this map is never cleared as you move
+// between novels, and "Chapter 1" is not a unique name. See nrChapterKey in titles.js.
 const CHAPTERS = new Map()
+
+function chapterKey(seriesUid, title) {
+  return nrChapterKey(seriesUid, title)
+}
+
+/** The site's own record for a title within one series, or undefined. */
+function chapterFor(seriesUid, title) {
+  if (!seriesUid) return undefined
+  return CHAPTERS.get(chapterKey(seriesUid, title))
+}
+
+/** This page's series id, or '' — never a throw, and never another novel's. */
+function seriesUidOrEmpty() {
+  try {
+    return uidsFromUrl().series_uid
+  } catch {
+    return ''
+  }
+}
+
 window.addEventListener('message', (e) => {
   if (e.source !== window || e.data?.source !== 'nr-chapters') return
   for (const ch of e.data.chapters || []) {
-    if (ch?.displayName) CHAPTERS.set(nrTitleKey(ch.displayName), ch)
+    // Records without a series of their own are the studio and series rows, not chapters.
+    if (ch?.displayName && ch.series_uid) {
+      CHAPTERS.set(chapterKey(ch.series_uid, ch.displayName), ch)
+    }
   }
 })
 
@@ -1186,6 +1209,65 @@ async function fetchChapters(studio_uid, series_uid) {
   return rows.filter((r) => recordKind(r) === 'chapter')
 }
 
+// When the in-memory index was last read straight from the site, and how old it may get
+// before a post re-reads it. A run posts one chapter every few seconds, so 60s costs about
+// one extra GET per three or four chapters -- cheap next to posting a duplicate.
+let indexReadAt = 0
+// WHICH series that reading was of. Without this the freshness check fails OPEN: move to
+// another novel and the timestamp is still recent, so the re-read is skipped, the map holds
+// nothing under the new series' key, and every chapter reads as absent — which is the
+// direction that posts duplicates.
+let indexSeriesUid = ''
+const INDEX_MAX_AGE_MS = 60000
+
+/**
+ * Re-read this series' chapter list from the site's own API and refresh CHAPTERS.
+ *
+ * Deliberately WITHOUT `pages: true`: this wants each chapter's settings, not its prose,
+ * and asking for the text of a 150-chapter novel to answer "does this name exist" would be
+ * megabytes per check.
+ */
+async function refreshChapterIndex(pinned) {
+  const res = await api('GET', '/app/chapter', {
+    studio_uid: pinned.studio_uid, series_uid: pinned.series_uid,
+    userid: observedParam('userid'),
+  })
+  const rows = (Array.isArray(res?.data) ? res.data : [])
+    .filter((r) => recordKind(r) === 'chapter'
+      && String(r.series_uid || '') === pinned.series_uid)
+  for (const ch of rows) {
+    if (ch?.displayName) CHAPTERS.set(chapterKey(ch.series_uid, ch.displayName), ch)
+  }
+  indexReadAt = Date.now()
+  indexSeriesUid = pinned.series_uid
+  return rows
+}
+
+/**
+ * The site's record for this title, re-reading the index first if it has gone stale.
+ *
+ * The guard this exists for: buildQueue scrapes the page ONCE, at the start of a run, and
+ * a hundred-chapter run spans twenty minutes on that one reading. Anything posted in the
+ * meantime -- from another tab, from the phone, by hand -- is invisible to it. And an
+ * app-driven run deliberately does not reload the page, so a second run in the same tab
+ * diffs against a list that predates the first.
+ */
+async function alreadyOnSite(pinned, title) {
+  const stale = indexSeriesUid !== pinned.series_uid
+    || Date.now() - indexReadAt > INDEX_MAX_AGE_MS
+  if (stale) {
+    try {
+      await refreshChapterIndex(pinned)
+    } catch (e) {
+      // A failed read is NOT "nothing is there". Refuse to post rather than guess: this
+      // is the last guard, and the cost of being wrong is a duplicate readers can buy.
+      throw new Error(`could not re-read the chapter list to check for duplicates `
+        + `(${e.message}) — stopping rather than posting blind`)
+    }
+  }
+  return chapterFor(pinned.series_uid, title) || null
+}
+
 /** The site's chapter record as Night Reader wants it. */
 function toRecord(chapter) {
   return {
@@ -1437,8 +1519,11 @@ async function pushSiteList(rows) {
   // the box alone had a mostly-free series priced at 1 coin. A row whose record this tab
   // has not seen contributes nothing rather than a guess — write_site keeps whatever an
   // earlier reading learned, so silence is safe and a wrong number is not.
+  // Scoped to THIS series: "Chapter 1" is not a unique name, and the map outlives the
+  // navigation that filled it.
+  const uid = seriesUidOrEmpty()
   const prices = rows.map((r) => {
-    const rec = CHAPTERS.get(nrTitleKey(r.title))
+    const rec = chapterFor(uid, r.title)
     if (!rec) return 0
     const isPaid = rec.paid === true || Number(rec.paid) === 1
     return isPaid ? Number(rec.coins) || 0 : 0
@@ -1718,7 +1803,38 @@ async function postBatch({ count, state, upTo, run = null }) {
         const payload = await ask('payload', {
           sid: ctx.sid, projectId: item.project_id, index: item.index,
         })
+
+        // The last guard before anything is created, and the only one that is still true
+        // RIGHT NOW. buildQueue diffed against one reading of the page taken before the
+        // first chapter went out; twenty minutes and a hundred chapters later that reading
+        // is history, and an app-driven run never reloads the page. Anything posted in the
+        // meantime -- another tab, the phone, by hand -- is invisible to it.
+        //
+        // The one exception is a chapter we created earlier and did not finish: there,
+        // "already on the site" is the shell we mean to fill, not a duplicate.
+        const resuming = readPending()
+        const isResume = resuming
+          && nrTitleKey(resuming.title) === nrTitleKey(payload.title)
+        if (!isResume) {
+          const live = await alreadyOnSite(pinned, payload.title)
+          if (live) {
+            throw new Error(
+              `"${payload.title}" is already on the site (id ${live.id || '?'}`
+              + `${live.state ? ', ' + String(live.state).toLowerCase() : ''}`
+              + `${Number(live.coins) > 0 ? ', ' + live.coins + ' coins' : ''})`
+              + ' — stopping rather than posting a second copy.')
+          }
+        }
+
         const done = await postViaApi({ payload, coins: item.coins, state: want.state })
+        // Record it locally straight away, so the guard is right BETWEEN refreshes and the
+        // same run can never post one title twice.
+        if (done?.id) {
+          CHAPTERS.set(chapterKey(pinned.series_uid, payload.title), {
+            id: done.id, displayName: payload.title, series_uid: pinned.series_uid,
+            state: want.state.toLowerCase(), coins: Number(item.coins) || 0,
+          })
+        }
         await ask('result', {
           sid: ctx.sid, target_id: ctx.target_id, title: payload.title,
           project_id: item.project_id, index: item.index, global: item.global,
@@ -1822,7 +1938,10 @@ async function publishPosted() {
     const todo = []
     const unknown = []
     for (const e of mine) {
-      const ch = CHAPTERS.get(nrTitleKey(e.title))
+      // Scoped to this series. Unscoped, a generic title could match a record belonging
+      // to a novel visited earlier in this tab — and the PUT below writes the whole record
+      // back, so that would have overwritten a different novel's chapter text.
+      const ch = chapterFor(seriesUidOrEmpty(), e.title)
       if (!ch) unknown.push(e.title)
       else if (String(ch.state).toLowerCase() !== 'public') todo.push({ entry: e, ch })
     }

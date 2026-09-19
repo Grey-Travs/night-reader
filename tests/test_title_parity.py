@@ -155,5 +155,52 @@ def test_nothing_becomes_the_empty_key_by_accident():
     assert site_title_key("ch") == "ch"
 
 
+# ---- a title alone is not an identity -------------------------------------
+
+# "Chapter 1" names a chapter in every novel there is. The extension keeps the site's own
+# records in a map that is never cleared as you move between novels, so keyed by title
+# alone a record from a novel visited earlier answered to this one -- and since publishing
+# writes the whole record back, that meant writing over a DIFFERENT novel's chapter text.
+
+
+def _js_chapter_keys(pairs) -> list[str]:
+    # Statements separated by semicolons rather than newlines: nothing here then needs
+    # a newline escape, which is one fewer thing for a quoting layer to mangle.
+    script = (
+        "const { nrChapterKey } = require("
+        + json.dumps(TITLES_JS.replace(os.sep, "/"))
+        + ");"
+        "const pairs = " + json.dumps(pairs) + ";"
+        "console.log(JSON.stringify(pairs.map(([u, t]) => nrChapterKey(u, t))))"
+    )
+    result = subprocess.run([_NODE, "-e", script],
+                            capture_output=True, text=True, encoding="utf-8")
+    assert result.returncode == 0, f"node failed: {result.stderr}"
+    return json.loads(result.stdout)
+
+
+def test_the_same_title_in_two_novels_is_two_different_keys():
+    a, b = _js_chapter_keys([["654cae46b04", "Chapter 1"], ["64f69b0c181", "Chapter 1"]])
+    assert a != b
+
+
+def test_the_same_chapter_spelt_messily_is_one_key():
+    a, b = _js_chapter_keys([["654cae46b04", "Chapter 1"],
+                             ["654cae46b04", "  CHAPTER  1 "]])
+    assert a == b
+
+
+def test_the_separator_cannot_be_spelt_by_the_inputs():
+    """The bug this catches nearly shipped.
+
+    An escaping slip turned the separator into a plain SPACE, and a space can occur in a
+    normalised title -- which makes ("a b", "c") and ("a", "b c") the same key, so one
+    novel's chapter can answer for another's. The obvious test (two novels, same title)
+    passes with a space separator and would not have caught it.
+    """
+    a, b = _js_chapter_keys([["a b", "c"], ["a", "b c"]])
+    assert a != b
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
