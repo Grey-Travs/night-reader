@@ -22,12 +22,19 @@ new translations are clean. This repairs the ones already on disk.
 
 Two rules, both deliberately conservative — this rewrites the prose of hundreds of files:
 
-* a leading block is removed only when it is a bare number REPEATING that chapter's own
-  number, taken from its source tab's header (``is_chapter_number_block``). An in-story
-  part marker that differs, or any number in a chapter whose source has no header to
-  compare against, is left alone.
+* a leading block is removed only when ``sanitize.strip_leading_heading`` recognises it
+  as the export's own chapter heading: a line reading only "Chapter 203"/"Episode 188",
+  a number carrying markdown heading marks ("# 101"), or the novel's translated title
+  sitting directly on top of one of those. An unmarked bare number is removed only when
+  it REPEATS that chapter's own number from its source tab — so an in-story part marker
+  that differs ("33." inside chapter 17) is left alone.
 * a trailing block is removed only when it matches the copyright notice, in Korean or in
   the English the model produced for it.
+
+The first rule used to require the chapter's own number for every shape, which is why
+repeated runs kept reporting "0 remaining" while leaked headings were still on screen:
+the chapters that leak are precisely the ones whose source number could not be read, and
+without one the check returned False and removed nothing.
 
 Anything that can't be accounted for is reported and skipped, never guessed at.
 
@@ -51,8 +58,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from translation_bot.pipeline import _AUDIT_TRANSLATION_MARK  # noqa: E402
 from translation_bot.sanitize import (  # noqa: E402
-    is_chapter_number_block,
     strip_export_footer,
+    strip_leading_heading,
     strip_source_header,
 )
 from translation_bot.text_source import records_to_chapters  # noqa: E402
@@ -119,48 +126,25 @@ def source_numbers(pdir: pathlib.Path) -> dict[int, str] | None:
     return out
 
 
-# The English the model produces for the header line: "Chapter 161", sometimes as a
-# markdown heading. is_chapter_number_block only knows the bare/Korean forms, because the
-# SOURCE never contains this one -- it exists only after translation.
-_EN_CHAPTER = re.compile(r"^#{0,6}\s*chapter\s+0*(\d{1,5})\s*$", re.I)
-_SENTENCE_END = re.compile(r"[.!?…][\"”’]?\s*$")
-
-
-def _is_chapter_line(block: str, number: str | None) -> bool:
-    """A leading \"Chapter 161\" that merely repeats this chapter's own number."""
-    if not number:
-        return False
-    m = _EN_CHAPTER.match((block or "").strip())
-    return bool(m) and int(m.group(1)) == int(number)
-
-
-def _looks_like_a_title(block: str) -> bool:
-    """Short, and not a sentence. Never enough on its own -- see clean_prose."""
-    b = (block or "").strip()
-    return bool(b) and len(b) <= 80 and not _SENTENCE_END.search(b)
-
-
 def clean_prose(prose: str, number: str | None) -> tuple[str, bool, bool]:
-    """Return (cleaned, dropped_number, dropped_notice) for one chapter's English."""
-    blocks = [b for b in SEP_RE.split((prose or "").strip()) if b.strip()]
-    dropped_number = False
-    # The novel's translated title, when it sits directly above the chapter line.
-    #
-    # Removed ONLY when the very next block is a confirmed repeat of this chapter's own
-    # number. On its own a short opening line is indistinguishable from an in-story
-    # section heading, and this rewrites real prose -- so it needs the corroboration.
-    if (len(blocks) >= 2 and _looks_like_a_title(blocks[0])
-            and (_is_chapter_line(blocks[1], number)
-                 or is_chapter_number_block(blocks[1], number))):
-        blocks = blocks[1:]
-        dropped_number = True
-    if blocks and (is_chapter_number_block(blocks[0], number)
-                   or _is_chapter_line(blocks[0], number)):
-        blocks = blocks[1:]
-        dropped_number = True
-    body = "\n\n".join(blocks)
-    trimmed = strip_export_footer(body)
-    return trimmed, dropped_number, trimmed != body
+    """Return (cleaned, dropped_number, dropped_notice) for one chapter's English.
+
+    The heading rules live in ``sanitize.strip_leading_heading`` so that this repair and
+    the pipeline that prevents a repeat cannot drift apart. ``number`` is still passed
+    where it is known — it is what allows an UNMARKED bare number to be removed — but it
+    is no longer required, which is the whole point: the chapters that survived every
+    earlier run are exactly the ones whose source number could not be read.
+    """
+    body, dropped_number = strip_leading_heading(prose or "", number)
+    # Compare on the SAME normalisation strip_export_footer emits — it splits on blank
+    # lines and rejoins with exactly one. strip_leading_heading deliberately returns the
+    # text byte-for-byte when it drops nothing, so comparing the footer's output against
+    # that raw text reports every file whose spacing merely differs (a trailing newline
+    # is enough) as one carrying a notice: 6,748 of them, against a real population of
+    # about 132.
+    normalized = "\n\n".join(b for b in SEP_RE.split(body.strip()) if b.strip())
+    trimmed = strip_export_footer(normalized)
+    return trimmed, dropped_number, trimmed != normalized
 
 
 def process(path: pathlib.Path, number: str | None, apply: bool,

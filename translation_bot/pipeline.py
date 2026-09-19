@@ -19,7 +19,13 @@ from .locks import file_lock
 from .docs_extract import Chapter, extract_chapters, fetch_document, hangul_fraction
 from .glossary import Glossary, queue_new_terms
 from .google_auth import build_docs_service, get_credentials
-from .sanitize import remove_snippets, strip_export_footer, strip_reasoning, strip_source_header
+from .sanitize import (
+    remove_snippets,
+    strip_export_footer,
+    strip_leading_heading,
+    strip_reasoning,
+    strip_source_header,
+)
 from . import state as state_mod
 from .state import State
 from .translator import (
@@ -232,6 +238,33 @@ def write_audit(
     return path
 
 
+def _drop_leaked_heading(result: TranslationResult, chapter: Chapter) -> None:
+    """Remove the export's chapter heading if the model translated it into the prose.
+
+    ``_for_model`` strips that header before the model ever sees it, so this is only
+    reached when the source header was not recognisable -- a tab missing its "NNN화"
+    line, or a title sitting somewhere the source stripper does not look. The model then
+    faithfully translates it, and the chapter is saved opening with the novel's title and
+    "Chapter 203".
+
+    Done HERE, before validation, rather than at the write sites: the length and
+    paragraph checks compare the output against the stripped source, so a header left in
+    makes a faithful translation look long by one paragraph.
+    """
+    cleaned, dropped = strip_leading_heading(result.prose, _source_number(chapter))
+    if dropped:
+        result.prose = cleaned
+        result.warnings = [*result.warnings, "removed a translated export heading"]
+
+
+def _source_number(chapter: Chapter) -> str | None:
+    """This chapter's own number per its source header, when the source still has one."""
+    try:
+        return strip_source_header(chapter.text)[1]
+    except Exception:  # noqa: BLE001 -- a number is an optional hint, never a hard need
+        return None
+
+
 def _translate_with_retry(
     translator: Translator,
     chapter: Chapter,
@@ -245,6 +278,7 @@ def _translate_with_retry(
     extra = cfg.translation.extra_instruction
 
     result = translator.translate_chapter(chapter, relevant, extra_instruction=extra, hooks=hooks)
+    _drop_leaked_heading(result, chapter)
     state.add_usage(chapter.index, result.usage, result.cost_usd)
     state.update(chapter.index, status=state_mod.STATUS_TRANSLATED)
     validation = validate_translation(chapter, result.prose, cfg.validation, relevant)
@@ -258,6 +292,7 @@ def _translate_with_retry(
         hooks.reset("retry")
     retry = translator.translate_chapter(chapter, relevant, extra_instruction=extra,
                                          retry_reminder=True, hooks=hooks)
+    _drop_leaked_heading(retry, chapter)
     state.add_usage(chapter.index, retry.usage, retry.cost_usd)
     retry_validation = validate_translation(chapter, retry.prose, cfg.validation, relevant)
     retry.warnings = ["[retry attempt]", *retry.warnings]

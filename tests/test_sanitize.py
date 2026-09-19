@@ -259,3 +259,127 @@ def test_a_number_that_differs_from_the_chapter_is_in_story_content():
     clean, number = _strip("제목 29화", "33.", "본문.")
     assert number == "29"
     assert clean.startswith("33.")
+
+# ---- the same header, surviving into the TRANSLATION ---------------------
+
+# strip_source_header runs before the model sees the chapter, so everything below is the
+# case where it could NOT recognise the header -- a tab with no "NNN화" line, or a title
+# the source stripper does not look for. The model then translates the header along with
+# the prose and the chapter is saved opening with it.
+#
+# Every input here is the real leading block of a real file in projects/, because the
+# rule they pin is the one that failed: each earlier repair needed the chapter's own
+# number before it would remove anything, and these are precisely the chapters whose
+# number could not be read. The cleanup kept reporting "0 remaining" while the headings
+# were still on screen.
+
+from translation_bot.sanitize import strip_leading_heading  # noqa: E402
+
+BODY = "He opened the door and stepped into the corridor."
+
+
+def _head(*blocks, number=None):
+    return strip_leading_heading(SEP.join(blocks), number)
+
+
+def test_the_title_and_the_chapter_line_both_come_off_without_a_known_number():
+    # projects/756cf21e6aeb/chapters/chapter-03.md
+    clean, dropped = _head("# What It Means to Become Gong's Older Brother",
+                           "Chapter 203", BODY)
+    assert dropped is True
+    assert clean == BODY
+
+
+def test_a_bold_chapter_line_is_the_same_line():
+    # chapter-08.md -- the model emphasises it about half the time.
+    clean, dropped = _head("# On Becoming the Top's Older Brother", "**Chapter 208**", BODY)
+    assert dropped is True
+    assert clean == BODY
+
+
+def test_the_title_is_matched_by_shape_not_by_name():
+    # The reason the title cannot be matched against the novel's name: the model
+    # re-translates that one source line differently in every chapter. These four are
+    # the same Korean header from four consecutive files.
+    for title in ("What It Means to Be the Top's Hyung",
+                  "On Becoming the Lead's Older Brother",
+                  "What It Means to Be the Duke's Older Brother",
+                  "**On Becoming Gong's Older Brother**"):
+        clean, dropped = _head(title, "Chapter 204", BODY)
+        assert dropped is True, title
+        assert clean == BODY, title
+
+
+def test_a_chapter_line_with_no_title_over_it_still_comes_off():
+    # chapter-02.md opens straight onto the number, with no title block at all.
+    clean, dropped = _head("Chapter 202", BODY)
+    assert dropped is True
+    assert clean == BODY
+
+
+def test_episode_counts_as_a_chapter_marker():
+    # projects/b65beb851d22/chapters/chapter-088.md
+    clean, dropped = _head("Episode 188", BODY)
+    assert dropped is True
+    assert clean == BODY
+
+
+def test_a_number_carrying_heading_marks_is_export_cruft():
+    # "# 101" / "#61": eleven projects carry one of these, each at a constant offset from
+    # the chapter index and covering essentially every file in the project.
+    for block in ("# 101", "#61", "**160**", "#101."):
+        clean, dropped = _head(block, BODY)
+        assert dropped is True, block
+        assert clean == BODY, block
+
+
+def test_an_unmarked_bare_number_is_still_in_story_content():
+    # The documented false positive, and the one shape the marks rule exists to spare:
+    # chapter-17 of one project opens "33.", chapter-79 opens "55.". Without marks and
+    # without a number to match, this stays.
+    clean, dropped = _head("33.", BODY)
+    assert dropped is False
+    assert clean.startswith("33.")
+
+
+def test_an_unmarked_bare_number_still_comes_off_when_it_is_the_chapter_number():
+    clean, dropped = _head("33.", BODY, number="33")
+    assert dropped is True
+    assert clean == BODY
+
+
+def test_a_title_with_no_heading_under_it_is_left_alone():
+    # A short opening line on its own is an in-story section heading. The chapter line
+    # beneath it is the only thing that makes it a header.
+    clean, dropped = _head("[7. What Happened at the Party]", BODY)
+    assert dropped is False
+    assert clean.startswith("[7. What Happened at the Party]")
+
+
+def test_a_sentence_that_merely_mentions_a_chapter_is_not_a_heading():
+    opening = "Chapter 203 of the manual said nothing about this."
+    clean, dropped = _head(opening, BODY)
+    assert dropped is False
+    assert clean.startswith(opening)
+
+
+def test_a_chapter_line_deeper_in_the_prose_is_untouched():
+    clean, dropped = _head(BODY, "Chapter 203", "More prose.")
+    assert dropped is False
+    assert "Chapter 203" in clean
+
+
+def test_nothing_to_strip_returns_the_text_byte_for_byte():
+    # This rewrites files in place, so a no-op must not renormalise the prose it was not
+    # asked to touch -- splitting on blank lines and rejoining would do exactly that.
+    original = "First line." + (chr(10) * 3) + "Second, after a wide gap." + chr(10)
+    clean, dropped = strip_leading_heading(original)
+    assert dropped is False
+    assert clean == original
+
+
+def test_the_body_below_a_dropped_heading_keeps_its_own_spacing():
+    original = SEP.join(["Chapter 202", "First." + (chr(10) * 3) + "Second."])
+    clean, dropped = strip_leading_heading(original)
+    assert dropped is True
+    assert clean == "First." + (chr(10) * 3) + "Second."

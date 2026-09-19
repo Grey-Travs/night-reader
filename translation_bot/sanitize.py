@@ -253,6 +253,98 @@ def strip_source_header(text: str) -> tuple[str, str | None]:
     return "\n\n".join(blocks[i:]).strip(), number
 
 
+# --- the same header, but on the OUTPUT side ------------------------------------------
+
+# Markdown emphasis/heading marks, removed before a block is matched so that "# 101",
+# "**Chapter 208**" and "Chapter 208" all reduce to the same thing.
+_HEADING_MARKS = "#*_ \t-–—:·|"
+
+# A block whose ENTIRE content is a chapter marker plus a number. The marker WORD is what
+# makes this safe without knowing the chapter's own number: prose does not open with a
+# line reading only "Chapter 203".
+_LINE_CHAPTER = re.compile(r"^(?:chapter|ch|episode|ep)\s*\.?\s*0*(\d{1,5})$", re.I)
+# A block whose entire content is a number. Only cruft when marks make it a heading.
+_LINE_NUMBER = re.compile(r"^0*(\d{1,5})\s*[.화]?$")
+
+
+def _heading_number(block: str, number: str | None = None) -> str | None:
+    """The chapter number a block announces, or None when it is not a chapter heading.
+
+    Three shapes qualify, and one deliberately does not:
+
+    * ``Chapter 203`` / ``**Chapter 208**`` / ``Episode 188`` — the marker word carries
+      the meaning, so no known chapter number is needed to be sure.
+    * ``# 101`` / ``#61`` — a bare number counts only when markdown marks make it a
+      heading. Measured: eleven projects carry one of these, each at a CONSTANT offset
+      from the chapter index and covering essentially every file in the project
+      (119/119, 78/78, 77/77, 56/56, 45/45, 23/23) — a per-export artefact, not story.
+    * ``33.`` with no marks — NOT a heading. That is the documented in-story part marker
+      (chapter-17 of one project opens "33.", chapter-79 opens "55."), so it is kept
+      unless it repeats the chapter's own number — the same rule, and the same reasoning,
+      as :func:`is_chapter_number_block`.
+    """
+    raw = (block or "").strip()
+    core = raw.strip(_HEADING_MARKS).strip()
+    m = _LINE_CHAPTER.match(core)
+    if m:
+        return m.group(1)
+    m = _LINE_NUMBER.match(core)
+    if m and (core != raw or is_chapter_number_block(core, number)):
+        return m.group(1)
+    return None
+
+
+def _is_title_line(block: str) -> bool:
+    """Short, not a sentence, and not itself a chapter line. Never enough on its own."""
+    b = (block or "").strip()
+    return (bool(b) and len(b) <= 80 and not _SENTENCE_END.search(b)
+            and _heading_number(b) is None)
+
+
+def _drop_leading_blocks(text: str, n: int) -> str:
+    """Remove the first ``n`` blocks, leaving the rest byte-for-byte as it was.
+
+    Splitting and rejoining would also renormalise every separator in the body, quietly
+    rewriting prose this function was not asked to touch.
+    """
+    s = (text or "").lstrip()
+    for _ in range(n):
+        parts = SEP_RE.split(s, maxsplit=1)
+        s = parts[1].lstrip() if len(parts) > 1 else ""
+    return s
+
+
+def strip_leading_heading(text: str, number: str | None = None) -> tuple[str, bool]:
+    """Drop the export's chapter heading from the top of a TRANSLATED chapter.
+
+    :func:`strip_source_header` removes this before the model ever sees it — but only
+    when the header is recognisable in the source. When it is not, the model translates
+    the header along with the prose, and the saved chapter opens with the novel's title
+    and "Chapter 203", to be deleted by hand.
+
+    Every other rule in this module needs the chapter's own number before it will act,
+    and that is exactly what is missing in the chapters that still leak: with ``number``
+    unknown, ``is_chapter_number_block`` and the repair tool's chapter-line check both
+    return False, so nothing is removed no matter how many times the cleanup is run.
+    This rule does not need one.
+
+    The title above the heading is dropped only WITH a heading beneath it. Alone, a short
+    opening line is indistinguishable from an in-story section heading — and it cannot be
+    matched by name either, because the model re-translates it differently every time
+    ("On Becoming the Top's Older Brother", "What It Means to Be the Duke's Older
+    Brother", "What It Means to Become the Gong's Hyung" — all the same source line). The
+    heading below it is the only reliable evidence that it is one.
+
+    Returns ``(cleaned, dropped)``, and the text unchanged when nothing qualifies.
+    """
+    blocks = [b for b in SEP_RE.split((text or "").strip()) if b.strip()]
+    if len(blocks) >= 2 and _is_title_line(blocks[0]) and _heading_number(blocks[1], number):
+        return _drop_leading_blocks(text, 2).strip(), True
+    if blocks and _heading_number(blocks[0], number):
+        return _drop_leading_blocks(text, 1).strip(), True
+    return text or "", False
+
+
 # The closing rights notice every RIDI export carries, in Korean and in the English the
 # model produces when it translates it instead of dropping it.
 _FOOTER_MARK = re.compile(
