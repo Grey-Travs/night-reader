@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
+import server.posting as posting  # noqa: E402
 from server.titles import site_title_key  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -200,6 +201,66 @@ def test_the_separator_cannot_be_spelt_by_the_inputs():
     """
     a, b = _js_chapter_keys([["a b", "c"], ["a", "b c"]])
     assert a != b
+
+
+# ---- the number a title states ------------------------------------------
+
+# The range control ("delete 201-220") selects chapters by reading the number out of the
+# site's own titles. The browser does the selecting and the app does the naming, so if the
+# two read a title differently the range covers different chapters on each side -- and the
+# thing being selected is deletion from a live paid site.
+
+NUMBER_CASES = [
+    "Chapter 201",
+    "chapter 220",
+    "CHAPTER 7",
+    "Chapter 007",
+    "Chapter 118: The Duel",
+    "Chapter 118 - the aftermath",
+    "Chapter 12a",
+    "Side Chapter 3",
+    "Prologue",
+    "ch",
+    "",
+    "  Chapter 5",
+]
+
+
+def _js_numbers(titles, template):
+    script = (
+        "const { nrChapterNumber } = require("
+        + json.dumps(TITLES_JS.replace(os.sep, "/"))
+        + ");"
+        "const t = " + json.dumps(titles) + ";"
+        "const tmpl = " + json.dumps(template) + ";"
+        "console.log(JSON.stringify(t.map((x) => nrChapterNumber(x, tmpl))))"
+    )
+    result = subprocess.run([_NODE, "-e", script],
+                            capture_output=True, text=True, encoding="utf-8")
+    assert result.returncode == 0, f"node failed: {result.stderr}"
+    return json.loads(result.stdout)
+
+
+def test_both_sides_read_the_same_number_out_of_a_title():
+    template = "Chapter {n}"
+    pattern = posting.title_number_re({"site": {"title_template": template}})
+    js = _js_numbers(NUMBER_CASES, template)
+    for title, from_js in zip(NUMBER_CASES, js):
+        m = pattern.match(title)
+        from_py = int(m.group(1)) if m else None
+        assert from_py == from_js, (
+            f"{title!r}: python says {from_py}, the browser says {from_js} — a range would cover different chapters on each side"
+        )
+
+
+def test_the_number_follows_a_custom_template_on_both_sides():
+    template = "Ep. {n}"
+    pattern = posting.title_number_re({"site": {"title_template": template}})
+    titles = ["Ep. 7", "Chapter 7", "Ep. 12: after"]
+    js = _js_numbers(titles, template)
+    for title, from_js in zip(titles, js):
+        m = pattern.match(title)
+        assert (int(m.group(1)) if m else None) == from_js, title
 
 
 if __name__ == "__main__":

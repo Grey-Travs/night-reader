@@ -601,8 +601,14 @@ async function apiCreateChapter(title) {
   return data
 }
 
-async function apiSaveChapter(data, { state, coins, html }) {
+async function apiSaveChapter(data, { state, coins, html, rawPages }) {
   const now = Date.now()
+  // rawPages is the site's OWN encoded pages value, handed straight back.
+  //
+  // Re-encoding from html flattens a chapter into ONE page named '' -- which is
+  // exactly right for a chapter this app created, and wrong for one typed on the
+  // site with several pages or a page name. A change that is only about VISIBILITY
+  // has no business rewriting the text, so hideRange passes the original through.
   const pages = html === undefined ? undefined
     : [{ displayName: '', note: html }]
   return api('PUT', '/app/chapter', {
@@ -645,7 +651,8 @@ async function apiSaveChapter(data, { state, coins, html }) {
     custom_date: false,
     emails: false,
     cache: JSON.stringify(new Date().toISOString()),
-  }, pages ? { pages: b64(JSON.stringify(pages)) } : undefined)
+  }, rawPages !== undefined ? { pages: rawPages }
+    : pages ? { pages: b64(JSON.stringify(pages)) } : undefined)
 }
 
 // A chapter that was created but not finished, remembered so a retry continues into it.
@@ -2070,6 +2077,123 @@ async function postBatch({ count, state, upTo, run = null }) {
  * ten already-published chapters would blank them. Re-sending the same HTML that Night
  * Reader generated is both safe and idempotent: the worst case is writing identical content.
  */
+// Armed by a preview and spent by the next press. A range that changes disarms it.
+let armedHide = null
+
+/**
+ * Hide a range of chapters from readers -- "201 to 220" rather than one name at a time.
+ *
+ * Two presses, never one. The first reads the site and prints exactly which chapters it
+ * found and what state they are in, and changes nothing; the second does the work. That
+ * is the same shape as the posting run -- a plan you read, then a single Start -- and it
+ * matters more here, because this acts on chapters readers may have paid for.
+ *
+ * The chapters are chosen by the number in the SITE's own titles, read with the inverse
+ * of the adapter's title template (nrChapterNumber, twinned with title_number_re in
+ * Python and tested for parity). So "201 to 220" means what the site calls 201 to 220,
+ * which is the thing you can see on the page, not what this app believes it posted.
+ *
+ * Hiding rather than deleting: the site's delete call has never been observed, so there
+ * is nothing to call safely. This uses the PUT that is already proven, is reversible from
+ * the panel's own "Publish private", and takes a chapter away from readers immediately.
+ * To capture the real delete: remove ONE chapter on the site by hand, then press "Show
+ * requests" -- every non-GET is recorded with its body, which is exactly how the posting
+ * API was found.
+ */
+async function hideRange(from, to) {
+  if (busy) return
+  const armed = !!(armedHide && armedHide.from === from && armedHide.to === to
+    && Date.now() - armedHide.at < 120000)
+  busy = true
+  startLog(armed ? `# Hiding chapters ${from}-${to}`
+    : `# What hiding chapters ${from}-${to} would do`)
+  const done = []
+  let stopped = null
+  try {
+    if (!ctx.found) throw new Error('no Night Reader series publishes to this page')
+    if (!(from >= 1) || !(to >= from)) {
+      throw new Error('give a range like 201 to 220 -- the second number cannot be lower')
+    }
+    const pinned = uidsFromUrl()
+    const adapter = await adapterOnce()
+    const template = (adapter?.site || {}).title_template
+
+    const rows = await refreshChapterIndex(pinned)
+    const found = rows
+      .map((r) => ({ r, n: nrChapterNumber(r.displayName, template) }))
+      .filter((x) => x.n !== null && x.n >= from && x.n <= to)
+      .sort((a, b) => a.n - b.n)
+    if (!found.length) {
+      throw new Error(`the site has no chapters numbered ${from} to ${to} in this novel`)
+    }
+
+    say(`
+${found.length} chapter(s) on the site in that range:`)
+    for (const x of found) {
+      const st = String(x.r.state || '').toLowerCase()
+      const paid = Number(x.r.coins) > 0 ? `${x.r.coins} coins` : 'free'
+      say(`  ${x.r.displayName}  ${st}  ${paid}`)
+    }
+    const todo = found.filter((x) => String(x.r.state || '').toLowerCase() !== 'private')
+    if (!todo.length) throw new Error('every one of them is already hidden')
+
+    if (!armed) {
+      armedHide = { from, to, at: Date.now() }
+      say(`
+NOTHING HAS CHANGED. Press Hide again within two minutes to hide `
+        + `${todo.length} of them; change either number to call it off.`)
+      return
+    }
+    armedHide = null
+
+    for (const [i, x] of todo.entries()) {
+      say(`
+———— ${i + 1} of ${todo.length}: ${x.r.displayName} ————`)
+      // Read the chapter back WITH its text, so the save can hand the site its own bytes
+      // rather than a re-encoding of them. A PUT with no pages body can be read as "no
+      // pages", which would empty the chapter instead of hiding it.
+      const res = await api('GET', '/app/chapter', {
+        studio_uid: pinned.studio_uid, series_uid: pinned.series_uid,
+        uid: x.r.uid, pages: true,
+      })
+      const list = Array.isArray(res?.data) ? res.data
+        : res?.data && typeof res.data === 'object' ? [res.data] : []
+      const full = list.find((c) => String(c?.uid || '') === String(x.r.uid)) || list[0]
+      if (!full || full.pages === undefined) {
+        throw new Error('could not read its text back, so hiding it might blank it')
+      }
+      const saved = await apiSaveChapter(full, {
+        state: 'private', coins: Number(x.r.coins) || 0, rawPages: full.pages,
+      })
+      const after = saved?.data || {}
+      if (String(after.state).toLowerCase() !== 'private') {
+        throw new Error(`it saved as "${after.state}" instead of private`)
+      }
+      say('    hidden from readers');
+      done.push(x.r.displayName)
+      CHAPTERS.set(chapterKey(pinned.series_uid, x.r.displayName),
+        { ...x.r, state: 'private' })
+      if (i < todo.length - 1) await sleep(1200)
+    }
+  } catch (e) {
+    stopped = e.message
+  } finally {
+    busy = false
+  }
+
+  if (done.length) {
+    say(`
+====
+HID ${done.length} chapter(s). They are still on the site and still in `
+      + `its list -- readers just cannot open them. "Publish private" puts them back.`)
+  }
+  if (stopped) say(`
+====
+STOPPED: ${stopped}`)
+  if (done.length) setTimeout(() => location.reload(), 2000)
+}
+
+
 async function publishPosted() {
   if (busy) return
   busy = true
@@ -2199,6 +2323,15 @@ function build() {
       <button class="nr-btn nr-go" data-act="publish">Publish private</button>
     </div>
     <div class="nr-row">
+      <label class="nr-lbl">hide ch
+        <input class="nr-from" type="number" min="1" max="9999" placeholder="from">
+      </label>
+      <label class="nr-lbl">to
+        <input class="nr-to" type="number" min="1" max="9999" placeholder="to">
+      </label>
+      <button class="nr-btn nr-go" data-act="hide">Hide range</button>
+    </div>
+    <div class="nr-row">
       <button class="nr-btn" data-act="check">Check this novel</button>
       <button class="nr-btn nr-go" data-act="import">Import it</button>
       <button class="nr-btn" data-act="catalogue">Send novel list</button>
@@ -2309,6 +2442,11 @@ function build() {
       const count = Math.max(1, Math.min(200, Number(box?.value) || 1))
       const upTo = Number(panel.querySelector('.nr-upto')?.value) || 0
       postBatch({ count, upTo, state: act === 'public' ? 'Public' : 'Private' })
+    }
+    if (act === 'hide') {
+      const from = Number(panel.querySelector('.nr-from')?.value) || 0
+      const to = Number(panel.querySelector('.nr-to')?.value) || 0
+      hideRange(from, to)
     }
     if (act === 'publish') publishPosted()
     if (act === 'posted') showPosted()
