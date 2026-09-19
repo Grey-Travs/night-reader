@@ -40,6 +40,7 @@ It is a dry run by default; nothing is written without ``--apply``.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import pathlib
 import re
@@ -118,11 +119,43 @@ def source_numbers(pdir: pathlib.Path) -> dict[int, str] | None:
     return out
 
 
+# The English the model produces for the header line: "Chapter 161", sometimes as a
+# markdown heading. is_chapter_number_block only knows the bare/Korean forms, because the
+# SOURCE never contains this one -- it exists only after translation.
+_EN_CHAPTER = re.compile(r"^#{0,6}\s*chapter\s+0*(\d{1,5})\s*$", re.I)
+_SENTENCE_END = re.compile(r"[.!?…][\"”’]?\s*$")
+
+
+def _is_chapter_line(block: str, number: str | None) -> bool:
+    """A leading \"Chapter 161\" that merely repeats this chapter's own number."""
+    if not number:
+        return False
+    m = _EN_CHAPTER.match((block or "").strip())
+    return bool(m) and int(m.group(1)) == int(number)
+
+
+def _looks_like_a_title(block: str) -> bool:
+    """Short, and not a sentence. Never enough on its own -- see clean_prose."""
+    b = (block or "").strip()
+    return bool(b) and len(b) <= 80 and not _SENTENCE_END.search(b)
+
+
 def clean_prose(prose: str, number: str | None) -> tuple[str, bool, bool]:
     """Return (cleaned, dropped_number, dropped_notice) for one chapter's English."""
     blocks = [b for b in SEP_RE.split((prose or "").strip()) if b.strip()]
     dropped_number = False
-    if blocks and is_chapter_number_block(blocks[0], number):
+    # The novel's translated title, when it sits directly above the chapter line.
+    #
+    # Removed ONLY when the very next block is a confirmed repeat of this chapter's own
+    # number. On its own a short opening line is indistinguishable from an in-story
+    # section heading, and this rewrites real prose -- so it needs the corroboration.
+    if (len(blocks) >= 2 and _looks_like_a_title(blocks[0])
+            and (_is_chapter_line(blocks[1], number)
+                 or is_chapter_number_block(blocks[1], number))):
+        blocks = blocks[1:]
+        dropped_number = True
+    if blocks and (is_chapter_number_block(blocks[0], number)
+                   or _is_chapter_line(blocks[0], number)):
         blocks = blocks[1:]
         dropped_number = True
     body = "\n\n".join(blocks)
@@ -170,7 +203,11 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="write changes (backs up first)")
     ap.add_argument("--project", help="limit to one project id")
-    ap.add_argument("--stamp", default="20260828", help="backup folder suffix")
+    # Today, not a fixed date. A hardcoded stamp means every run writes into the SAME
+    # backup folder, so a second run overwrites the first run's originals -- which is the
+    # one thing a backup exists to prevent. Pass --stamp to write beside an earlier run.
+    ap.add_argument("--stamp", default=datetime.now().strftime("%Y%m%d"),
+                    help="backup folder suffix (defaults to today)")
     args = ap.parse_args()
 
     if not PROJECTS.is_dir():

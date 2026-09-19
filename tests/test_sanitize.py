@@ -24,6 +24,7 @@ from translation_bot.sanitize import (  # noqa: E402
     has_korean_leak,
     remove_korean_echoes,
     strip_reasoning,
+    strip_source_header,
 )
 
 # --- PURE-meta leaks: pure junk, safe to DELETE (no real prose to lose) -----------------
@@ -175,3 +176,86 @@ def _run_standalone():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_standalone() else 0)
+
+
+
+# ---- the export header, which must never reach the translator ------------
+
+# The shape that prompted these: a RIDI export repeats the novel's title on a line of
+# its own, and repeats the chapter number too. Whatever survives here is fed to the
+# model, and the model sometimes TRANSLATES it instead of dropping it -- which is how a
+# saved chapter came to open with the novel's title and "Chapter 161", to be deleted by
+# hand. Measured on the corpus: 207 of 4,110 source chapters carried a stray title line.
+
+SEP = chr(10) + chr(10)
+
+
+def _strip(*blocks):
+    return strip_source_header(SEP.join(blocks))
+
+
+def test_the_repeated_title_and_number_are_both_dropped():
+    clean, number = _strip(
+        "ridibooks.com/books/2259040008/view",
+        "공의 형이 된다는 건 161화",
+        "5-6 minutes",
+        "공의 형이 된다는 건",      # the title, again, on its own
+        "161화",                    # and the number, again
+        "그는 문을 열었다.",
+    )
+    assert number == "161"
+    assert clean == "그는 문을 열었다."
+
+
+def test_a_finale_marker_after_the_number_still_reads_as_a_header():
+    # "147화 (완결)" -- anchoring hard at the end missed these, so the number was never
+    # read AND the whole line survived into the chapter.
+    clean, number = _strip(
+        "ridibooks.com/books/3302054804/view",
+        "무슠 버스에 빙의했다 147화 (완결)",
+        "4 minutes",
+        "진짜 본문이다.",
+    )
+    assert number == "147"
+    assert clean == "진짜 본문이다."
+
+
+def test_a_title_above_the_chapter_line_is_still_a_header():
+    # One real export puts the title FIRST. The scan used to break on it and strip
+    # nothing at all, so the entire header went to the model.
+    clean, number = _strip(
+        "Are You Out of Your Mind? (제정신이니?)",
+        "Chapter 16",
+        "He opened the door.",
+    )
+    assert number == "16"
+    assert clean == "He opened the door."
+
+
+# ---- and the other side of the contract: prose is never eaten -------------
+
+
+def test_a_short_opening_line_that_is_not_the_title_is_kept():
+    # A real line from the corpus: an in-story section heading. It is short, Korean and
+    # carries no sentence punctuation -- exactly the shape a title has -- so the ONLY
+    # thing separating them is that this one does not repeat the header's title.
+    clean, _ = _strip(
+        "공의 형이 된다는 건 43화",
+        "6-7 minutes",
+        "[7. 파티에서 생긴 일]",
+        "그는 문을 열었다.",
+    )
+    assert clean.startswith("[7. 파티에서 생긴 일]")
+
+
+def test_a_sentence_that_merely_contains_the_chapter_marker_is_not_a_header():
+    clean, number = _strip("그는 100화를 보았다.", "다음 문장.")
+    assert number is None
+    assert clean.startswith("그는 100화를 보았다.")
+
+
+def test_a_number_that_differs_from_the_chapter_is_in_story_content():
+    # The existing contract, re-asserted because the pattern that decides it was widened.
+    clean, number = _strip("제목 29화", "33.", "본문.")
+    assert number == "29"
+    assert clean.startswith("33.")

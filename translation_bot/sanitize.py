@@ -138,10 +138,28 @@ def korean_fraction(text: str) -> float:
 # --- source-export header cruft (ridibooks etc.): URL · title · "4-5 minutes" · "NNN화" ---
 _HDR_URL = re.compile(r"https?://|ridibooks\.com", re.I)
 _HDR_MIN = re.compile(r"^\s*\d+\s*(?:[-–]\s*\d+\s*)?min(?:ute)?s?\.?\s*$", re.I)
-# A header line ENDING in a chapter marker — "NNN화", "Chapter N", or "Title — Chapter N".
-_HDR_ENDNUM = re.compile(r"(?:chapter|ch\.?|episode|ep\.?)\s+(\d+)\s*$|(\d+)\s*화\s*$", re.I)
-# A block that is nothing but a number: "29" / "29."
-_BARE_NUM = re.compile(r"^(\d{1,4})\s*\.?$")
+# A header line ending in a chapter marker: "NNN화", "Chapter N", "Title — Chapter N".
+# A short parenthetical may follow the number -- real headers carry "147화 (완결)" for a
+# finale, and anchoring hard at the end missed those entirely, so the number was never
+# read and the whole line survived into the translation.
+# Anything that ends a real sentence. A header line never does.
+_SENTENCE_END = re.compile(r"[.!?…]\s*$|[”’\"]\s*$")
+
+TAIL = r"(?:\s*[(\[][^)\]]{0,14}[)\]])?\s*$"
+_HDR_ENDNUM = re.compile(r"(?:chapter|ch\.?|episode|ep\.?)\s+(\d+)" + TAIL + r"|(\d+)\s*화" + TAIL, re.I)
+# A block that is nothing but a number: "29", "29." or "29화" -- the export repeats
+# the chapter number under the header, sometimes bare and sometimes still carrying the
+# Korean marker. Still only DROPPED when it equals the number the header gave us.
+_BARE_NUM = re.compile(r"^(\d{1,4})\s*(?:\.|화)?$")
+
+# Markdown heading marks and the punctuation an export puts between a title and its
+# chapter number, so "# Title" and "Title —" compare equal to "Title".
+_TITLE_MARKS = "#*_-–—:·|"
+
+
+def _title_key(block: str) -> str:
+    """A title reduced to what it says, for comparing one against another."""
+    return " ".join(block.strip().strip(_TITLE_MARKS).split()).casefold()
 
 
 def is_chapter_number_block(block: str, number: str | None) -> bool:
@@ -177,6 +195,7 @@ def strip_source_header(text: str) -> tuple[str, str | None]:
     """
     blocks = SEP_RE.split((text or "").strip())
     number: str | None = None
+    title: str | None = None
     i = 0
     while i < len(blocks):
         b = blocks[i].strip()
@@ -186,14 +205,51 @@ def strip_source_header(text: str) -> tuple[str, str | None]:
         if _HDR_MIN.match(b):
             i += 1
             continue
+        # A title can come FIRST, above the chapter line -- one real export reads
+        # "Are You Out of Your Mind? (제정신이니?)" and only then "Chapter 16". The scan
+        # used to break on that first line and strip nothing at all, so the whole header
+        # went to the translator. Consumed only when a chapter line really does follow
+        # within the next two blocks, and only for a short line carrying no sentence
+        # punctuation -- prose is never this shape.
+        if (len(b) <= 80 and not _SENTENCE_END.search(b)
+                and any(_HDR_ENDNUM.search(x.strip()) and len(x.strip()) <= 80
+                        for x in blocks[i + 1:i + 3])):
+            if not title:
+                title = _title_key(b)
+            i += 1
+            continue
         m = _HDR_ENDNUM.search(b)
         if m and len(b) <= 80:        # "114화" / "Chapter 114" / "<Title> Chapter 114"
             number = number or m.group(1) or m.group(2)
+            # Remember the title this line carries, so a repeat of it on its own can
+            # be dropped later without guessing what the novel is called.
+            head = _title_key(b[:m.start()])
+            if head:
+                title = title or head
             i += 1
             continue
         break
-    if i < len(blocks) and is_chapter_number_block(blocks[i], number):
-        i += 1
+    # The export then repeats the NOVEL TITLE on a line of its own, under the header
+    # line that carried it with the chapter number -- and, separately, repeats the
+    # chapter number bare. Either can come first, so both are dropped in either order.
+    #
+    # Measured: 207 of 4,110 source chapters reached the translator with that stray
+    # title line still on top. The model usually drops it; when it does not, the saved
+    # translation opens with the novel's title and "Chapter 161", which then has to be
+    # deleted by hand, chapter by chapter.
+    #
+    # Only an EXACT repeat of the title the header already gave us is dropped, never a
+    # guess -- the same discipline as the bare number, where one that DIFFERS from the
+    # chapter's own is in-story content and is kept.
+    while i < len(blocks):
+        b = blocks[i].strip()
+        if title and _title_key(b) == title:
+            i += 1
+            continue
+        if is_chapter_number_block(b, number):
+            i += 1
+            continue
+        break
     return "\n\n".join(blocks[i:]).strip(), number
 
 
