@@ -369,6 +369,46 @@ def test_the_tailnet_name_is_trusted_only_while_remote_access_is_on(monkeypatch)
     assert "box.tailnet.ts.net" in remote.allowed_hosts()
 
 
+# ---- every link handed to a phone carries the key -------------------------
+
+
+def test_the_https_link_offered_for_installing_carries_the_key(here, monkeypatch):
+    """The bug this exists for, found by actually opening the link.
+
+    A request proxied by `tailscale serve` does NOT arrive from loopback -- measured, it
+    is refused like any other device -- so an https link without the key opens straight
+    onto a 403. The Settings panel built that link by hand, in the one branch whose whole
+    job is to say "ready to install".
+    """
+    monkeypatch.setattr(remote, "_tailscale_json", lambda args: (
+        {"Self": {"DNSName": "box.tailnet.ts.net."}} if args[0] == "status"
+        else {"Web": {"box.tailnet.ts.net:8443": {
+            "Handlers": {"/": {"Proxy": "http://127.0.0.1:8000"}}}}}))
+    token = _enable()
+    serve = here.get("/api/remote").json()["serve"]
+    assert serve["https_url"] == "https://box.tailnet.ts.net:8443"
+    assert serve["phone_url"] == (
+        f"https://box.tailnet.ts.net:8443/phone?{remote.TOKEN_QUERY}={token}")
+
+
+def test_there_is_no_https_link_until_something_is_served(here, monkeypatch):
+    monkeypatch.setattr(remote, "_tailscale_json", lambda args: (
+        {"Self": {"DNSName": "box.tailnet.ts.net."}} if args[0] == "status" else {}))
+    _enable()
+    serve = here.get("/api/remote").json()["serve"]
+    assert serve["https_url"] == ""
+    # Empty rather than a keyless URL: the UI shows the setup command in this case, and a
+    # half-built link would be worse than none.
+    assert serve["phone_url"] == ""
+
+
+def test_a_link_is_never_built_without_a_key(monkeypatch):
+    # phone_link is the single place both links come from, so this covers the http one too.
+    assert remote.phone_link("https://box.ts.net:8443") == ""   # remote access still off
+    _enable()
+    assert remote.phone_link("") == ""
+
+
 # ---- the home-screen icon -------------------------------------------------
 
 

@@ -14,7 +14,8 @@ import { useToast } from '../toast'
 // already be serving something else on 443 — and in the case that prompted this, it is.
 function HomeScreen({ serve, local, onCopy }) {
   if (!local || !serve) return null
-  const { tailnet_name: name, https_url: httpsUrl, serving_other: other, command, would_be: wouldBe } = serve
+  const { tailnet_name: name, https_url: httpsUrl, phone_url: httpsPhone,
+    serving_other: other, command, would_be: wouldBe } = serve
 
   if (!name) {
     return (
@@ -36,13 +37,14 @@ function HomeScreen({ serve, local, onCopy }) {
         <>
           <p className="text-xs text-hint">
             Ready. Open this on the phone, then use Chrome’s menu → <b>Install app</b>. It
-            gets its own icon and opens with no address bar.
+            gets its own icon and opens with no address bar. The key is in the link, so
+            the installed app keeps working after the browser forgets the cookie.
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <code className="min-w-0 flex-1 truncate rounded px-2 py-1.5 font-mono text-xs"
-              style={{ background: 'var(--b-muted-bg)' }}>{httpsUrl}/phone</code>
+              style={{ background: 'var(--b-muted-bg)' }}>{httpsPhone}</code>
             <button className="btn btn-primary px-3 py-1.5 text-xs"
-              onClick={() => onCopy(`${httpsUrl}/phone`, 'Link copied')}>
+              onClick={() => onCopy(httpsPhone, 'Link copied')}>
               Copy
             </button>
           </div>

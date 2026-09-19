@@ -233,7 +233,12 @@ def _remote_state(request: Request) -> dict:
         # Only on the computer, and only when the feature is on: this shells out to the
         # Tailscale CLI twice, which is not something to do on every poll from a phone.
         if doc["enabled"]:
-            state["serve"] = remote.serve_state(PORT)
+            serve = remote.serve_state(PORT)
+            # Built here rather than inside serve_state, which is a pure detector and
+            # has no business knowing the key. Empty until something is served over
+            # https, which is exactly when the UI has no link to offer either.
+            serve["phone_url"] = remote.phone_link(serve["https_url"])
+            state["serve"] = serve
     return state
 
 

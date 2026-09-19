@@ -368,6 +368,20 @@ def allowed_hosts() -> list[str]:
     return hosts
 
 
+def phone_link(origin: str) -> str:
+    """The ``/phone`` link for an origin, key and all, or empty if not set up.
+
+    Every link handed to a phone is built here, which is the point. The https one offered
+    beside the install instructions was assembled in the UI without the key -- and a
+    request proxied by ``tailscale serve`` is NOT exempt from the gate, so that link
+    opened straight onto a 403, in the one place whose whole job was to say "ready".
+    """
+    doc = load()
+    if not (doc["enabled"] and doc["token"] and origin):
+        return ""
+    return f"{origin}/phone?{TOKEN_QUERY}={doc['token']}"
+
+
 def phone_url(port: int = 8000) -> str:
     """The one link to open on the phone, token and all, or empty if not set up.
 
@@ -376,11 +390,8 @@ def phone_url(port: int = 8000) -> str:
     is still reachable by editing the address, which is the right way round -- the rare
     case costs a moment, the common one costs nothing.
     """
-    doc = load()
     rows = addresses(port)
-    if not (doc["enabled"] and doc["token"] and rows):
-        return ""
-    return f'{rows[0]["url"]}/phone?{TOKEN_QUERY}={doc["token"]}'
+    return phone_link(rows[0]["url"]) if rows else ""
 
 
 # ---------------------------------------------------------------------------
