@@ -1923,7 +1923,11 @@ async function postBatch({ count, state, upTo, run = null }) {
         setWatch(`posting ${n + 1}/${q.queue.length}`, true)
         say(`\n———— ${n + 1} of ${q.queue.length} ————`)
         const payload = await ask('payload', {
-          sid: ctx.sid, projectId: item.project_id, index: item.index,
+          // target_id so the payload learns this novel's naming from the same chapter
+          // list the plan did. If the two disagreed, the run would post under a title
+          // nothing is watching for.
+          sid: ctx.sid, targetId: ctx.target_id,
+          projectId: item.project_id, index: item.index,
         })
 
         // The last guard before anything is created, and the only one that is still true
@@ -2106,7 +2110,8 @@ async function publishPosted() {
           + 'be re-sent safely — publish that one on the site by hand')
       }
       const payload = await ask('payload', {
-        sid: ctx.sid, projectId: entry.project_id, index: entry.index,
+        sid: ctx.sid, targetId: ctx.target_id,
+        projectId: entry.project_id, index: entry.index,
       })
       const saved = await apiSaveChapter(ch, {
         state: 'public',

@@ -82,3 +82,87 @@ def site_title_key(title: str | None) -> str:
     text = _INVISIBLE_RE.sub("", text)
     text = _SPACE_RE.sub(" ", text)
     return text.strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# What this novel calls its chapters
+# ---------------------------------------------------------------------------
+
+# A family needs this many members before it is a naming convention rather than a
+# coincidence. Two chapters happening to end in a number is not a pattern; three is.
+MIN_FAMILY = 3
+
+# Greedy prefix, so the LAST run of digits is the one taken: "Ep. 2 Part 3" is part 3 of
+# episode 2, not episode 2. The suffix cannot contain digits, which is what lets
+# "Chapter 118: The Duel" resolve to 118 with ": The Duel" as the suffix.
+_TAIL_NUMBER = re.compile(r"^(.*?)(\d+)(\D*)$")
+
+
+def learn_naming(titles: list[str], chapter_template: str | None = None) -> dict:
+    """What this novel calls its chapters and its side stories, read off the site.
+
+    The problem it solves, measured: ``I Possessed a Character`` has eight side stories
+    live as "Side Chapter 1".."Side Chapter 8", while this app generates "Side Stories N".
+    Nothing matches, so the duplicate guard cannot see them and all eight would post a
+    second time. Every series with side stories has the same zero overlap.
+
+    Rather than hard-code a second convention -- the site's naming is whatever a person
+    typed, and it differs per novel -- the names are learned from the site's own list, and
+    the same learned template is used to GENERATE titles and to match them. That is the
+    point: once generation agrees with the site, matching is just the shared title key and
+    there is no second code path to drift.
+
+    Returns families keyed by their (prefix, suffix), plus the digit-free titles.
+    """
+    families: dict[tuple[str, str], set[int]] = {}
+    singletons: list[str] = []
+    for raw in titles or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        m = _TAIL_NUMBER.match(text)
+        if not m:
+            singletons.append(site_title_key(text))
+            continue
+        prefix, number, suffix = m.group(1), int(m.group(2)), m.group(3)
+        families.setdefault((prefix.strip(), suffix.strip()), set()).add(number)
+
+    real = {key: nums for key, nums in families.items() if len(nums) >= MIN_FAMILY}
+
+    # Which family is the CHAPTERS is not a guess when the adapter already says what they
+    # are called. Anchoring on it matters: picking the largest family instead would, on a
+    # novel with few chapters and many side stories, label the side stories as chapters
+    # and then generate every real chapter under the side name.
+    chapter_key = None
+    if chapter_template:
+        head, _, tail = str(chapter_template).partition("{n}")
+        wanted = (head.strip(), tail.strip())
+        if wanted in families:
+            chapter_key = wanted
+
+    def coverage(nums: set[int]) -> float:
+        """How much of 1..max this family actually fills. The chapter family of a novel
+        runs 1, 2, 3 ...; a side family is smaller and often does not start at 1."""
+        top = max(nums)
+        return len(nums) / top if top else 0.0
+
+    # No template, or the site does not use it: fall back to the fullest-looking family.
+    if chapter_key is None:
+        chapter_key = max(real, key=lambda k: (len(real[k]), coverage(real[k])),
+                          default=None)
+
+    def described(key):
+        if key is None or key not in families:
+            return {"template": "", "seen": 0, "numbers": [], "learned": False}
+        prefix, suffix = key
+        return {"template": f"{prefix} {{n}}{(' ' + suffix) if suffix else ''}".strip(),
+                "seen": len(families[key]), "numbers": sorted(families[key]),
+                "learned": True}
+
+    # Every other numeric family is side content. The largest wins when there are several,
+    # which is the only one worth generating into.
+    side_keys = [k for k in real if k != chapter_key]
+    side_key = max(side_keys, key=lambda k: len(real[k]), default=None)
+
+    return {"chapter": described(chapter_key), "side": described(side_key),
+            "singletons": sorted(set(singletons))}

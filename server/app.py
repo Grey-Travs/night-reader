@@ -3994,12 +3994,13 @@ async def posting_plan(sid: str, target_id: str | None = None,
 
 @app.get("/api/posting/payload")
 async def posting_payload(sid: str, project_id: str, index: int,
-                          site: str = "meiko") -> dict:
+                          site: str = "meiko", target_id: str | None = None) -> dict:
     """One chapter's title and finished HTML, ready to paste."""
     require_series(sid)
     try:
         return await run_in_threadpool(
-            posting.chapter_payload, sid, project_id, index, adapter_name=site
+            posting.chapter_payload, sid, project_id, index, adapter_name=site,
+            target_id=target_id,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

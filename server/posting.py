@@ -27,7 +27,7 @@ from translation_bot.state import DONE_STATUSES, State
 from . import projects as pj
 from . import remote
 from . import series as series_mod
-from .titles import site_title_key
+from .titles import learn_naming, site_title_key
 
 ADAPTERS_DIR = pj.PROJECT_ROOT / "adapters"
 
@@ -94,18 +94,57 @@ def _chapter_status(pid: str, index: int) -> str:
     return rec.get("status") or "pending"
 
 
-def chapter_title(row: dict, adapter: dict, side_ordinal: int | None = None) -> str:
+def chapter_title(row: dict, adapter: dict, side_ordinal: int | None = None,
+                  naming: dict | None = None) -> str:
     """The chapter's display name on the site.
 
-    Matches the walkthrough's own convention: numbered chapters are "Chapter 122", side
-    stories are "Side Stories 1" and numbered within their own run.
+    Numbered chapters are "Chapter 122"; side stories are numbered within their own run.
+
+    ``naming`` is what this novel's own chapter list says it calls things, learned by
+    ``titles.learn_naming``. It WINS over the adapter default, and that is the whole fix
+    for side stories: eight are live on one real series as "Side Chapter 1".."Side Chapter
+    8" while the default here generates "Side Stories N", so nothing matches, the
+    duplicate guard cannot see them, and all eight would post again. Generating the name
+    the site already uses makes the shared title key the entire matcher -- no second code
+    path to drift.
+
+    Preference order, most specific first: what the site actually uses, then a per-target
+    override somebody set by hand, then the adapter's default.
     """
     site = adapter.get("site") or {}
+    learned = naming or {}
+
+    # A prologue is not chapter one. It carries global 1 in the mapping, so without this
+    # branch it renders as "Chapter 1" -- and on two real series the site carries BOTH a
+    # "Prologue" and a "Chapter 1", so that name is already taken.
+    if row.get("kind") == "prologue":
+        return next((s for s in learned.get("singletons") or [] if s == "prologue"),
+                    "Prologue").title()
+
     if row.get("kind") == "side":
-        template = site.get("side_title_template") or "Side Stories {n}"
+        template = ((learned.get("side") or {}).get("template")
+                    or site.get("side_title_template") or "Side Stories {n}")
         return template.replace("{n}", str(side_ordinal if side_ordinal else 1))
-    template = site.get("title_template") or "Chapter {n}"
+
+    template = ((learned.get("chapter") or {}).get("template")
+                or site.get("title_template") or "Chapter {n}")
     return template.replace("{n}", str(row.get("global")))
+
+
+def naming_for(sid: str, target_id: str) -> dict:
+    """What this novel calls its chapters, learned from the site list already stored.
+
+    One function so the plan and the payload cannot disagree. If they did, the title the
+    run was planned under would differ from the title it actually posted -- which is a
+    duplicate with extra steps.
+    """
+    site = load_site(sid, target_id)
+    if not site.get("trusted", True):
+        # Names learned from a reading of the wrong page would be the other novels' names.
+        return {}
+    adapter = load_adapter()
+    return learn_naming(site["titles"],
+                        (adapter.get("site") or {}).get("title_template"))
 
 
 def title_number_re(adapter: dict) -> re.Pattern:
@@ -241,6 +280,18 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     side_paid = bool(target.get("side_paid", True))
     max_chars = int((adapter.get("site") or {}).get("max_chars") or 100000)
 
+    # Read BEFORE the items are built, because the titles they carry depend on the naming
+    # learned from this list -- what the novel's own chapter list says it calls things.
+    site = (load_site(sid, target["id"]) if use_site
+            else {"titles": [], "fetched_at": None, "trusted": True, "why": ""})
+    numbers = site_numbers(site["titles"], adapter)
+    age = _age_seconds(site.get("fetched_at"))
+    # Names learned from a reading of the wrong page would be other novels' names, so an
+    # untrusted snapshot teaches nothing and the adapter's defaults stand.
+    naming = (learn_naming(site["titles"],
+                       (adapter.get("site") or {}).get("title_template"))
+              if site.get("trusted", True) else {})
+
     rows = series_mod.reading_order(series, mapping)
     ordinals = _side_ordinals(rows)
     items = []
@@ -257,7 +308,7 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
             continue
 
         pid, index = row["project_id"], row["index"]
-        title = chapter_title(row, adapter, ordinals.get((pid, index)))
+        title = chapter_title(row, adapter, ordinals.get((pid, index)), naming)
         md = _chapter_markdown(pid, index)
         status = _chapter_status(pid, index)
         html = markdown_to_html(strip_leading_heading(md or ""),
@@ -319,8 +370,6 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     # is either a duplicate posted or a chapter permanently blocked. Widening the ledger
     # match from exact to the shared key only ever ADDS blocking, which is the safe
     # direction. See server/titles.py.
-    site = (load_site(sid, target["id"]) if use_site
-            else {"titles": [], "fetched_at": None, "trusted": True, "why": ""})
     on_site = {site_title_key(t) for t in site["titles"]}
     # A snapshot we cannot trust blocks EVERYTHING, rather than being treated as empty.
     #
@@ -329,8 +378,6 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     # -- 120 and 101 chapters -- as ready to post a second time. Blocking every row makes
     # eligible_items return nothing, which makes request_run refuse with "Nothing in that
     # range is ready to post", so no second mechanism is needed to stop the run.
-    numbers = site_numbers(site["titles"], adapter)
-    age = _age_seconds(site.get("fetched_at"))
     untrusted = (f"the site reading for this novel is unusable ({site['why']}) — open it "
                  f"on meiko.studio so its chapter list is read again"
                  ) if not site.get("trusted", True) else None
@@ -381,6 +428,9 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
         "audit": audit_pricing(items, site),
         # Half-made chapters to reconcile before anything new is created.
         "creating": creating,
+        # What this novel calls its chapters, learned from its own list. Surfaced so the
+        # page can say when nothing was learned and the defaults are in use.
+        "naming": naming,
         # What the run would actually charge for, spelled out. Getting this backwards is
         # the mistake worth one extra click to avoid.
         "summary": {
@@ -391,12 +441,14 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
 
 
 def chapter_payload(sid: str, project_id: str, index: int,
-                    *, adapter_name: str = "meiko") -> dict:
+                    *, adapter_name: str = "meiko",
+                    target_id: str | None = None) -> dict:
     """The finished HTML for one chapter, ready to paste."""
-    series = series_mod.get_series(sid)
-    if series is None:
-        raise ValueError("That series doesn't exist.")
+    series, target = _resolve_target(sid, target_id)
     adapter = load_adapter(adapter_name)
+    # The SAME learned naming the plan used. A title generated here that differs from the
+    # planned one would be posted under a name nothing is watching for.
+    naming = naming_for(sid, target["id"])
     mapping = series_mod.load_mapping(sid)
     rows = series_mod.reading_order(series, mapping)
     row = next((r for r in rows
@@ -413,7 +465,7 @@ def chapter_payload(sid: str, project_id: str, index: int,
         "global": row.get("global"),
         "kind": row.get("kind"),
         "title": chapter_title(row, adapter,
-                               _side_ordinals(rows).get((project_id, index))),
+                               _side_ordinals(rows).get((project_id, index)), naming),
         "html": markdown_to_html(clean, strip_part_markers=True),
         # Sent alongside as the plain-text flavour of the same paste, exactly as the
         # reader's Copy button does.

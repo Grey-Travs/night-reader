@@ -859,6 +859,93 @@ def test_leading_zeros_do_not_make_a_different_chapter(client):
     assert posting.site_numbers(["Chapter 007"], adapter) == [7]
 
 
+# ---- what this novel calls its chapters -----------------------------------
+
+# Measured: "I Possessed a Character" has eight side stories live as "Side Chapter 1" ..
+# "Side Chapter 8", while this app generated "Side Stories N". Zero overlap, on every
+# series that has side stories -- so the duplicate guard could not see them and all eight
+# would have posted a second time. Rather than hard-code a second convention, the names
+# are learned from the novel's own list and used to GENERATE as well as to match.
+
+
+def test_the_side_story_naming_is_learned_from_the_site(client):
+    sid = _with_sides(client, "Learned", free_through=1, coin_price=55)
+    posting.write_site(sid, "t1", [
+        "Chapter 1", "Side Chapter 1", "Side Chapter 2", "Side Chapter 3"])
+    naming = _plan(client, sid)["naming"]
+    assert naming["side"]["template"] == "Side Chapter {n}"
+    assert naming["chapter"]["template"] == "Chapter {n}"
+
+
+def test_a_side_story_already_on_the_site_is_no_longer_posted_twice(client):
+    """The double-post this phase exists to stop.
+
+    With the adapter default these generate "Side Stories 1" and "Side Stories 2", match
+    nothing on the site, and go out as second copies. Learned, they generate the names the
+    site already uses and are blocked.
+    """
+    sid = _with_sides(client, "NoDouble", free_through=1, coin_price=55)
+    posting.write_site(sid, "t1", [
+        "Chapter 1", "Side Chapter 1", "Side Chapter 2", "Side Chapter 3"])
+    sides = [i for i in _plan(client, sid)["items"] if i["kind"] == "side"]
+    assert [i["title"] for i in sides] == ["Side Chapter 1", "Side Chapter 2"]
+    assert all("already on the site" in i["blockers"] for i in sides)
+
+
+def test_without_a_learned_name_the_adapter_default_stands(client):
+    # Eight of the real series have no side stories on the site at all, and a brand-new
+    # name cannot be a duplicate, so this is a fallback rather than a failure.
+    sid = _with_sides(client, "Unlearned", free_through=1, coin_price=55)
+    posting.write_site(sid, "t1", ["Chapter 1", "Chapter 2", "Chapter 3"])
+    sides = [i for i in _plan(client, sid)["items"] if i["kind"] == "side"]
+    assert sides[0]["title"] == "Side Stories 1"
+
+
+def test_an_untrusted_reading_teaches_no_names(client, tmp_path):
+    # Names learned from the studio's series list would be other novels' names.
+    sid = _with_sides(client, "Untaught", free_through=1, coin_price=55)
+    posting.write_site(sid, "t1", ["Chapter 1"])
+    _catalogue(tmp_path, ["A Damned Bastard", "A Killer E-Rank Guide", "Cherry Pop!"])
+    posting.site_path(sid, "t1").write_text(json.dumps({
+        "fetched_at": "2026-09-20T00:00:00+00:00",
+        "titles": ["A Damned Bastard", "A Killer E-Rank Guide", "Cherry Pop!"],
+    }), encoding="utf-8")
+    plan = _plan(client, sid)
+    assert plan["naming"] == {}
+    assert plan["site"]["trusted"] is False
+
+
+def test_a_prologue_is_not_chapter_one(client):
+    """Two real series carry BOTH a "Prologue" and a "Chapter 1" on the site.
+
+    A prologue row holds global 1 in the mapping, so without its own branch it rendered as
+    "Chapter 1" -- a name already taken by a different chapter.
+    """
+    a = _novel(client, "Prolog", [1, 2], translated=[(1, "One.\n"), (2, "Two.\n")])
+    sid = _series(client, "Prolog", [a])
+    client.put(f"/api/series/{sid}/mapping", json={"overrides": [
+        {"project_id": a, "index": 1, "global": 1, "kind": "prologue"}]})
+    titles = [i["title"] for i in _plan(client, sid)["items"]]
+    assert "Prologue" in titles
+    assert titles.count("Chapter 1") == 0
+
+
+def test_the_plan_and_the_payload_agree_on_the_title(client):
+    """They must, or a run posts under a name nothing is watching for.
+
+    Two call sites generate titles -- plan_run and chapter_payload -- and they learn the
+    naming separately. This is the assertion that they learn the same thing.
+    """
+    sid = _with_sides(client, "Agree", free_through=1, coin_price=55)
+    posting.write_site(sid, "t1", [
+        "Chapter 9", "Side Chapter 1", "Side Chapter 2", "Side Chapter 3"])
+    side = next(i for i in _plan(client, sid)["items"] if i["kind"] == "side")
+    payload = client.get("/api/posting/payload", params={
+        "sid": sid, "project_id": side["project_id"], "index": side["index"],
+        "target_id": "t1"}).json()
+    assert payload["title"] == side["title"]
+
+
 # ---- the run request ------------------------------------------------------
 
 # How the app asks the browser to post. Everything here is checkable without a browser,

@@ -55,8 +55,12 @@ const HANDLERS = {
     if (end != null) q.set('end', String(end))
     return call(`/api/posting/plan?${q}`)
   },
-  payload: ({ sid, projectId, index }) => call(
-    `/api/posting/payload?${new URLSearchParams({ sid, project_id: projectId, index: String(index) })}`,
+  // targetId is forwarded so the payload learns this novel's naming from the same chapter
+  // list the plan did. Dropping it here would silently put the two back out of step.
+  payload: ({ sid, projectId, index, targetId }) => call(
+    `/api/posting/payload?${new URLSearchParams({
+      sid, project_id: projectId, index: String(index), target_id: targetId || '',
+    })}`,
   ),
   // The durable record of what has been posted. Worth reading back into the panel: posting
   // through the API means the site's own list cannot be trusted to show a new chapter until
