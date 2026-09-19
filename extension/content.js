@@ -2077,8 +2077,65 @@ async function postBatch({ count, state, upTo, run = null }) {
  * ten already-published chapters would blank them. Re-sending the same HTML that Night
  * Reader generated is both safe and idempotent: the worst case is writing identical content.
  */
-// Armed by a preview and spent by the next press. A range that changes disarms it.
-let armedHide = null
+/**
+ * Delete one chapter from the site, for good.
+ *
+ * The shape is the site's own, captured from a real hand-deletion: a DELETE to the same
+ * /app/chapter with the WHOLE record in the query string, and no body. It answers
+ * {"success":true,"delete":true}.
+ *
+ * Two differences from the PUT, both faithful to what the site actually sends:
+ *   - displayName goes PLAIN here, where a save base64s it;
+ *   - the trailing flags a save carries (tags, socials, cache and the rest) are absent.
+ *
+ * There is no undo. The chapter, its text and its view count are gone from the site, and
+ * nothing in this app can put them back -- which is why the range control previews first
+ * and why deleting is a separate button from hiding.
+ */
+async function apiDeleteChapter(data) {
+  const res = await api('DELETE', '/app/chapter', {
+    version: data.version ?? 2,
+    id: data.id,
+    studio_uid: data.studio_uid,
+    series_uid: data.series_uid,
+    photoURL: data.photoURL || '',
+    bannerURL: data.bannerURL || '',
+    uid: data.uid,
+    view_count: data.view_count ?? 0,
+    displayName: data.displayName,
+    description: data.description || '',
+    status: data.status || 'live',
+    state: String(data.state || 'private').toLowerCase(),
+    type: data.type || 'notes',
+    createdAt: data.createdAt ?? Date.now(),
+    createdBy: data.createdBy || '',
+    lastUpdatedAt: data.lastUpdatedAt ?? data.createdAt ?? Date.now(),
+    lastUpdatedBy: data.lastUpdatedBy || data.createdBy || '',
+    position: data.position ?? 0,
+    position_number: data.position_number ?? 0,
+    preview: JSON.stringify({ cover: { number: 1, type: 1 } }),
+    // The record's OWN paid flag, not one derived from coins. A free chapter on this
+    // site still carries coins:1 with paid:0 -- the captured delete sent exactly that
+    // pair -- so deriving it would send a value the site never sends for that row.
+    paid: (data.paid === true || Number(data.paid) === 1) ? 1 : 0,
+    coins: Number(data.coins) || 0,
+    schedule: JSON.stringify({ date: new Date().toISOString(), toggle: 0 }),
+    pin: data.pin ?? 0,
+    shortlink: data.shortlink || '',
+    tier: data.tier ?? 0,
+  })
+  // The site says so explicitly; anything else is not a delete however cheerful it looks.
+  if (res?.delete !== true) {
+    throw new Error(`the site did not confirm the delete (${JSON.stringify(res).slice(0, 120)})`)
+  }
+  return res
+}
+
+
+// Armed by a preview and spent by the next press. Keyed on the ACTION as well as the
+// range, so previewing a hide can never arm a delete -- one is reversible and the
+// other is not, and they sit next to each other.
+let armedRange = null
 
 /**
  * Hide a range of chapters from readers -- "201 to 220" rather than one name at a time.
@@ -2100,13 +2157,16 @@ let armedHide = null
  * requests" -- every non-GET is recorded with its body, which is exactly how the posting
  * API was found.
  */
-async function hideRange(from, to) {
+async function rangeAction(action, from, to) {
   if (busy) return
-  const armed = !!(armedHide && armedHide.from === from && armedHide.to === to
-    && Date.now() - armedHide.at < 120000)
+  const gone = action === 'delete'
+  const verb = gone ? 'Deleting' : 'Hiding'
+  const armed = !!(armedRange && armedRange.action === action
+    && armedRange.from === from && armedRange.to === to
+    && Date.now() - armedRange.at < 120000)
   busy = true
-  startLog(armed ? `# Hiding chapters ${from}-${to}`
-    : `# What hiding chapters ${from}-${to} would do`)
+  startLog(armed ? `# ${verb} chapters ${from}-${to}`
+    : `# What ${gone ? 'deleting' : 'hiding'} chapters ${from}-${to} would do`)
   const done = []
   let stopped = null
   try {
@@ -2134,45 +2194,60 @@ ${found.length} chapter(s) on the site in that range:`)
       const paid = Number(x.r.coins) > 0 ? `${x.r.coins} coins` : 'free'
       say(`  ${x.r.displayName}  ${st}  ${paid}`)
     }
-    const todo = found.filter((x) => String(x.r.state || '').toLowerCase() !== 'private')
+    // Hiding skips what is already hidden, so running it twice costs nothing.
+    // Deleting takes everything in range: private is not the same as gone.
+    const todo = gone ? found
+      : found.filter((x) => String(x.r.state || '').toLowerCase() !== 'private')
     if (!todo.length) throw new Error('every one of them is already hidden')
 
     if (!armed) {
-      armedHide = { from, to, at: Date.now() }
+      armedRange = { action, from, to, at: Date.now() }
       say(`
-NOTHING HAS CHANGED. Press Hide again within two minutes to hide `
-        + `${todo.length} of them; change either number to call it off.`)
+NOTHING HAS CHANGED. Press ${gone ? 'Delete' : 'Hide'} again within two `
+        + `minutes to ${gone ? 'DELETE' : 'hide'} ${todo.length} of them; change `
+        + 'either number to call it off.')
+      if (gone) {
+        say('There is no undo. Deleting takes the text and the view count with it.')
+      }
       return
     }
-    armedHide = null
+    armedRange = null
 
     for (const [i, x] of todo.entries()) {
       say(`
 ———— ${i + 1} of ${todo.length}: ${x.r.displayName} ————`)
-      // Read the chapter back WITH its text, so the save can hand the site its own bytes
-      // rather than a re-encoding of them. A PUT with no pages body can be read as "no
-      // pages", which would empty the chapter instead of hiding it.
-      const res = await api('GET', '/app/chapter', {
-        studio_uid: pinned.studio_uid, series_uid: pinned.series_uid,
-        uid: x.r.uid, pages: true,
-      })
-      const list = Array.isArray(res?.data) ? res.data
-        : res?.data && typeof res.data === 'object' ? [res.data] : []
-      const full = list.find((c) => String(c?.uid || '') === String(x.r.uid)) || list[0]
-      if (!full || full.pages === undefined) {
-        throw new Error('could not read its text back, so hiding it might blank it')
+      if (gone) {
+        // No text is read first: the record the list gave us already carries every field
+        // the site's own delete sends, and there is nothing to preserve afterwards.
+        await apiDeleteChapter(x.r)
+        say('    deleted from the site')
+        CHAPTERS.delete(chapterKey(pinned.series_uid, x.r.displayName))
+      } else {
+        // Read the chapter back WITH its text, so the save can hand the site its own
+        // bytes rather than a re-encoding of them. A PUT with no pages body can be read
+        // as "no pages", which would empty the chapter instead of hiding it.
+        const res = await api('GET', '/app/chapter', {
+          studio_uid: pinned.studio_uid, series_uid: pinned.series_uid,
+          uid: x.r.uid, pages: true,
+        })
+        const list = Array.isArray(res?.data) ? res.data
+          : res?.data && typeof res.data === 'object' ? [res.data] : []
+        const full = list.find((c) => String(c?.uid || '') === String(x.r.uid)) || list[0]
+        if (!full || full.pages === undefined) {
+          throw new Error('could not read its text back, so hiding it might blank it')
+        }
+        const saved = await apiSaveChapter(full, {
+          state: 'private', coins: Number(x.r.coins) || 0, rawPages: full.pages,
+        })
+        const after = saved?.data || {}
+        if (String(after.state).toLowerCase() !== 'private') {
+          throw new Error(`it saved as "${after.state}" instead of private`)
+        }
+        say('    hidden from readers')
+        CHAPTERS.set(chapterKey(pinned.series_uid, x.r.displayName),
+          { ...x.r, state: 'private' })
       }
-      const saved = await apiSaveChapter(full, {
-        state: 'private', coins: Number(x.r.coins) || 0, rawPages: full.pages,
-      })
-      const after = saved?.data || {}
-      if (String(after.state).toLowerCase() !== 'private') {
-        throw new Error(`it saved as "${after.state}" instead of private`)
-      }
-      say('    hidden from readers');
       done.push(x.r.displayName)
-      CHAPTERS.set(chapterKey(pinned.series_uid, x.r.displayName),
-        { ...x.r, state: 'private' })
       if (i < todo.length - 1) await sleep(1200)
     }
   } catch (e) {
@@ -2181,7 +2256,12 @@ NOTHING HAS CHANGED. Press Hide again within two minutes to hide `
     busy = false
   }
 
-  if (done.length) {
+  if (done.length && gone) {
+    say(`
+====
+DELETED ${done.length} chapter(s). They are gone from the site along with their `
+      + `text and view counts. Re-posting them makes new chapters, not the old ones.`)
+  } else if (done.length) {
     say(`
 ====
 HID ${done.length} chapter(s). They are still on the site and still in `
@@ -2330,6 +2410,7 @@ function build() {
         <input class="nr-to" type="number" min="1" max="9999" placeholder="to">
       </label>
       <button class="nr-btn nr-go" data-act="hide">Hide range</button>
+      <button class="nr-btn nr-go" data-act="drop">Delete range</button>
     </div>
     <div class="nr-row">
       <button class="nr-btn" data-act="check">Check this novel</button>
@@ -2443,10 +2524,10 @@ function build() {
       const upTo = Number(panel.querySelector('.nr-upto')?.value) || 0
       postBatch({ count, upTo, state: act === 'public' ? 'Public' : 'Private' })
     }
-    if (act === 'hide') {
+    if (act === 'hide' || act === 'drop') {
       const from = Number(panel.querySelector('.nr-from')?.value) || 0
       const to = Number(panel.querySelector('.nr-to')?.value) || 0
-      hideRange(from, to)
+      rangeAction(act === 'drop' ? 'delete' : 'hide', from, to)
     }
     if (act === 'publish') publishPosted()
     if (act === 'posted') showPosted()
