@@ -30,17 +30,27 @@ export function priceLine(rows, coins) {
   return `${rows.length - paid} free, ${paid} at ${coins} coins`
 }
 
+// Contiguous numbers collapsed to [first, last] pairs. One algorithm, because the server
+// sends runs in this exact shape and they must render identically to ones computed here.
+export function runs(numbers) {
+  const ns = [...numbers].filter((n) => n != null).sort((a, b) => a - b)
+  const out = []
+  for (const n of ns) {
+    const last = out[out.length - 1]
+    if (last && n === last[1] + 1) last[1] = n
+    else if (!last || n !== last[1]) out.push([n, n])
+  }
+  return out
+}
+
+export function formatRuns(pairs) {
+  if (!pairs?.length) return '—'
+  return pairs.map(([a, b]) => (a === b ? `${a}` : `${a}–${b}`)).join(', ')
+}
+
 // Contiguous runs read far better than a list of forty numbers.
 export function range(rows) {
-  const ns = rows.map((i) => i.global).filter((n) => n != null).sort((a, b) => a - b)
-  if (!ns.length) return '—'
-  const runs = []
-  for (const n of ns) {
-    const last = runs[runs.length - 1]
-    if (last && n === last[1] + 1) last[1] = n
-    else runs.push([n, n])
-  }
-  return runs.map(([a, b]) => (a === b ? `${a}` : `${a}–${b}`)).join(', ')
+  return formatRuns(runs(rows.map((i) => i.global)))
 }
 
 export function ago(iso) {
@@ -96,14 +106,132 @@ export function eligible(ready, { from, to, upTo, limit }) {
 // than of the series, which is the only way to get it right: a series with a free cutoff
 // but no coin price would otherwise sail through and post everything past the cutoff as
 // paid at zero coins — a locked chapter readers cannot buy, with the revenue simply gone.
-export function blockedReason({ willPost, savedCoins, savedFree, priceDirty }) {
+export function blockedReason({ willPost, savedCoins, savedFree, priceDirty, dupes = [] }) {
   const paidInRun = willPost.filter((i) => i.paid).length
   if (savedCoins === 0 && paidInRun > 0) {
     return `${paidInRun} of these are past the free cutoff (chapter ${savedFree}), so they `
       + 'would post as paid at 0 coins — a locked chapter readers cannot buy. Set the '
       + 'coins first.'
   }
+  // Second, because revenue lost outright is still the more expensive mistake. A duplicate
+  // is the next one: readers can buy the same chapter twice, and removing one on meiko
+  // means retyping its name to confirm.
+  if (dupes.length) {
+    return `${range(dupes)} ${dupes.length === 1 ? 'is' : 'are'} already on the site, by `
+      + 'number, even though the titles did not match. Posting again makes a second copy. '
+      + 'Narrow the range, or open the novel on meiko.studio so its chapter list is read '
+      + 'again.'
+  }
   if (priceDirty) return 'Save the pricing first, so the run charges what you just typed.'
   if (!willPost.length) return 'Nothing in that range is ready to post.'
   return null
+}
+
+// Staleness is a WARNING and must never reach blockedReason. The threshold that blocks a
+// two-day-old snapshot also blocks every legitimate run on a machine that has not opened
+// the meiko tab today -- and the cure needs that tab open anyway, which is when the push
+// happens by itself. A blocking staleness check is the one that gets switched off.
+export const SNAPSHOT_STALE_HOURS = 24
+
+export function snapshotWarning(site) {
+  if (!site) return null
+  if (site.trusted === false) {
+    return `The last reading of this novel cannot be used ${site.why ? `(${site.why})` : ''}`
+      + ' — so nothing here is posting until it is read again. Open the novel on'
+      + ' meiko.studio and let its chapter list finish loading.'
+  }
+  if (!site.fetched_at) {
+    return 'Nobody has read this novel’s chapter list off the site yet, so nothing here'
+      + ' knows what is already posted.'
+  }
+  // count without numbered is the corruption tell: 94 titles, none of them a chapter.
+  if (site.count > 0 && site.numbered === 0) {
+    return `The last reading got ${site.count} titles with no chapter numbers among them,`
+      + ' which looks like the studio’s series list rather than this novel’s'
+      + ' chapters. Open the novel itself on meiko.studio.'
+  }
+  const hours = (site.age_seconds || 0) / 3600
+  if (hours >= SNAPSHOT_STALE_HOURS) {
+    return `This list was read ${ago(site.fetched_at)} — anything posted since is not`
+      + ' counted here.'
+  }
+  return null
+}
+
+// What this run would pick up next, given what is NOT yet on the site.
+//
+// `from` is min(ready), not max_posted + 1. `ready` already IS "mine that is not posted",
+// with both the ledger and the site subtracted by the server; asking max_posted + 1
+// consults a second, weaker oracle for the same thing. On real data it also gives the
+// wrong answer: one series' site ends at 196 while its first ready chapter is 198, so
+// max_posted + 1 names 197, which is not finished and cannot post.
+//
+// `to` ends the FIRST CONTIGUOUS run rather than at the highest ready number, because the
+// site orders chapters by number: posting 223 while 201-222 are missing publishes a novel
+// with a hole the reader can see.
+export function nextRun(ready) {
+  const numbered = ready.map((i) => i.global).filter((n) => n != null)
+  const sides = ready.filter((i) => i.global == null).length
+  const pairs = runs(numbered)
+  if (!pairs.length) {
+    return { from: null, to: null, count: 0, apart: [], sides, covers: true }
+  }
+  const [from, to] = pairs[0]
+  const apart = [...numbered].sort((a, b) => a - b).filter((n) => n > to)
+  return { from, to, count: to - from + 1, apart, sides, covers: apart.length === 0 }
+}
+
+const inRuns = (n, pairs) => (pairs || []).some(([a, b]) => n >= a && n <= b)
+
+// Chapters this run would post whose NUMBER the site already carries.
+//
+// A real contradiction, not a guess: the server said this chapter is not posted (its title
+// matched nothing) while the site's own list says that number is there. That is what title
+// drift looks like — "Chapter 118: The Duel" up there against "Chapter 118" here — and it
+// is exactly how the same chapter gets posted twice.
+export function duplicates(willPost, site) {
+  return willPost.filter((i) => i.global != null && inRuns(i.global, site?.posted))
+}
+
+// Chapters below the site's highest number that it does not have: a hole. Could be a
+// chapter deliberately deleted and due to be re-posted, so this warns rather than refuses.
+export function belowSite(willPost, site) {
+  const max = site?.max_posted
+  if (max == null) return []
+  return willPost.filter((i) => i.global != null && i.global < max
+    && !inRuns(i.global, site?.posted))
+}
+
+// The one-tap offer. Names the evidence, then the effect — the same shape as the coin
+// price suggestion, which says "the site charges 55 — use that".
+export function suggestionLabel(next, site) {
+  if (next?.from == null) return ''
+  const span = next.from === next.to
+    ? `${next.from}` : `${next.from}${'–'}${next.to}`
+  const ending = site?.max_posted != null ? `the site ends at ${site.max_posted} — ` : ''
+  return `${ending}post ${span}`
+}
+
+// Where what you have meets what is up there — the direct answer to "will I post twice?".
+//
+// Deliberately not a repeat of range(ready): the Ready tile already shows that. The tile
+// is "what I have", the site line is "what is up there", and this is where they meet.
+export function pickupLine(next) {
+  if (next?.from == null) return 'Nothing of yours is missing from it.'
+  const span = next.count === 1 ? '1 chapter' : `${next.count} chapters`
+  if (next.apart.length) {
+    return `Picks up at ${next.from} — ${span}, then a gap before ${next.apart[0]}.`
+  }
+  return `Picks up at ${next.from} — ${span}.`
+}
+
+// "1 side story is" / "2 chapters without a number are" — `kind` is on every plan item.
+export function unnumberedLabel(rows) {
+  const loose = rows.filter((i) => i.global == null)
+  if (!loose.length) return ''
+  const allSide = loose.every((i) => i.kind === 'side')
+  const noun = allSide
+    ? `side stor${loose.length === 1 ? 'y' : 'ies'}`
+    : `chapter${loose.length === 1 ? '' : 's'} without a number`
+  return `${loose.length} ${noun} ${loose.length === 1 ? 'is' : 'are'}`
 }

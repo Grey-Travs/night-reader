@@ -71,7 +71,8 @@ function plan(items, over = {}) {
     blocked: items.length - ready.length,
     free_through: 47,
     coin_price: 55,
-    site: { fetched_at: null, count: 0 },
+    site: { fetched_at: null, count: 0, posted: [], max_posted: null,
+            numbered: 0, trusted: true, why: '', age_seconds: null },
     summary: { free: [], paid: ready.map((i) => i.global) },
     ...over,
   }
@@ -267,5 +268,64 @@ describe('a run in flight', () => {
       },
     })
     expect(await screen.findByText(/chapter 75: session expired/i)).toBeInTheDocument()
+  })
+})
+
+const siteWith = (over) => ({
+  fetched_at: '2026-09-20T00:00:00Z', count: 196, posted: [[1, 196]], max_posted: 196,
+  numbered: 196, trusted: true, why: '', age_seconds: 60, ...over,
+})
+
+describe('the range suggestion on a phone', () => {
+  it('is reachable without opening the range panel', async () => {
+    // The phone's version of "renders without a router": a suggestion inside a collapsed
+    // <details> is a suggestion nobody sees, so it sits above it.
+    setup({
+      planDoc: plan([item(198), item(199), item(200), item(223)],
+        { site: siteWith({}) }),
+    })
+    const offer = await screen.findByRole('button', { name: /the site ends at 196/i })
+    expect(offer.closest('details')).toBeNull()
+  })
+
+  it('shows the applied range on the collapsed panel', async () => {
+    // So a tap has a visible result even with the panel shut.
+    setup({
+      planDoc: plan([item(198), item(199), item(200), item(223)],
+        { site: siteWith({}) }),
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /the site ends at 196/i }))
+    // Scoped to the summary: the tiles legitimately show the same numbers, and asserting
+    // on the page as a whole would pass without the panel saying anything at all.
+    const summary = document.querySelector('details summary')
+    await waitFor(() => expect(summary.textContent).toMatch(/198–200/))
+  })
+
+  it('names what the site holds, and where yours picks up', async () => {
+    setup({ planDoc: plan([item(198)], { site: siteWith({}) }) })
+    expect(await screen.findByText(/it has 1–196/)).toBeInTheDocument()
+    expect(screen.getByText(/picks up at 198/i)).toBeInTheDocument()
+  })
+})
+
+describe('the duplicate refusal reaches the phone too', () => {
+  it('will not start on a chapter the site already carries', async () => {
+    // The whole point of putting the rule in posting.js: the phone cannot be the lenient
+    // screen. A phone is also where a mistake is hardest to notice.
+    setup({ planDoc: plan([item(118)], { site: siteWith({}) }) })
+    expect(await screen.findByText(/already on the site, by number/i)).toBeInTheDocument()
+    expect(await startButton()).toBeDisabled()
+    fireEvent.click(await startButton())
+    expect(api.startPostingRun).not.toHaveBeenCalled()
+  })
+
+  it('warns about an unusable reading without blocking', async () => {
+    setup({
+      planDoc: plan([item(5)], {
+        site: siteWith({ count: 94, numbered: 0, posted: [], max_posted: null }),
+      }),
+    })
+    expect(await screen.findByText(/series list/i)).toBeInTheDocument()
+    expect(await startButton()).toBeEnabled()
   })
 })

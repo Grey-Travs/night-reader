@@ -792,6 +792,73 @@ def test_finishing_the_chapter_clears_the_intent(client):
     assert "already in the ledger as posted" in by_number[2]["blockers"]
 
 
+# ---- what the site holds, as numbers --------------------------------------
+
+# The page needs to say "it has 1-196" and to spot a chapter whose NUMBER is already up
+# even when its TITLE drifted. Both need the site's titles read back as numbers, and the
+# parser for that is the inverse of the adapter's own template rather than a second regex
+# that can disagree with it.
+
+
+def test_the_plan_says_what_the_site_already_holds(client):
+    a = _novel(client, "Holds", [1, 2, 3], translated=[(1, "One.\n")])
+    sid = _series(client, "Holds", [a])
+    posting.write_site(sid, "t1", [f"Chapter {n}" for n in (1, 2, 3, 4, 5)])
+    site = _plan(client, sid)["site"]
+    assert site["posted"] == [[1, 5]]
+    assert site["max_posted"] == 5 and site["numbered"] == 5
+
+
+def test_a_gap_on_the_site_survives_into_the_plan(client):
+    # Rendered as "1-2, 4-5", which is exactly the shape that deserves a second look.
+    a = _novel(client, "Gappy", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Gappy", [a])
+    posting.write_site(sid, "t1", ["Chapter 1", "Chapter 2", "Chapter 4", "Chapter 5"])
+    assert _plan(client, sid)["site"]["posted"] == [[1, 2], [4, 5]]
+
+
+def test_a_decorated_title_still_yields_its_chapter_number(client):
+    """The tail is deliberately ignored.
+
+    "Chapter 118: The Duel" must parse to 118. The strict form would fail to parse it,
+    find no 118 on the site, and let a duplicate through -- which is the difference
+    between catching one and posting one.
+    """
+    a = _novel(client, "Decorated", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Decorated", [a])
+    posting.write_site(sid, "t1", ["Chapter 118: The Duel", "Chapter 119 - the aftermath"])
+    assert _plan(client, sid)["site"]["posted"] == [[118, 119]]
+
+
+def test_a_snapshot_of_the_series_list_reports_no_chapter_numbers(client, tmp_path):
+    # The regression test for the two real corrupt files: 94 titles, none a chapter. That
+    # count-without-numbers shape is what the page warns on.
+    a = _novel(client, "Listy", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Listy", [a])
+    path = posting.site_path(sid, "t1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"fetched_at": "2026-09-19T00:00:00+00:00",
+                                "titles": ["A Damned Bastard", "Cherry Pop!",
+                                           "Hard Control"]}), encoding="utf-8")
+    site = _plan(client, sid)["site"]
+    assert site["count"] == 3 and site["numbered"] == 0
+    assert site["posted"] == [] and site["max_posted"] is None
+
+
+def test_the_site_numbers_follow_the_adapter_template(client, tmp_path):
+    # Edit the template and the parser follows, because it is derived from it.
+    (tmp_path / "adapters" / "meiko.toml").write_text(
+        ADAPTER.replace('title_template = "Chapter {n}"', 'title_template = "Ep. {n}"'),
+        encoding="utf-8")
+    adapter = posting.load_adapter("meiko")
+    assert posting.site_numbers(["Ep. 7", "Ep. 8", "Chapter 9"], adapter) == [7, 8]
+
+
+def test_leading_zeros_do_not_make_a_different_chapter(client):
+    adapter = posting.load_adapter("meiko")
+    assert posting.site_numbers(["Chapter 007"], adapter) == [7]
+
+
 # ---- the run request ------------------------------------------------------
 
 # How the app asks the browser to post. Everything here is checkable without a browser,

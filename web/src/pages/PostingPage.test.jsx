@@ -72,7 +72,8 @@ function plan(items, over = {}) {
     blocked: items.length - ready.length,
     free_through: 47,
     coin_price: 55,
-    site: { fetched_at: null, count: 0 },
+    site: { fetched_at: null, count: 0, posted: [], max_posted: null,
+            numbered: 0, trusted: true, why: '', age_seconds: null },
     summary: { free: [], paid: ready.map((i) => i.global) },
     ...over,
   }
@@ -303,5 +304,94 @@ describe('a run in flight', () => {
     })
     expect(await screen.findByText(/Stopped on an error/)).toBeTruthy()
     expect(screen.getByText(/Chapter 73: session expired/)).toBeTruthy()
+  })
+})
+
+const siteWith = (over) => ({
+  fetched_at: '2026-09-20T00:00:00Z', count: 196, posted: [[1, 196]], max_posted: 196,
+  numbered: 196, trusted: true, why: '', age_seconds: 60, ...over,
+})
+
+describe('taking the range from what is actually posted', () => {
+  it('offers the next run and applies it without asking the server again', async () => {
+    // The real shape, from "Becoming the Top's Older Brother": the site ends at 196, and
+    // 198, 199, 200 and 223 are waiting here. 223 sits past a gap, so the offer is not a
+    // no-op and is worth showing. Range changes are pure client arithmetic, which is what
+    // keeps the page responsive.
+    setup({
+      planDoc: plan([item(198), item(199), item(200), item(223)],
+        { site: siteWith({}) }),
+    })
+    const offer = await screen.findByRole('button', { name: /the site ends at 196/i })
+    api.postingPlan.mockClear()
+    fireEvent.click(offer)
+    expect(screen.getByLabelText('From chapter')).toHaveValue(198)
+    expect(screen.getByLabelText('To chapter')).toHaveValue(200)
+    expect(api.postingPlan).not.toHaveBeenCalled()
+  })
+
+  it('stops offering once the range already matches', async () => {
+    setup({
+      planDoc: plan([item(198), item(199), item(200), item(223)],
+        { site: siteWith({}) }),
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /the site ends at 196/i }))
+    await waitFor(() => expect(
+      screen.queryByRole('button', { name: /the site ends at 196/i })).toBeNull())
+  })
+
+  it('does not offer a range that would quietly drop the side stories', async () => {
+    // With nothing apart, blank boxes already post exactly the suggestion PLUS the side
+    // stories — so the button would be a no-op that loses them.
+    const side = { ...item(201), global: null, kind: 'side', title: 'Side Stories 1' }
+    setup({ planDoc: plan([item(198), item(199), side], { site: siteWith({}) }) })
+    await screen.findByRole('button', { name: /start posting/i })
+    expect(screen.queryByRole('button', { name: /post 198/i })).toBeNull()
+  })
+
+  it('names what the site already holds', async () => {
+    setup({ planDoc: plan([item(198)], { site: siteWith({}) }) })
+    expect(await screen.findByText(/it has 1–196/)).toBeInTheDocument()
+  })
+
+  it('says plainly when nothing of yours is missing', async () => {
+    // The state most of the real library is in, and the direct answer to the question.
+    setup({ planDoc: plan([], { site: siteWith({}) }) })
+    expect(await screen.findByText(/nothing of yours is missing from it/i)).toBeInTheDocument()
+  })
+
+  it('says what a range leaves out, and offers to undo it', async () => {
+    const side = { ...item(300), global: null, kind: 'side', title: 'Side Stories 1' }
+    setup({ planDoc: plan([item(198), item(199), side], { site: siteWith({}) }) })
+    await screen.findByRole('button', { name: /start posting/i })
+    fireEvent.change(screen.getByLabelText('From chapter'), { target: { value: '198' } })
+    expect(await screen.findByText(/1 side story is not in this run/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /post everything ready instead/i }))
+    await waitFor(() => expect(screen.getByLabelText('From chapter')).toHaveValue(null))
+  })
+})
+
+describe('refusing a chapter the site already carries', () => {
+  it('will not start, and says why', async () => {
+    // Title drift: the server saw no matching TITLE, so 118 reads as ready, while the
+    // site's own list says that NUMBER is there. That is how one gets posted twice.
+    setup({ planDoc: plan([item(118)], { site: siteWith({}) }) })
+    expect(await screen.findByText(/already on the site, by number/i)).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /start posting/i })).toBeDisabled()
+    fireEvent.click(await screen.findByRole('button', { name: /start posting/i }))
+    expect(api.startPostingRun).not.toHaveBeenCalled()
+  })
+
+  it('warns about a series-list reading but does not block on it', async () => {
+    // Stale or untrusted is a warning, never a block: the threshold that blocks a two-day
+    // old snapshot also blocks every legitimate run on a machine that has not opened the
+    // tab today.
+    setup({
+      planDoc: plan([item(5)], {
+        site: siteWith({ count: 94, numbered: 0, posted: [], max_posted: null }),
+      }),
+    })
+    expect(await screen.findByText(/series list/i)).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /start posting/i })).toBeEnabled()
   })
 })

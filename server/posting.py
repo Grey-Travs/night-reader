@@ -108,6 +108,50 @@ def chapter_title(row: dict, adapter: dict, side_ordinal: int | None = None) -> 
     return template.replace("{n}", str(row.get("global")))
 
 
+def title_number_re(adapter: dict) -> re.Pattern:
+    """The inverse of the adapter's own title template.
+
+    ``chapter_title`` builds "Chapter 122" out of ``title_template``; this reads it back.
+    Deriving one from the other means the duplicate check compares like with like, and a
+    user who edits the template does not silently break the parser.
+
+    Head-anchored, then the number, then STOP -- the tail is deliberately ignored, so
+    "Chapter 118: The Duel" parses to 118. The strict form would fail to parse it, find no
+    118 on the site, and let a duplicate through. Leading zeros are eaten so "Chapter 007"
+    is 7.
+    """
+    template = ((adapter.get("site") or {}).get("title_template") or "Chapter {n}")
+    head, _, _tail = template.partition("{n}")
+    return re.compile(r"^\s*" + re.escape(head) + r"0*(\d{1,5})\b", re.I)
+
+
+def site_numbers(titles: list[str], adapter: dict) -> list[int]:
+    """The chapter numbers the site's own titles state, ascending and unique."""
+    pattern = title_number_re(adapter)
+    found = set()
+    for title in titles:
+        m = pattern.match(str(title or ""))
+        if m:
+            found.add(int(m.group(1)))
+    return sorted(found)
+
+
+def number_runs(numbers: list[int]) -> list[list[int]]:
+    """Contiguous numbers collapsed to [first, last] pairs.
+
+    Ten bytes for a healthy series, where a list of titles would be hundreds. It is also
+    the shape the page wants: "1-196" is what a person reads, and a gap shows up as a
+    second pair rather than having to be hunted for.
+    """
+    runs: list[list[int]] = []
+    for n in numbers:
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    return runs
+
+
 def audit_pricing(items: list[dict], site: dict) -> list[dict]:
     """Chapters already on the site that do not match what this series says they cost.
 
@@ -285,6 +329,8 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     # -- 120 and 101 chapters -- as ready to post a second time. Blocking every row makes
     # eligible_items return nothing, which makes request_run refuse with "Nothing in that
     # range is ready to post", so no second mechanism is needed to stop the run.
+    numbers = site_numbers(site["titles"], adapter)
+    age = _age_seconds(site.get("fetched_at"))
     untrusted = (f"the site reading for this novel is unusable ({site['why']}) — open it "
                  f"on meiko.studio so its chapter list is read again"
                  ) if not site.get("trusted", True) else None
@@ -319,7 +365,17 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
                   # is blocked, so the page must explain rather than show a bare zero.
                   "trusted": bool(site.get("trusted", True)),
                   "why": site.get("why") or "",
-                  "source": site.get("source") or ""},
+                  "source": site.get("source") or "",
+                  # What the site actually holds, as contiguous [first, last] runs. The
+                  # titles themselves are deliberately not sent -- a hundred chapter names
+                  # would dwarf the response -- but the runs are three orders of magnitude
+                  # smaller and strictly more useful.
+                  "posted": number_runs(numbers),
+                  "max_posted": max(numbers) if numbers else None,
+                  # count vs numbered is the corruption tell: the two bad snapshots hold
+                  # 94 titles of which 0 parse as chapters.
+                  "numbered": len(numbers),
+                  "age_seconds": age},
         # Chapters already up that do not match this series' own pricing. Empty until a
         # reading carries the site's paid/coins/state, which title-only snapshots do not.
         "audit": audit_pricing(items, site),
@@ -810,6 +866,19 @@ def write_site(sid: str, target_id: str, rows, prices: list[int] | None = None,
 # is worth more than the latency.
 
 RUN_STATES = ("queued", "running", "done", "cancelled", "failed")
+
+def _age_seconds(stamp) -> int | None:
+    """How long ago a snapshot was read, or None if nobody ever has."""
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - when).total_seconds()))
+
 
 # How much of the previous snapshot a new reading must still cover. Below this it is
 # treated as a partial page rather than as chapters having been deleted. Deleting a fifth

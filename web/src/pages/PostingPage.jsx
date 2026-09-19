@@ -1,7 +1,10 @@
 import { Link } from 'react-router-dom'
 import { SkeletonRows } from '../components/ui'
 import { useToast } from '../toast'
-import { NUMBERING, ago, clock, priceLine, range, runHeadline } from '../posting'
+import {
+  NUMBERING, ago, clock, formatRuns, pickupLine, priceLine, range, runHeadline,
+  unnumberedLabel,
+} from '../posting'
 import { usePostingConsole } from '../usePostingConsole'
 
 // Where a posting run is set up and started.
@@ -82,8 +85,14 @@ export default function PostingPage() {
               </section>
 
               <p className="mt-2 text-xs text-hint">
-                {c.plan.site?.fetched_at ? (
-                  <>Read {c.plan.site.count} chapters off the site {ago(c.plan.site.fetched_at)}.</>
+                {c.site?.fetched_at ? (
+                  <>
+                    Read {c.site.count} chapters off the site {ago(c.site.fetched_at)}
+                    {/* Suppressed when the reading is not believable: a snapshot we do
+                        not trust has no business making a claim about what is up there. */}
+                    {c.site.trusted !== false && c.site.numbered > 0
+                      && <> — it has {formatRuns(c.site.posted)}</>}.
+                  </>
                 ) : (
                   <>
                     These counts don’t know what’s on the site yet — open the series on
@@ -92,6 +101,16 @@ export default function PostingPage() {
                   </>
                 )}
               </p>
+
+              {c.siteWarning && (
+                <p className="mt-1 inline-block rounded-card px-2 py-1 text-xs pill-review">
+                  {c.siteWarning}
+                </p>
+              )}
+
+              {c.site?.fetched_at && c.site.trusted !== false && (
+                <p className="mt-1 text-xs text-muted">{pickupLine(c.nextUp)}</p>
+              )}
 
               {c.held.length > 0 && (
                 <p className="mt-1 text-xs text-hint">
@@ -164,6 +183,14 @@ export default function PostingPage() {
                       <Num label="To chapter" value={c.to} onChange={c.setTo} placeholder="end" />
                       <Num label="Stop at chapter" value={c.upTo} onChange={c.setUpTo} placeholder="—" />
                       <Num label="At most" value={c.limit} onChange={c.setLimit} placeholder="all" />
+                      {c.suggestionApplies && (
+                        <button
+                          className="btn btn-ghost px-3 py-1.5 text-xs"
+                          onClick={c.applyNextRun}
+                        >
+                          {c.suggestion}
+                        </button>
+                      )}
                       <label className="text-xs text-muted">
                         Publish as
                         <select
@@ -202,6 +229,15 @@ export default function PostingPage() {
                       {c.blocked && (
                         <div className="mt-1 text-xs pill-review inline-block rounded-card px-2 py-0.5">
                           {c.blocked}
+                        </div>
+                      )}
+                      {c.sideExcluded.length > 0 && (
+                        <div className="mt-1 text-xs text-hint">
+                          {unnumberedLabel(c.sideExcluded)} not in this run — a chapter
+                          range can’t reach them.{' '}
+                          <button className="underline" onClick={c.clearRange}>
+                            post everything ready instead
+                          </button>
                         </div>
                       )}
                     </div>

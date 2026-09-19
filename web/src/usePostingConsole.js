@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
-import { blockedReason, eligible, heldReason, isLive } from './posting'
+import {
+  blockedReason, duplicates, eligible, heldReason, isLive, nextRun, snapshotWarning,
+  suggestionLabel,
+} from './posting'
 
 // Everything a screen needs to configure and start a posting run, minus the markup.
 //
@@ -124,6 +127,39 @@ export function usePostingConsole() {
     return [...groups.entries()].sort((a, b) => b[1] - a[1])
   }, [items])
 
+  const site = plan?.site || null
+
+  // What this run would pick up next, and whether offering it would change anything.
+  const nextUp = useMemo(() => nextRun(ready), [ready])
+  const suggestion = useMemo(() => suggestionLabel(nextUp, site), [nextUp, site])
+  // Shown only when tapping it would change what posts — the same discipline as the coin
+  // button, which disappears once the value matches.
+  //
+  // The second clause is the important one: when the unposted chapters are contiguous
+  // with nothing apart, blank boxes ALREADY post exactly the suggestion plus the side
+  // stories, so the button would be a no-op that quietly drops them.
+  const untouched = !from && !to && !upTo && !limit
+  const suggestionApplies = nextUp.from != null
+    && (String(nextUp.from) !== from || String(nextUp.to) !== to)
+    && !(nextUp.covers && untouched)
+
+  const applyNextRun = useCallback(() => {
+    setFrom(String(nextUp.from)); setTo(String(nextUp.to)); setUpTo(''); setLimit('')
+  }, [nextUp])
+  const clearRange = useCallback(() => { setFrom(''); setTo(''); setUpTo('') }, [])
+
+  // A numeric bound cannot reach a side story, in eligible() or on the server. Said where
+  // it happens rather than warned about in the abstract.
+  const sideExcluded = useMemo(
+    () => ((from || to || upTo) ? ready.filter((i) => i.global == null) : []),
+    [ready, from, to, upTo])
+
+  const siteWarning = useMemo(() => snapshotWarning(site), [site])
+  const dupes = useMemo(() => duplicates(willPost, site), [willPost, site])
+  const rangeLabel = from && to ? `${from}–${to}`
+    : from ? `from ${from}` : to ? `to ${to}`
+    : upTo ? `up to ${upTo}` : limit ? `at most ${limit}` : ''
+
   const savedFree = Number(target?.free_through ?? 0)
   const savedCoins = Number(target?.coin_price ?? 0)
   const savedSidePaid = target?.side_paid ?? true
@@ -206,6 +242,8 @@ export function usePostingConsole() {
     savedFree, savedCoins, priceDirty, suggestedCoins, savingPrice, savePricing,
     from, setFrom, to, setTo, upTo, setUpTo, limit, setLimit,
     postState, setPostState, starting, start, cancel, resume,
-    blocked: blockedReason({ willPost, savedCoins, savedFree, priceDirty }),
+    site, nextUp, suggestion, suggestionApplies, applyNextRun, clearRange,
+    sideExcluded, siteWarning, dupes, rangeLabel,
+    blocked: blockedReason({ willPost, savedCoins, savedFree, priceDirty, dupes }),
   }
 }

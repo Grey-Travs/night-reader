@@ -1,5 +1,7 @@
 import { useToast } from '../toast'
-import { ago, priceLine, range, runHeadline } from '../posting'
+import {
+  ago, formatRuns, pickupLine, priceLine, range, runHeadline, unnumberedLabel,
+} from '../posting'
 import { usePostingConsole } from '../usePostingConsole'
 
 // Night Reader on a phone: one page, no app around it.
@@ -84,10 +86,22 @@ export default function PhonePage() {
                 </section>
 
                 <p className="text-xs text-hint">
-                  {c.plan.site?.fetched_at
-                    ? `Read ${c.plan.site.count} chapters off the site ${ago(c.plan.site.fetched_at)}.`
+                  {c.site?.fetched_at
+                    ? `Read ${c.site.count} chapters off the site ${ago(c.site.fetched_at)}`
+                      + `${c.site.trusted !== false && c.site.numbered > 0
+                        ? ` — it has ${formatRuns(c.site.posted)}` : ''}.`
                     : 'These counts don’t know what’s on the site yet — open the novel on meiko.studio once on the computer.'}
                 </p>
+
+                {c.siteWarning && (
+                  <p className="rounded-card px-2 py-1 text-xs pill-review">
+                    {c.siteWarning}
+                  </p>
+                )}
+
+                {c.site?.fetched_at && c.site.trusted !== false && (
+                  <p className="text-xs text-muted">{pickupLine(c.nextUp)}</p>
+                )}
 
                 {c.held.length > 0 && (
                   <p className="text-xs text-hint">
@@ -132,11 +146,26 @@ export default function PhonePage() {
                       </p>
                     </section>
 
+                    {c.suggestionApplies && (
+                      <button
+                        className="btn btn-ghost w-full py-2.5 text-xs"
+                        onClick={c.applyNextRun}
+                      >
+                        {c.suggestion}
+                      </button>
+                    )}
+
                     {/* Collapsed by default: these four are normally left empty, and an
-                        empty form is the common case worth keeping off the screen. */}
+                        empty form is the common case worth keeping off the screen. The
+                        suggestion sits ABOVE it on purpose — inside, nobody would see it,
+                        and the summary carries the applied range so a tap is visible
+                        without opening the panel. */}
                     <details className="card p-4">
                       <summary className="cursor-pointer text-sm font-medium">
                         Range &amp; visibility
+                        {c.rangeLabel && (
+                          <span className="text-hint"> · {c.rangeLabel}</span>
+                        )}
                       </summary>
                       <div className="mt-3 space-y-3">
                         <div className="flex gap-3">
@@ -194,6 +223,15 @@ export default function PhonePage() {
           </div>
           {c.blocked && (
             <div className="mt-1 rounded-card px-2 py-1 text-xs pill-review">{c.blocked}</div>
+          )}
+          {c.sideExcluded.length > 0 && (
+            <div className="mt-1 text-xs text-hint">
+              {unnumberedLabel(c.sideExcluded)} not in this run — a chapter range can’t
+              reach them.{' '}
+              <button className="underline" onClick={c.clearRange}>
+                post everything ready instead
+              </button>
+            </div>
           )}
           <button
             className="btn btn-primary mt-2 w-full py-3.5 text-base"
