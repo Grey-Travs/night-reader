@@ -27,6 +27,7 @@ from translation_bot.state import DONE_STATUSES, State
 from . import projects as pj
 from . import remote
 from . import series as series_mod
+from .titles import site_title_key
 
 ADAPTERS_DIR = pj.PROJECT_ROOT / "adapters"
 
@@ -214,17 +215,37 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
         })
 
     ledger = load_ledger(sid, target["id"])
-    posted = {e["title"] for e in ledger.get("entries", []) if e.get("status") == "posted"}
+    posted = {site_title_key(e["title"])
+              for e in ledger.get("entries", []) if e.get("status") == "posted"}
     # What the site itself says it has, which outranks the ledger: it reflects reality
     # including anything posted by hand, from another machine, or before this app existed.
-    # Compared case-insensitively to agree with the extension's own live diff, which
-    # lowercases — the ledger's exact match is kept as-is so its behaviour is unchanged.
-    site = load_site(sid, target["id"]) if use_site else {"titles": [], "fetched_at": None}
-    on_site = {t.casefold() for t in site["titles"]}
+    #
+    # Both sides go through site_title_key. This used to be an exact match against the
+    # ledger and a casefold against the site, which was two of the FIVE spellings of this
+    # comparison that existed across the two languages -- and any two of them disagreeing
+    # is either a duplicate posted or a chapter permanently blocked. Widening the ledger
+    # match from exact to the shared key only ever ADDS blocking, which is the safe
+    # direction. See server/titles.py.
+    site = (load_site(sid, target["id"]) if use_site
+            else {"titles": [], "fetched_at": None, "trusted": True, "why": ""})
+    on_site = {site_title_key(t) for t in site["titles"]}
+    # A snapshot we cannot trust blocks EVERYTHING, rather than being treated as empty.
+    #
+    # The direction matters more than the rule. "Treat it as empty" reads as "nothing is
+    # posted here", which is exactly what has two real series offering their whole backlog
+    # -- 120 and 101 chapters -- as ready to post a second time. Blocking every row makes
+    # eligible_items return nothing, which makes request_run refuse with "Nothing in that
+    # range is ready to post", so no second mechanism is needed to stop the run.
+    untrusted = (f"the site reading for this novel is unusable ({site['why']}) — open it "
+                 f"on meiko.studio so its chapter list is read again"
+                 ) if not site.get("trusted", True) else None
     for item in items:
-        if item["title"] in posted:
+        key = site_title_key(item["title"])
+        if untrusted:
+            item["blockers"] = [*item["blockers"], untrusted]
+        elif key in posted:
             item["blockers"] = [*item["blockers"], "already in the ledger as posted"]
-        elif item["title"].casefold() in on_site:
+        elif key in on_site:
             item["blockers"] = [*item["blockers"], "already on the site"]
 
     ready = [i for i in items if not i["blockers"]]
@@ -244,7 +265,11 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
                   # What the site charges, read off its own chapter rows. Offered to the
                   # page as a suggestion to confirm, never written onto the series here:
                   # a price is painful to undo, so it gets a person's click.
-                  "observed_coins": site.get("observed_coins")},
+                  "observed_coins": site.get("observed_coins"),
+                  # Whether this reading can be believed at all. False means every chapter
+                  # is blocked, so the page must explain rather than show a bare zero.
+                  "trusted": bool(site.get("trusted", True)),
+                  "why": site.get("why") or ""},
         # What the run would actually charge for, spelled out. Getting this backwards is
         # the mistake worth one extra click to avoid.
         "summary": {
@@ -452,20 +477,101 @@ def site_path(sid: str, target_id: str) -> Path:
     return publish_dir(sid, target_id) / "site.json"
 
 
+# Three is enough. A chapter genuinely titled after another novel is possible once; three
+# of them is not a coincidence, and the real failures match on all 94.
+_WRONG_PAGE_HITS = 3
+
+
+def snapshot_looks_wrong(sid: str, titles: list[str]) -> str | None:
+    """Whether a chapter list was in fact read off some OTHER page. Reason, or None.
+
+    This is not hypothetical. Two snapshots on disk -- "The Fluffy Intruder of the Demon
+    King's Castle" and "Everyone is Suspiciously Targeting Me" -- each hold 94 titles of
+    which every one is the name of a different novel in the studio. The extension scraped
+    the studio's series-list table instead of a chapter list, and because the result was
+    non-empty nothing rejected it. Both series consequently report their whole backlog
+    (120 and 101 chapters) as unposted, and a run on either would post them all a second
+    time.
+
+    The existing guard is ``write_site`` refusing an EMPTY list, whose docstring says "the
+    one way to get an empty result is to have scraped the wrong page". The two files above
+    are the counter-example: the wrong page can be read perfectly well and still be the
+    wrong page.
+
+    Matching is by ``site_title_key``, so the check agrees with every other title
+    comparison in the app.
+    """
+    keys = {site_title_key(t) for t in titles or []}
+    keys.discard("")
+    if not keys:
+        return None
+
+    # A local import: server/importing.py imports THIS module, so a module-level import
+    # here would be a cycle.
+    from . import importing
+
+    catalogue = {site_title_key(row.get("name"))
+                 for row in (importing.load_catalogue().get("series") or [])}
+    catalogue.discard("")
+    hits = keys & catalogue
+    if len(hits) >= _WRONG_PAGE_HITS:
+        return (f"{len(hits)} of these {len(keys)} titles are names of novels in the "
+                f"studio rather than chapters, so this was read off the series list")
+
+    # Works even when no catalogue has been pushed, which is the case for most libraries.
+    others = {site_title_key(row.get("name")) for row in series_mod.list_series()
+              if row.get("id") != sid}
+    others.discard("")
+    hits = keys & others
+    if len(hits) >= _WRONG_PAGE_HITS:
+        return (f"{len(hits)} of these {len(keys)} titles are names of other novels in "
+                f"your library rather than chapters of this one")
+    return None
+
+
 def load_site(sid: str, target_id: str) -> dict:
     """The chapter names last read off the site, or an empty snapshot.
 
     Empty and stale are deliberately different things: ``fetched_at`` is None only when
     nobody has ever looked, which is worth saying out loud on the Posting page rather than
     reporting a hundred chapters as ready to post.
+
+    ``trusted`` is the third state, and the important one. A snapshot can be present,
+    non-empty and recent and still be a reading of the wrong page -- see
+    ``snapshot_looks_wrong``. Checked on the way OUT rather than only on the way in,
+    because the two bad files are already on disk and a write-side guard would never look
+    at them.
+
+    Read here rather than through ``_read_json`` so that "the file is corrupt" and "nobody
+    has looked yet" stay distinguishable. They lead to opposite advice, and the shared
+    helper cannot tell them apart.
     """
-    doc = _read_json(site_path(sid, target_id),
-                     {"titles": [], "fetched_at": None, "observed_coins": None})
+    path = site_path(sid, target_id)
+    empty = {"titles": [], "fetched_at": None, "observed_coins": None,
+             "trusted": True, "why": ""}
+    if not path.exists():
+        return empty
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            raise ValueError("not an object")
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
+        # Keep the bytes, as every other reader here does -- and do NOT report it as an
+        # empty snapshot, which reads as "nothing is posted" and is the direction that
+        # posts a duplicate.
+        quarantine_unreadable(path)
+        return {**empty, "trusted": False,
+                "why": "the last reading of this novel could not be read back"}
+
     titles = doc.get("titles")
+    titles = [str(t) for t in titles] if isinstance(titles, list) else []
     coins = doc.get("observed_coins")
-    return {"titles": [str(t) for t in titles] if isinstance(titles, list) else [],
+    why = snapshot_looks_wrong(sid, titles)
+    return {"titles": titles,
             "fetched_at": doc.get("fetched_at"),
-            "observed_coins": coins if isinstance(coins, int) and coins > 0 else None}
+            "observed_coins": coins if isinstance(coins, int) and coins > 0 else None,
+            "trusted": why is None,
+            "why": why or ""}
 
 
 def _modal_price(prices: list[int] | None) -> int | None:
@@ -499,14 +605,31 @@ def write_site(sid: str, target_id: str, titles: list[str],
     the only way the plan can know what is already published. Without it a series posted
     before Night Reader existed reads as entirely unposted.
 
-    An EMPTY list is rejected rather than stored. The extension only ever scrapes a page it
-    believes is a chapter list, and the one way to get an empty result is to have scraped
-    the wrong page or scraped it too early — storing that would clear a good snapshot and
-    report everything as postable again.
+    Three ways a push is refused, each learned from a real file:
+
+    * **Empty.** Storing it would clear a good snapshot and report everything as postable.
+    * **The wrong page.** The original version of this docstring claimed an empty result
+      was "the one way" to have scraped the wrong page. It is not: two snapshots on disk
+      hold 94 perfectly well-formed titles that are the names of other novels, read off
+      the studio's series list. See ``snapshot_looks_wrong``.
+    * **A suspicious shrink.** A partial render, a paginated table or a scrape taken
+      mid-load yields a SHORT list, which the empty check waves through — and because a
+      write replaces, 114 chapters can become 1 with nothing to say so.
     """
     clean = [t for t in (str(x).strip() for x in titles or []) if t]
     if not clean:
         raise ValueError("Empty chapter list — refusing to overwrite the last snapshot.")
+    wrong = snapshot_looks_wrong(sid, clean)
+    if wrong:
+        raise ValueError(
+            f"This does not look like one novel's chapter list — {wrong}. Open the novel's "
+            f"own page (the one listing its chapters) and let it finish loading.")
+    previous = load_site(sid, target_id)["titles"]
+    if previous and len(clean) < SHRINK_FLOOR * len(previous):
+        raise ValueError(
+            f"Only {len(clean)} chapters were read where the last reading had "
+            f"{len(previous)} — refusing to shrink the snapshot on what looks like a "
+            f"partial page. Let the chapter list finish loading and try again.")
     # De-duplicated, preserving the site's own order (newest first) so the file reads the
     # way the page it came from does.
     seen: set[str] = set()
@@ -541,6 +664,11 @@ def write_site(sid: str, target_id: str, titles: list[str],
 # is worth more than the latency.
 
 RUN_STATES = ("queued", "running", "done", "cancelled", "failed")
+
+# How much of the previous snapshot a new reading must still cover. Below this it is
+# treated as a partial page rather than as chapters having been deleted. Deleting a fifth
+# of a novel in one sitting is rare; a table that rendered half its rows is not.
+SHRINK_FLOOR = 0.8
 
 # A running run whose browser has not been heard from in this long is reported as stalled.
 # Nothing reaps it: staleness is computed when the file is read, so there is no timer to

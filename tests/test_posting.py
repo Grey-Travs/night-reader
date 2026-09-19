@@ -517,8 +517,105 @@ def test_a_corrupt_snapshot_is_kept_aside_rather_than_trusted(client):
     path = posting.site_path(sid, "t1")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{ not json", encoding="utf-8")
-    assert posting.load_site(sid, "t1")["titles"] == []
+    site = posting.load_site(sid, "t1")
+    assert site["titles"] == []
     assert list(path.parent.glob("site.json.unreadable-*"))
+    # And NOT merely empty. An empty snapshot reads as "nothing is posted here", which is
+    # the direction that posts a duplicate; unreadable has to mean "do not act on this".
+    assert site["trusted"] is False
+    assert posting.plan_run(sid, "t1")["ready"] == 0
+
+
+# ---- a snapshot read off the wrong page -----------------------------------
+
+# Not hypothetical. Two snapshots in the real library each hold 94 titles that are the
+# names of OTHER novels: the extension scraped the studio's series-list table instead of a
+# chapter list, and because the result was non-empty nothing rejected it. Both series then
+# offered their whole backlog — 120 and 101 chapters — as ready to post a second time.
+#
+# The guard that existed was write_site refusing an EMPTY list, and its docstring claimed
+# an empty result was "the one way" to have scraped the wrong page. These files are the
+# counter-example.
+
+
+def _catalogue(tmp_path, names):
+    """The studio's own list of novels, as the extension pushes it."""
+    import json as _json
+    (tmp_path / "site_series.json").write_text(_json.dumps({
+        "fetched_at": "2026-09-19T00:00:00+00:00", "studio_uid": "s",
+        "series": [{"uid": f"u{i}", "name": n} for i, n in enumerate(names)],
+    }), encoding="utf-8")
+
+
+def test_a_reading_of_the_series_list_is_refused(client, tmp_path):
+    a = _novel(client, "Wrong", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Wrong", [a])
+    posting.write_site(sid, "t1", ["Chapter 1"])
+    _catalogue(tmp_path, ["A Damned Bastard", "A Killer E-Rank Guide", "Cherry Pop!"])
+    with pytest.raises(ValueError) as caught:
+        posting.write_site(sid, "t1", ["A Damned Bastard", "A Killer E-Rank Guide",
+                                       "Cherry Pop!"])
+    assert "chapter list" in str(caught.value)
+    # And the good snapshot is still there.
+    assert posting.load_site(sid, "t1")["titles"] == ["Chapter 1"]
+
+
+def test_a_series_list_already_on_disk_is_distrusted_on_read(client, tmp_path):
+    # The write-side guard cannot help the two files that already exist, so the check runs
+    # on the way out as well as on the way in.
+    a = _novel(client, "Stored", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Stored", [a])
+    posting.write_site(sid, "t1", ["Chapter 1"])
+    _catalogue(tmp_path, ["A Damned Bastard", "A Killer E-Rank Guide", "Cherry Pop!"])
+    path = posting.site_path(sid, "t1")
+    path.write_text(json.dumps({"fetched_at": "2026-09-19T00:00:00+00:00",
+                                "titles": ["A Damned Bastard", "A Killer E-Rank Guide",
+                                           "Cherry Pop!"]}), encoding="utf-8")
+    site = posting.load_site(sid, "t1")
+    assert site["trusted"] is False
+    assert "series list" in site["why"]
+
+
+def test_an_untrusted_snapshot_blocks_everything_rather_than_nothing(client, tmp_path):
+    """The whole point, and the direction is what matters.
+
+    Treating an unusable reading as "empty" means "nothing is posted", which is how two
+    real series came to offer 120 and 101 already-published chapters as ready.
+    """
+    a = _novel(client, "Closed", [1, 2, 3],
+               translated=[(1, "One.\n"), (2, "Two.\n"), (3, "Three.\n")])
+    sid = _series(client, "Closed", [a])
+    assert _plan(client, sid)["ready"] == 3          # nothing known about the site yet
+    _catalogue(tmp_path, ["A Damned Bastard", "A Killer E-Rank Guide", "Cherry Pop!"])
+    path = posting.site_path(sid, "t1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "fetched_at": "2026-09-19T00:00:00+00:00",
+        "titles": ["A Damned Bastard", "A Killer E-Rank Guide", "Cherry Pop!"],
+    }), encoding="utf-8")
+
+    plan = _plan(client, sid)
+    assert plan["ready"] == 0
+    assert plan["site"]["trusted"] is False
+    assert all("unusable" in b for i in plan["items"] for b in i["blockers"])
+    # And so a run cannot be started at all, through the refusal that already exists.
+    r = client.post("/api/posting/run", json={"sid": sid, "options": {}})
+    assert r.status_code == 400
+
+
+def test_a_partial_page_cannot_shrink_the_snapshot(client):
+    # A paginated table, a lazy render, or a scrape taken mid-load yields a SHORT list.
+    # The empty check waves it through, and a write replaces — so 114 becomes 1 silently.
+    a = _novel(client, "Shrink", [1], translated=[(1, "One.\n")])
+    sid = _series(client, "Shrink", [a])
+    posting.write_site(sid, "t1", [f"Chapter {n}" for n in range(1, 21)])
+    with pytest.raises(ValueError) as caught:
+        posting.write_site(sid, "t1", ["Chapter 20"])
+    assert "partial" in str(caught.value)
+    assert len(posting.load_site(sid, "t1")["titles"]) == 20
+    # A believable amount of shrinkage still goes through: chapters do get deleted.
+    posting.write_site(sid, "t1", [f"Chapter {n}" for n in range(1, 18)])
+    assert len(posting.load_site(sid, "t1")["titles"]) == 17
 
 
 # ---- the run request ------------------------------------------------------

@@ -13,6 +13,9 @@ config.toml
 # Your translated novels & progress (per-user data)
 projects/
 series/
+# The studio's own list of your novels, pushed here by the extension. Same reasoning as
+# projects/ and series/: it is your library, not this app's source.
+site_series.json
 chapters/
 audit/
 glossary.json

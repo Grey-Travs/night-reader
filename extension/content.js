@@ -110,8 +110,9 @@ function showWriteCount() {
 
 
 // The site's own chapter records, learned from the list it fetches for itself. Keyed by
-// display name, because that is the only handle shared between Night Reader's ledger and
-// the site — the ids are the site's alone.
+// nrTitleKey(displayName), because the display name is the only handle shared between
+// Night Reader's ledger and the site — the ids are the site's alone — and the key is the
+// one normalisation both halves of this app agree on (see server/titles.py).
 //
 // Needed because a chapter can only be changed by PUTting its whole record back, so editing
 // one created in an earlier session means knowing its `id`, `uid`, `createdAt` and the rest.
@@ -119,7 +120,7 @@ const CHAPTERS = new Map()
 window.addEventListener('message', (e) => {
   if (e.source !== window || e.data?.source !== 'nr-chapters') return
   for (const ch of e.data.chapters || []) {
-    if (ch?.displayName) CHAPTERS.set(ch.displayName.trim().toLowerCase(), ch)
+    if (ch?.displayName) CHAPTERS.set(nrTitleKey(ch.displayName), ch)
   }
 })
 
@@ -658,7 +659,8 @@ async function postViaApi({ payload, coins, state }) {
 
   const pending = readPending()
   let created
-  if (pending?.title === payload.title && pending.data?.id) {
+  if (pending && nrTitleKey(pending.title) === nrTitleKey(payload.title)
+      && pending.data?.id) {
     say(`1/3 resuming the chapter created earlier (id ${pending.data.id})`)
     created = pending.data
   } else {
@@ -1436,7 +1438,7 @@ async function pushSiteList(rows) {
   // has not seen contributes nothing rather than a guess — write_site keeps whatever an
   // earlier reading learned, so silence is safe and a wrong number is not.
   const prices = rows.map((r) => {
-    const rec = CHAPTERS.get(String(r.title || '').trim().toLowerCase())
+    const rec = CHAPTERS.get(nrTitleKey(r.title))
     if (!rec) return 0
     const isPaid = rec.paid === true || Number(rec.paid) === 1
     return isPaid ? Number(rec.coins) || 0 : 0
@@ -1567,18 +1569,22 @@ function buildQueue(plan, adapter, count, upTo) {
       + 'listing its chapters) rather than a single chapter, so the already-posted '
       + 'chapters can be read off it.')
   }
-  const already = new Set(onSite.map((r) => r.title.toLowerCase()))
+  // Keyed the same way the server keys its snapshot and its ledger. These two sides
+  // disagreeing is either a duplicate posted or a chapter that can never post.
+  const already = new Set(onSite.map((r) => nrTitleKey(r.title)))
   const held = plan.items.filter((i) => i.blockers.length)
   const ready = plan.items.filter((i) => !i.blockers.length)
-  let fresh = ready.filter((i) => !already.has(i.title.toLowerCase()))
+  let fresh = ready.filter((i) => !already.has(nrTitleKey(i.title)))
   // "up to chapter N" is a truer way to say what to post than a count: it names the
   // finishing line, so a run can be repeated without working out how many are left.
   // Rows with no global number are side stories, which no numeric range should sweep up.
   if (upTo) fresh = fresh.filter((i) => i.global != null && i.global <= upTo)
 
   const pending = readPending()
-  const resumable = pending && ready.find((i) => i.title === pending.title)
-  const queue = resumable && !fresh.some((i) => i.title === resumable.title)
+  const resumable = pending
+    && ready.find((i) => nrTitleKey(i.title) === nrTitleKey(pending.title))
+  const queue = resumable
+    && !fresh.some((i) => nrTitleKey(i.title) === nrTitleKey(resumable.title))
     ? [resumable, ...fresh]
     : fresh
 
@@ -1816,7 +1822,7 @@ async function publishPosted() {
     const todo = []
     const unknown = []
     for (const e of mine) {
-      const ch = CHAPTERS.get(String(e.title).trim().toLowerCase())
+      const ch = CHAPTERS.get(nrTitleKey(e.title))
       if (!ch) unknown.push(e.title)
       else if (String(ch.state).toLowerCase() !== 'public') todo.push({ entry: e, ch })
     }
