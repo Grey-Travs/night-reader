@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Suspense, useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import { Dot } from './ui'
@@ -87,7 +87,12 @@ export default function AppShell({ status, setStatus, onSetup }) {
           <ThemeToggle className="shrink-0" />
         </header>
         <main className="min-w-0 flex-1">
-          <Outlet context={{ status, setStatus, onSetup }} />
+          {/* Pages are fetched on demand, so this is where a route arrives. The boundary
+              is INSIDE main on purpose: put it above the shell and every navigation
+              would blank the sidebar and the header for the length of one fetch. */}
+          <Suspense fallback={<div className="page text-hint">Loading…</div>}>
+            <Outlet context={{ status, setStatus, onSetup }} />
+          </Suspense>
         </main>
       </div>
       <CommandPalette />

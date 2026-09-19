@@ -2,15 +2,6 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { useToast } from '../toast'
 
-// Reaching this app from a phone, so a posting run can be started from anywhere.
-//
-// The run request is what makes that work at all: pressing Start writes a file, and
-// whichever Chrome is open on the computer picks it up on its next poll. So there is no
-// phone-specific posting code — the only thing missing was a way to reach this interface.
-//
-// Which is also the risk, and why this screen is wordy. The API has no accounts; being
-// bound to loopback IS its authentication. Switching this on gives it an access key and
-// starts refusing anything from another device that does not carry it.
 // Turning the phone link into an icon on the home screen.
 //
 // The catch is not Night Reader's: Chrome will only install a web app from a **secure
@@ -91,9 +82,10 @@ function HomeScreen({ serve, local, onCopy }) {
             </a>. If the command complains about a certificate, that is what it wants.
           </p>
           <p className="text-xs text-hint">
-            One thing worth knowing: requests arriving this way come from Tailscale on this
-            machine, so they skip the access key — the tailnet itself is what keeps them
-            out. Only your own signed-in devices can reach it.
+            The access key still applies over https — a request proxied by Tailscale does
+            not arrive from this machine, so it is checked like any other. That is why the
+            installed app’s own start address carries the key: it keeps working even after
+            the browser forgets the cookie.
           </p>
         </>
       )}
@@ -101,6 +93,15 @@ function HomeScreen({ serve, local, onCopy }) {
   )
 }
 
+// Reaching this app from a phone, so a posting run can be started from anywhere.
+//
+// The run request is what makes that work at all: pressing Start writes a file, and
+// whichever Chrome is open on the computer picks it up on its next poll. So there is no
+// phone-specific posting code — the only thing missing was a way to reach this interface.
+//
+// Which is also the risk, and why this screen is wordy. The API has no accounts; being
+// bound to loopback IS its authentication. Switching this on gives it an access key and
+// starts refusing anything from another device that does not carry it.
 export default function RemoteAccess() {
   const toast = useToast()
   const [state, setState] = useState(null)

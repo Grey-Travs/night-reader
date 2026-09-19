@@ -108,9 +108,6 @@ function showWriteCount() {
   el.className = `nr-writes ${n ? 'nr-ok' : ''}`
 }
 
-function netSince(since) {
-  return NET.filter((r) => r.at >= since)
-}
 
 // The site's own chapter records, learned from the list it fetches for itself. Keyed by
 // display name, because that is the only handle shared between Night Reader's ledger and
@@ -126,24 +123,6 @@ window.addEventListener('message', (e) => {
   }
 })
 
-// GETs are the page refreshing itself; a write is what proves a submit happened.
-// Tokens are already redacted in netlog.js before they reach here.
-function describeNet(since, { limit = 6 } = {}) {
-  const all = netSince(since)
-  if (!all.length) return 'no requests at all — the click never reached the site'
-  const writes = all.filter((r) => r.method !== 'GET')
-  const show = writes.length ? writes : all
-  const lines = [`${all.length} request(s), ${writes.length} of them writes:`]
-  for (const r of show.slice(-limit)) {
-    lines.push(`  ${r.method} ${r.status} ${r.url}`)
-    // What was SENT matters as much as what came back: an operation the site puts in the
-    // request body would be missing from ours, and that is the difference between 200
-    // and 400.
-    if (r.sent) lines.push(`    sent: ${r.sent.replace(/\s+/g, ' ').slice(0, 400)}`)
-    if (r.body) lines.push(`    got:  ${r.body.replace(/\s+/g, ' ').slice(0, 300)}`)
-  }
-  return lines.join('\n')
-}
 
 /**
  * The writes, broken out parameter by parameter.
@@ -645,13 +624,6 @@ async function apiSaveChapter(data, { state, coins, html }) {
   }, pages ? { pages: b64(JSON.stringify(pages)) } : undefined)
 }
 
-/**
- * Post one chapter: create it, then save its fields and text together.
- *
- * `state` stays a parameter so a trial run can leave the chapter Private and invisible to
- * readers. The text goes in the SAME call that publishes it, so there is no window in which
- * an empty chapter is public.
- */
 // A chapter that was created but not finished, remembered so a retry continues into it.
 //
 // Without this, a failure between "created" and "saved" leaves a chapter on the site and the
@@ -674,6 +646,13 @@ function writePending(value) {
   } catch { /* blocked storage just means no resume */ }
 }
 
+/**
+ * Post one chapter: create it, then save its fields and text together.
+ *
+ * `state` stays a parameter so a trial run can leave the chapter Private and invisible to
+ * readers. The text goes in the SAME call that publishes it, so there is no window in which
+ * an empty chapter is public.
+ */
 async function postViaApi({ payload, coins, state }) {
   say(`\n## ${payload.title}  (${state}, ${coins ? `${coins} coins` : 'free'})`)
 
@@ -1054,7 +1033,7 @@ function scrapeChapterList(adapter) {
   }).filter((r) => r.title)
 }
 
-// --- driving the form ------------------------------------------------------
+// --- clicking and waiting, for the diagnostics -----------------------------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -1132,417 +1111,6 @@ async function click(el, what, { allowDisabled = false } = {}) {
   await sleep(150)
 }
 
-/**
- * Put text into a field so the page's own framework notices.
- *
- * Setting `.value` alone shows the text but leaves Vue's bound state untouched, so the
- * site still believes the field is empty — the text is visibly there and Submit stays
- * disabled. The key events are what a real keyboard produces, and `blur` is what triggers
- * validation on most forms.
- */
-async function typeInto(el, text) {
-  el.focus()
-  el.select?.()
-
-  // `execCommand('insertText')` first. It is the one programmatic way to enter text that
-  // produces a real `beforeinput`/`input` pair from the browser itself, so every framework
-  // honours it — whereas assigning `.value` and dispatching a synthetic `input` puts the
-  // text on screen without necessarily reaching the component's state. That distinction is
-  // what cost chapter 62 twice: the box visibly read "Chapter 62" while the site submitted
-  // an empty name, and it could not be caught by checking `.value` or whether Submit was
-  // enabled, because both looked right.
-  let inserted = false
-  try {
-    inserted = document.execCommand('insertText', false, text)
-  } catch {
-    inserted = false
-  }
-  if (!inserted || el.value !== text) {
-    setInputValue(el, text)
-  }
-
-  // No synthetic `blur` here. It was added on the theory that blurring triggers
-  // validation, but a Headless UI dialog traps focus and can treat focus leaving as a
-  // dismissal — which would close the dialog before Submit is even clicked, leaving the
-  // click to land on the page underneath. `insertText` already updates the component's
-  // state, so the blur bought nothing and risked exactly this.
-  await sleep(250)
-  if (el.value !== text) {
-    throw new Error(`the name box holds "${el.value}" instead of "${text}"`)
-  }
-  return inserted ? 'typed' : 'assigned'
-}
-
-// Is the dialog still there? Checked immediately before submitting, because a dialog that
-// has already closed turns the Submit click into a click on whatever is behind it — which
-// looks exactly like a handler that silently did nothing.
-function dialogOpen(panel, nameInput) {
-  return document.contains(nameInput) && visible(nameInput)
-    && (!panel || document.contains(panel))
-}
-
-function isBlocked(el) {
-  // Vue components often mark a button unusable with aria-disabled and a no-op handler
-  // rather than the disabled attribute, so checking only `.disabled` misses it.
-  return el.disabled || el.getAttribute('aria-disabled') === 'true'
-}
-
-/**
- * Submit the new-chapter dialog, escalating until something actually happens.
- *
- * A plain click is what a person does, so it is tried first. If the dialog is still
- * sitting there afterwards the click did not take, and `requestSubmit` (the correct
- * programmatic way to submit a form, validation included) and then Enter are worth trying
- * before giving up. Each step says what it did, so the log shows which one the site wants.
- */
-async function submitDialog(panel, nameInput, adapter, log) {
-  const wanted = adapter.create_dialog.submit_text.toLowerCase()
-  const find = () => [...panel.querySelectorAll(CLICKABLE)]
-    .filter(visible)
-    .find((b) => label(b).toLowerCase().includes(wanted))
-
-  if (!dialogOpen(panel, nameInput)) {
-    throw new Error('the dialog closed before it could be submitted')
-  }
-
-  const button = find()
-  if (button) {
-    log(`    submitting via "${label(button)}" inside the dialog`
-      + (isBlocked(button) ? ' (marked unusable — trying anyway)' : ''))
-    button.scrollIntoView({ block: 'center' })
-    realClick(button)
-    await sleep(900)
-    if (!dialogOpen(panel, nameInput)) return 'clicked'
-
-    const form = button.closest('form')
-    if (form) {
-      log('    still open — submitting the form directly')
-      try {
-        form.requestSubmit(button.type === 'submit' ? button : undefined)
-      } catch {
-        form.requestSubmit()
-      }
-      await sleep(900)
-      if (!dialogOpen(panel, nameInput)) return 'requestSubmit'
-    }
-  } else {
-    log('    no Submit inside the dialog')
-  }
-
-  log('    still open — pressing Enter in the name box')
-  nameInput.focus()
-  for (const type of ['keydown', 'keypress', 'keyup']) {
-    nameInput.dispatchEvent(new KeyboardEvent(type, {
-      key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
-    }))
-  }
-  await sleep(900)
-  return dialogOpen(panel, nameInput) ? 'nothing worked' : 'enter'
-}
-
-// Every short piece of visible text on the page, for spotting what a toast said. The site
-// answers both success and failure with a notification, and until now the run read neither
-// — so a rejected submission looked identical to a silent no-op.
-function textSnapshot() {
-  const out = new Set()
-  for (const el of document.querySelectorAll('div, span, p, small, li, strong')) {
-    if (el.children.length) continue
-    const t = label(el)
-    if (t && t.length < 160) out.add(t)
-  }
-  return out
-}
-
-function newTextSince(before) {
-  return [...textSnapshot()].filter((t) => !before.has(t))
-}
-
-function clickable(text, what) {
-  const hit = byText(text)[0]
-  if (!hit) throw new Error(`could not find ${what || `a control labelled "${text}"`}`)
-  return hit
-}
-
-// A field is found by its PRINTED LABEL, then the control inside that label's container.
-// It cannot be found by the control's own text, because a Headless UI listbox button
-// shows its current VALUE ("Notes"), not what it is for ("Type") — and it cannot be found
-// by id, because every id here carries a per-render random prefix.
-const FIELD_CONTROL = '[id*="listbox-button"], [role="switch"], input, [aria-haspopup]'
-
-// An element's OWN text, ignoring text inside its children. A field label is sometimes
-// written as `<label>Type<span>Notes</span></label>`, whose full text reads "TypeNotes" and
-// which is not a leaf — so matching only leaf elements on their whole text misses it.
-function ownText(el) {
-  return [...el.childNodes]
-    .filter((n) => n.nodeType === 3)
-    .map((n) => n.textContent)
-    .join('')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-function fieldContainer(labelText) {
-  const want = String(labelText).trim().toLowerCase()
-  const labels = [...document.querySelectorAll('div, span, label, p, h3, h4, dt, dd')]
-    .filter((e) => ownText(e).toLowerCase() === want)
-  for (const el of labels) {
-    for (let n = el.parentElement, i = 0; n && i < 5; n = n.parentElement, i++) {
-      if (n.querySelector(FIELD_CONTROL)) return n
-    }
-  }
-  return null
-}
-
-// What the chapter form actually looks like, for when a field cannot be found. Reporting
-// this beats guessing at the structure a third time.
-function describeDetails(adapter) {
-  const d = adapter.details || {}
-  const lines = ['--- the chapter form as it stands ---', `url: ${location.href}`]
-  for (const name of [d.type_label, d.state_label, d.status_label, d.paid_label]) {
-    if (!name) continue
-    const box = fieldContainer(name)
-    const control = box && box.querySelector(FIELD_CONTROL)
-    lines.push(`label "${name}": ${box ? 'container found' : 'NOT FOUND'}`
-      + (control ? ` · control ${cssPath(control)} reads "${label(control).slice(0, 30)}"` : ''))
-  }
-  const boxes = [...document.querySelectorAll('[id*="listbox-button"], [aria-haspopup]')]
-    .filter(visible)
-  lines.push(`dropdowns on the page: ${boxes.length}`)
-  for (const b of boxes.slice(0, 8)) lines.push(`  reads "${label(b).slice(0, 30)}"  ${cssPath(b)}`)
-  const switches = [...document.querySelectorAll('[role="switch"]')].filter(visible)
-  lines.push(`switches: ${switches.length}`)
-  lines.push('Copy this back to Night Reader.')
-  return lines.join('\n')
-}
-
-function listboxFor(labelText) {
-  const box = fieldContainer(labelText)
-  return box ? box.querySelector('[id*="listbox-button"], [aria-haspopup]') : null
-}
-
-function valueOf(labelText) {
-  const b = listboxFor(labelText)
-  return b ? label(b).trim() : null
-}
-
-async function setListbox(labelText, want) {
-  const button = listboxFor(labelText)
-  if (!button) throw new Error(`no dropdown found for "${labelText}"`)
-  if (label(button).trim().toLowerCase() === String(want).toLowerCase()) return 'already'
-  await click(button, `the "${labelText}" dropdown`)
-  const options = await waitFor(
-    () => {
-      const opts = [...document.querySelectorAll('[role="option"]')].filter(visible)
-      return opts.length ? opts : null
-    },
-    { what: `the "${labelText}" options to open` },
-  )
-  const option = options.find((o) => label(o).trim().toLowerCase() === String(want).toLowerCase())
-  if (!option) {
-    const seen = options.map((o) => label(o).trim()).join(', ')
-    await click(button, 'to close the dropdown')  // leave the form as we found it
-    throw new Error(`"${labelText}" has no option "${want}" — it offers: ${seen}`)
-  }
-  await click(option, `the "${want}" option`)
-  await waitFor(() => label(button).trim().toLowerCase() === String(want).toLowerCase(),
-                { ms: 3000, what: `"${labelText}" to read "${want}"` })
-  return 'set'
-}
-
-function setInputValue(el, value) {
-  // The site is Nuxt/Vue (the page root is #__nuxt), so `v-model` listens for `input` and
-  // reads el.value back — meaning the value must be set BEFORE the event is fired, and the
-  // event must bubble. Going through the prototype's setter rather than assigning directly
-  // costs nothing here and is also what a React-controlled input would require, so this
-  // works either way if the site is ever rebuilt.
-  const setter = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value')?.set
-  if (setter) setter.call(el, String(value))
-  else el.value = String(value)
-  el.dispatchEvent(new Event('input', { bubbles: true }))
-  el.dispatchEvent(new Event('change', { bubbles: true }))
-}
-
-async function setPaid(coins, adapter) {
-  const labelText = adapter?.details?.paid_label || 'Paid Chapter'
-  const box = fieldContainer(labelText)
-  if (!box) throw new Error(`no "${labelText}" field found`)
-  const sw = box.querySelector('[role="switch"], input[type="checkbox"]')
-  if (!sw) throw new Error(`no toggle inside "${labelText}"`)
-  const isOn = () => {
-    const a = sw.getAttribute('aria-checked')
-    if (a != null) return a === 'true' || a === '1'
-    return !!sw.checked
-  }
-  const wantOn = Number(coins) > 0
-  if (isOn() !== wantOn) await click(sw, `the "${labelText}" toggle`)
-  if (!wantOn) return { paid: false, coins: 0 }
-  const input = await waitFor(() => box.querySelector('input[type="number"]'),
-                              { ms: 4000, what: 'the coins box to appear' })
-  setInputValue(input, coins)
-  await sleep(150)
-  return { paid: true, coins: Number(input.value) }
-}
-
-// Read the three fields back rather than trusting that setting them worked. Each is wrong
-// by default and each costs something real: Type left as "Pages" is the wrong kind of
-// chapter, State left as "Private" is invisible to readers, and a paid chapter posted free
-// is revenue gone and awkward to claw back once people have read it.
-function readBackDetails(adapter, want) {
-  const d = adapter.details
-  const got = {
-    type: valueOf(d.type_label),
-    state: valueOf(d.state_label),
-    coins: (() => {
-      const box = fieldContainer(d.paid_label)
-      const input = box && box.querySelector('input[type="number"]')
-      return input ? Number(input.value) : 0
-    })(),
-  }
-  const wrong = []
-  if (got.type !== want.type) wrong.push(`Type is "${got.type}", wanted "${want.type}"`)
-  if (got.state !== want.state) wrong.push(`State is "${got.state}", wanted "${want.state}"`)
-  if (Number(got.coins) !== Number(want.coins)) {
-    wrong.push(`Coins is ${got.coins}, wanted ${want.coins}`)
-  }
-  return { got, wrong }
-}
-
-async function saveAndConfirm(adapter, what) {
-  const savedText = (adapter.details?.saved_text || 'saved').toLowerCase()
-  await click(clickable(adapter.details?.save_text || 'Save', `the ${what} Save button`),
-              `the ${what} Save button`)
-  await waitFor(
-    () => [...document.querySelectorAll('div, span, p')]
-      .some((e) => !e.children.length && label(e).toLowerCase().includes(savedText)),
-    { ms: 20000, what: 'the "saved" confirmation' },
-  )
-  await sleep(250)
-}
-
-/**
- * NOT USED for posting any more — kept as a fallback if the API ever changes shape, and
- * because its field-by-field read-back is the only other way to verify a save. The live
- * path is postViaApi.
- *
- * Post one chapter by driving the form, end to end.
- *
- * `state` is deliberately a parameter: the first real run uses "Private" so the chapter is
- * invisible to readers while the form mapping is still being confirmed. Deleting a chapter
- * here means retyping its name, so nothing is created until the payload is in hand, and a
- * failure reports the chapter's title so a retry can continue into the shell that already
- * exists rather than making a second one.
- */
-async function postOne({ payload, coins, adapter, state }) {
-  const want = { type: adapter.details.type_value, state, coins: Number(coins) || 0 }
-  say(`\n## ${payload.title}  (${want.state}, ${want.coins ? want.coins + ' coins' : 'free'})`)
-
-  say('1/8 opening the new-chapter dialog')
-  let nameInput, panel
-  try {
-    ({ box: nameInput, panel } = await openCreateDialog(adapter, say))
-  } catch (e) {
-    // Guessing at this twice was enough. Report what the page actually holds, so the log
-    // says what to target rather than inviting a third guess.
-    say(`\n${describeDialog()}`)
-    throw e
-  }
-
-  say(`2/8 naming it "${payload.title}"`)
-  const how = await typeInto(nameInput, payload.title)
-  say(`    entered by ${how === 'typed' ? 'real key input' : 'value assignment (fallback)'}`)
-
-  const urlBefore = location.href
-  const textBefore = textSnapshot()
-  const netFrom = Date.now()
-  const how2 = await submitDialog(panel, nameInput, adapter, say)
-  say(`    submitted by: ${how2}`)
-  if (how2 === 'nothing worked') {
-    say('    the dialog is still open, so nothing was submitted and nothing created')
-    const inside = [...panel.querySelectorAll(CLICKABLE)].filter(visible)
-    say(`    buttons in the dialog (${inside.length}):`)
-    for (const b of inside) {
-      say(`      "${label(b)}" tag=${b.tagName.toLowerCase()} type=${b.type || '-'}`
-        + ` disabled=${b.disabled} aria-disabled=${b.getAttribute('aria-disabled')}`)
-    }
-    throw new Error('the dialog would not submit')
-  }
-
-  say('3/8 waiting for the chapter form')
-  // Submitting creates the chapter on the server and then moves to its own page, so this
-  // is a round trip, not a render. Waiting for the URL to change first separates "the
-  // chapter was never created" from "it was created but the form looks different than
-  // expected" — two very different problems that both used to surface as one timeout.
-  try {
-    await waitFor(() => location.href !== urlBefore && /\/chapter\//.test(location.href),
-                  { ms: 25000, every: 200, what: 'the new chapter to open' })
-  } catch {
-    say('    the page never moved to a chapter — the chapter may not have been created')
-    // The site answers with a notification either way, so whatever text appeared after the
-    // click is the site's own account of what went wrong. Reading it beats inferring.
-    const said = newTextSince(textBefore)
-    say(said.length
-      ? `    the site then said: ${said.slice(0, 8).map((t) => `"${t}"`).join(' · ')}`
-      : '    the site said nothing at all — no notification appeared')
-    // The decisive line. Whether a request was made separates "the click never reached
-    // the handler" from "it ran and the server refused", which the DOM cannot tell us.
-    say(`\n--- network since Submit ---\n${describeNet(netFrom)}`)
-    say(`\n${describeDetails(adapter)}`)
-    throw new Error('Submit did not open a chapter page')
-  }
-  say(`    on ${location.pathname}`)
-  try {
-    await waitFor(() => listboxFor(adapter.details.type_label),
-                  { ms: 25000, every: 200, what: 'the Details form' })
-  } catch (e) {
-    say(`\n${describeDetails(adapter)}`)
-    throw e
-  }
-  // The form mounts its fields progressively; a moment here costs nothing and avoids
-  // setting a dropdown that is about to be re-rendered underneath us.
-  await sleep(600)
-
-  say(`4/8 Type -> ${want.type}, State -> ${want.state}`)
-  await setListbox(adapter.details.type_label, want.type)
-  await setListbox(adapter.details.state_label, want.state)
-  const paid = await setPaid(want.coins, adapter)
-  say(`    paid: ${paid.paid ? `${paid.coins} coins` : 'free'}`)
-
-  const before = readBackDetails(adapter, want)
-  if (before.wrong.length) throw new Error(`before saving — ${before.wrong.join('; ')}`)
-
-  say('5/8 saving the form')
-  await saveAndConfirm(adapter, 'chapter')
-  const after = readBackDetails(adapter, want)
-  if (after.wrong.length) throw new Error(`after saving — ${after.wrong.join('; ')}`)
-  say('    fields read back correctly')
-
-  say('6/8 opening the page editor')
-  await click(clickable(adapter.pages.nav_text, 'the Pages tab'), 'Pages')
-  await sleep(500)
-  await waitFor(() => byText(adapter.pages.write_text).length,
-                { what: 'the Write Page button' })
-  await click(clickable(adapter.pages.write_text, 'the Write Page button'), 'Write Page')
-  const editor = await waitFor(() => document.querySelector(adapter.pages.editor_css),
-                               { what: 'the editor' })
-  await sleep(400)
-
-  say('7/8 pasting the chapter')
-  const counterBefore = findCounter()
-  pasteHtml(editor, payload.html, payload.text)
-  await sleep(500)
-  const counterAfter = findCounter()
-  const moved = counterBefore && counterAfter && counterAfter.used > counterBefore.used
-  if (!moved && !(editor.innerText || '').trim()) {
-    throw new Error('the paste did not land — the chapter would have saved empty')
-  }
-  say(`    editor now holds ${counterAfter ? counterAfter.used : '?'} characters`)
-  await click(clickable(adapter.pages.submit_text, 'the editor Submit button'), 'Submit')
-
-  say('8/8 saving the page')
-  await saveAndConfirm(adapter, 'page')
-  say(`\nDONE — ${payload.title} is on the site as ${want.state}.`)
-  return { title: payload.title, chars: counterAfter ? counterAfter.used : null }
-}
 
 // Opens the new-chapter dialog and reports what is in it, without submitting. Creating a
 // chapter here costs a manual delete (the site makes you retype its name), so this exists

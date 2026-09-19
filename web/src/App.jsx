@@ -1,36 +1,49 @@
-import { useEffect, useState } from 'react'
+import { Suspense, lazy, useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { api } from './api'
 import AppShell from './components/AppShell'
 import SetupWizard from './components/SetupWizard'
-import ProjectLayout from './components/ProjectLayout'
-import LibraryPage from './pages/LibraryPage'
-import SeriesPage from './pages/SeriesPage'
-import SeriesDetailPage from './pages/SeriesDetailPage'
-import PostingPage from './pages/PostingPage'
-import PhonePage from './pages/PhonePage'
-import ImportPage from './pages/ImportPage'
-import ActivityPage from './pages/ActivityPage'
-import ArchivePage from './pages/ArchivePage'
-import ReviewPage from './pages/ReviewPage'
-import GuidePage from './pages/GuidePage'
-import SettingsPage from './pages/SettingsPage'
-import ChaptersPage from './pages/ChaptersPage'
-import PagesPage from './pages/PagesPage'
-import ScansPage from './pages/ScansPage'
-import ProjectActivityPage from './pages/ProjectActivityPage'
-import GlossaryPage from './pages/GlossaryPage'
-import ConsistencyPage from './pages/ConsistencyPage'
-import ProjectSettingsPage from './pages/ProjectSettingsPage'
-import ReaderPage from './pages/ReaderPage'
 import ErrorBoundary from './components/ErrorBoundary'
 import { ErrorProvider } from './components/ErrorDialog'
-import UpkeepPage from './pages/UpkeepPage'
 import { HintsContext } from './hints'
 import { ToastProvider } from './toast'
 import { ConfirmProvider } from './confirm'
 import { getGuideSeen, getHintsOn, setGuideSeen, setHintsOn } from './prefs'
 import { isReady } from './ready'
+
+// Every page is fetched on demand, so opening a route costs that route's code and nothing
+// else. The shell, the providers and the setup wizard stay eager because they are on
+// screen before any route has resolved.
+//
+// This began to matter when the phone console arrived. It imports three small local
+// modules, but as one bundle it still shipped the reader, the photo-OCR tool, the glossary
+// UI and the whole markdown stack — none of which a phone can even reach — just to draw
+// three numbers, over a tailnet link on mobile data.
+const LibraryPage = lazy(() => import('./pages/LibraryPage'))
+const SeriesPage = lazy(() => import('./pages/SeriesPage'))
+const SeriesDetailPage = lazy(() => import('./pages/SeriesDetailPage'))
+const PostingPage = lazy(() => import('./pages/PostingPage'))
+const PhonePage = lazy(() => import('./pages/PhonePage'))
+const ImportPage = lazy(() => import('./pages/ImportPage'))
+const ActivityPage = lazy(() => import('./pages/ActivityPage'))
+const ArchivePage = lazy(() => import('./pages/ArchivePage'))
+const ReviewPage = lazy(() => import('./pages/ReviewPage'))
+const GuidePage = lazy(() => import('./pages/GuidePage'))
+const SettingsPage = lazy(() => import('./pages/SettingsPage'))
+const UpkeepPage = lazy(() => import('./pages/UpkeepPage'))
+const ScansPage = lazy(() => import('./pages/ScansPage'))
+const ProjectLayout = lazy(() => import('./components/ProjectLayout'))
+const ChaptersPage = lazy(() => import('./pages/ChaptersPage'))
+const PagesPage = lazy(() => import('./pages/PagesPage'))
+const ProjectActivityPage = lazy(() => import('./pages/ProjectActivityPage'))
+const GlossaryPage = lazy(() => import('./pages/GlossaryPage'))
+const ConsistencyPage = lazy(() => import('./pages/ConsistencyPage'))
+const ProjectSettingsPage = lazy(() => import('./pages/ProjectSettingsPage'))
+const ReaderPage = lazy(() => import('./pages/ReaderPage'))
+
+function FullPageLoading() {
+  return <div className="flex min-h-screen items-center justify-center bg-page text-hint">Loading…</div>
+}
 
 export default function App() {
   const [status, setStatus] = useState(undefined) // undefined = still loading
@@ -61,9 +74,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status])
 
-  if (status === undefined) {
-    return <div className="flex min-h-screen items-center justify-center bg-page text-hint">Loading…</div>
-  }
+  if (status === undefined) return <FullPageLoading />
 
   const ready = isReady(status)
 
@@ -77,35 +88,40 @@ export default function App() {
     />
   ) : (
     <ErrorBoundary>
-      <Routes>
-        {/* Outside AppShell on purpose: no sidebar, no top bar, nothing of the desktop
-            site. This is what the phone link and the home-screen icon open. */}
-        <Route path="phone" element={<PhonePage />} />
-        <Route element={<AppShell status={status} setStatus={setStatus} onSetup={() => setForceSetup(true)} />}>
-          <Route index element={<LibraryPage />} />
-          <Route path="series" element={<SeriesPage />} />
-          <Route path="series/:sid" element={<SeriesDetailPage />} />
-          <Route path="posting" element={<PostingPage />} />
-          <Route path="import" element={<ImportPage />} />
-          <Route path="activity" element={<ActivityPage />} />
-          <Route path="review" element={<ReviewPage />} />
-          <Route path="scans" element={<ScansPage />} />
-          <Route path="upkeep" element={<UpkeepPage />} />
-          <Route path="archive" element={<ArchivePage />} />
-          <Route path="guide" element={<GuidePage />} />
-          <Route path="settings" element={<SettingsPage />} />
-          <Route path="novel/:pid" element={<ProjectLayout />}>
-            <Route index element={<ChaptersPage />} />
-            <Route path="pages" element={<PagesPage />} />
-            <Route path="activity" element={<ProjectActivityPage />} />
-            <Route path="glossary" element={<GlossaryPage />} />
-            <Route path="consistency" element={<ConsistencyPage />} />
-            <Route path="settings" element={<ProjectSettingsPage />} />
-            <Route path="chapter/:idx" element={<ReaderPage />} />
+      {/* The outermost boundary, and in practice only /phone reaches it: every route
+          inside AppShell suspends against the one around its Outlet, which is what keeps
+          the sidebar on screen while a page is being fetched. */}
+      <Suspense fallback={<FullPageLoading />}>
+        <Routes>
+          {/* Outside AppShell on purpose: no sidebar, no top bar, nothing of the desktop
+              site. This is what the phone link and the home-screen icon open. */}
+          <Route path="phone" element={<PhonePage />} />
+          <Route element={<AppShell status={status} setStatus={setStatus} onSetup={() => setForceSetup(true)} />}>
+            <Route index element={<LibraryPage />} />
+            <Route path="series" element={<SeriesPage />} />
+            <Route path="series/:sid" element={<SeriesDetailPage />} />
+            <Route path="posting" element={<PostingPage />} />
+            <Route path="import" element={<ImportPage />} />
+            <Route path="activity" element={<ActivityPage />} />
+            <Route path="review" element={<ReviewPage />} />
+            <Route path="scans" element={<ScansPage />} />
+            <Route path="upkeep" element={<UpkeepPage />} />
+            <Route path="archive" element={<ArchivePage />} />
+            <Route path="guide" element={<GuidePage />} />
+            <Route path="settings" element={<SettingsPage />} />
+            <Route path="novel/:pid" element={<ProjectLayout />}>
+              <Route index element={<ChaptersPage />} />
+              <Route path="pages" element={<PagesPage />} />
+              <Route path="activity" element={<ProjectActivityPage />} />
+              <Route path="glossary" element={<GlossaryPage />} />
+              <Route path="consistency" element={<ConsistencyPage />} />
+              <Route path="settings" element={<ProjectSettingsPage />} />
+              <Route path="chapter/:idx" element={<ReaderPage />} />
+            </Route>
           </Route>
-        </Route>
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </Suspense>
     </ErrorBoundary>
   )
 

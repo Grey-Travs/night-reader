@@ -1,8 +1,20 @@
-## meiko.studio — how to drive the chapter editor.
+## meiko.studio — the few things about the site the extension still has to be told.
 ##
 ## This file is DATA on purpose. When the site moves a button you edit a line here and
 ## reload the page; no code change, no extension reload. The extension fetches it from the
-## app at GET /api/posting/adapter.
+## app at GET /api/posting/adapter, and the app reads [site] itself when it builds a plan.
+##
+## It used to describe the whole posting flow — the Details form, the page editor, the
+## back arrow — because posting meant driving that form field by field. It does not any
+## more: meiko is a Nuxt front end over an API at hirayatales.com/app/chapter, and the
+## extension calls that directly (POST to create, PUT to configure and fill). Everything
+## the form path needed was removed along with the code that read it; git history has it
+## if the API ever changes shape.
+##
+## What is left is read by live code:
+##   [site]          the app, when planning a run
+##   [chapter_list]  scraped read-only before a run, as a duplicate guard
+##   [create]        the dialog probe in the extension's panel
 ##
 ## Locators are matched by VISIBLE TEXT wherever possible, because text is what survives a
 ## redesign. This site is built with Tailwind and Headless UI, so its class names are
@@ -10,8 +22,9 @@
 ## suffix (`headlessui-switch-nidk7BJvxkY_313`) — neither is safe to target. Give `css`
 ## only where the structure is stable, like a table cell position.
 ##
-## Confirmed against the live site by the extension's Probe, except the [details] section:
-## that form is on a chapter's own page, which has not been probed yet.
+## One standing rule, enforced by the code simply never looking for it: the robot does not
+## press "Send Notification". Posting a batch would otherwise fire one reader alert per
+## chapter; the user notifies people themselves.
 
 [site]
 name = "meiko"
@@ -24,9 +37,10 @@ title_template = "Chapter {n}"
 side_title_template = "Side Stories {n}"
 
 ## ---------------------------------------------------------------------------
-## Step 1 — the series landing page, listing every chapter already posted.
+## The series landing page, listing every chapter already posted.
 ## Scraped read-only before a run: the live list is a better duplicate guard than our own
-## ledger, because it also catches anything posted by hand.
+## ledger, because it also catches anything posted by hand. It is also where the coin price
+## is read from, so the app can offer the site's own number rather than have it typed.
 ##
 ## Confirmed shape, one row per chapter, newest first:
 ##   ["Chapter 61 55", "3", "Public"]
@@ -45,79 +59,22 @@ coins_input_css = 'input[placeholder="Coins"]'
 # role within the row — never by id.
 row_switch_css = '[role="switch"]'
 
-## Step 1 — start a new chapter. CONFIRMED by probe.
+## ---------------------------------------------------------------------------
+## Opening the "Create Chapter" dialog. Used only by the panel's dialog probe now, which
+## opens it and submits nothing — the real path creates chapters through the API.
 ##
 ## Two buttons carry this label (sidebar and header), so the extension tries each rather
 ## than trusting DOM order; the sidebar one is what opens the dialog.
 ##
-## Two things learned the hard way here. `el.click()` alone does nothing — the handler is
-## not on `click`, so the whole pointer/mouse sequence has to be dispatched. And the button
-## reports `disabled=true` shortly after the page settles; a synthetic event reaches a
-## disabled element's listeners anyway, which is why it opened at all, so the extension
-## waits for it to enable rather than relying on that.
+## Two things learned the hard way. `el.click()` alone does nothing — the handler is not on
+## `click`, so the whole pointer/mouse sequence has to be dispatched. And the button reports
+## `disabled=true` shortly after the page settles; a synthetic event reaches a disabled
+## element's listeners anyway, which is why it opened at all, so the extension waits for it
+## to enable rather than relying on that.
+##
+## The dialog's name box has NO placeholder and no stable id, so there is nothing here to
+## select on. It is found structurally instead — the text box that appeared inside the modal
+## and was not on the page beforehand — which is what `findNameBox` does, and why this
+## section carries no CSS.
 [create]
 text = "Create"
-
-## Step 2 — the "Create Chapter" dialog. CONFIRMED by probe.
-##
-## The name box has NO placeholder and no stable id (ids carry a per-render random prefix),
-## so there is nothing here to select on. It is found structurally instead: the text box
-## that appeared inside the modal which was not on the page beforehand. That is what
-## `findNameBox` does, and it is why this section has no CSS.
-[create_dialog]
-submit_text = "Submit"
-
-## ---------------------------------------------------------------------------
-## Step 3 — the chapter's Details form. NOT YET PROBED.
-##
-## There are no <select> elements anywhere on the list page, and this site uses Headless UI,
-## so Type/State/Status are almost certainly Headless UI Listbox widgets: a button that
-## opens a [role="listbox"] of [role="option"] items, rather than a native dropdown. The
-## extension tries, in order: a native <select>; a Headless UI listbox button whose label
-## matches; then any clickable whose text matches the wanted value.
-##
-## Three of these are wrong by default and each costs something real if it silently stays
-## wrong, so every one is read back after setting AND after saving.
-[details]
-# Defaults to "Pages"; must become "Notes".
-type_label = "Type"
-type_value = "Notes"
-# Defaults to "Private". A Private chapter is invisible to readers — which is exactly what
-# the first trial run wants, so set this to "Private" until the form mapping is confirmed.
-state_label = "State"
-state_value = "Public"
-status_label = "Status"
-status_value = "Live"
-# A toggle that reveals the coin input. A paid chapter posted free is revenue gone, and
-# awkward to claw back once people have read it.
-paid_label = "Paid Chapter"
-coins_label = "Coins"
-save_text = "Save"
-saved_text = "Your data has been saved"
-
-## ---------------------------------------------------------------------------
-## Steps 4-6 — a chapter's text lives in one Page inside the chapter.
-[pages]
-nav_text = "Pages"
-write_text = "Write Page"
-# CONFIRMED: TipTap/ProseMirror. So the text goes in with a synthetic `paste` event
-# carrying text/html — `.value` does not exist on it and assigning innerHTML corrupts
-# ProseMirror's internal document. The probe confirmed a synthetic paste is accepted and
-# preserves <p>, <strong> and <em>.
-editor_css = ".tiptap.ProseMirror"
-# Found by scanning leaf elements for this pattern; no stable class to hang a selector on.
-# The single most useful signal the site gives us: if it does not move off zero after the
-# paste, the paste failed and the chapter would save empty.
-counter_pattern = '(\d[\d,]*)\s*/\s*(\d[\d,]{3,})'
-page_name_input_placeholder = "Page Name"
-submit_text = "Submit"
-save_text = "Save"
-# Back to the chapter list, ready for the next one. An icon-only button, so it has no text
-# to match; it is the first button inside the sidebar header.
-back_css = "button:has(svg)"
-
-## ---------------------------------------------------------------------------
-## Never touched by the robot. Posting a batch would otherwise fire one reader alert per
-## chapter; the user notifies people themselves.
-[never]
-notify_text = "Send Notification"

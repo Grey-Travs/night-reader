@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { api } from '../api'
 import { errorTitle } from '../errors'
@@ -541,7 +541,12 @@ export default function ProjectLayout() {
         </div>
       )}
 
-      <Outlet context={ctx} />
+      {/* Its own boundary rather than leaning on AppShell's: this layout owns the SSE
+          stream and the chapter list, and suspending against the outer one would tear
+          down the novel's header and tabs every time you moved between them. */}
+      <Suspense fallback={<div className="p-6 text-hint">Loading…</div>}>
+        <Outlet context={ctx} />
+      </Suspense>
     </div>
   )
 }
