@@ -127,6 +127,24 @@ export function usePostingConsole() {
     return [...groups.entries()].sort((a, b) => b[1] - a[1])
   }, [items])
 
+  // Chapters already up that do not match this series' own pricing, grouped by PROBLEM
+  // for the same reason `held` groups by reason: the plan covers the whole back
+  // catalogue rather than this run, so one changed coin price puts every posted chapter
+  // in here at once, and a per-chapter list would be a wall of text on the phone.
+  //
+  // Empty is NOT "everything is priced right". audit_pricing skips every row whose
+  // `paid` it does not know, which is every title-only snapshot, so this stays silent
+  // rather than reassuring; the "Read N chapters off the site" line carries freshness.
+  const audit = useMemo(() => {
+    const groups = new Map()
+    for (const a of plan?.audit || []) {
+      for (const problem of a.problems) {
+        groups.set(problem, (groups.get(problem) || 0) + 1)
+      }
+    }
+    return [...groups.entries()].sort((a, b) => b[1] - a[1])
+  }, [plan])
+
   const site = plan?.site || null
 
   // What this run would pick up next, and whether offering it would change anything.
@@ -241,7 +259,7 @@ export function usePostingConsole() {
     series, sid, setSid, chosen, target, targetId,
     plan, loading, error, setError, loadPlan,
     run, poll, live,
-    ready, free, paid, willPost, held,
+    ready, free, paid, willPost, held, audit,
     freeThrough, setFreeThrough, coinPrice, setCoinPrice, sidePaid, setSidePaid,
     savedFree, savedCoins, priceDirty, suggestedCoins, savingPrice, savePricing,
     from, setFrom, to, setTo, upTo, setUpTo, limit, setLimit,

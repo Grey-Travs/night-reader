@@ -146,6 +146,25 @@ describe('the dashboard', () => {
     // has no business on a four-inch screen either.
     expect(screen.queryByRole('table')).toBeNull()
   })
+
+  it('folds a mispriced back catalogue into one line, like it folds held', async () => {
+    // audit_pricing covers the whole back catalogue, not this run, so one changed coin
+    // price puts every posted chapter in it. Sixty rows is a wall of text on a phone.
+    const audit = Array.from({ length: 60 }, (_, i) => ({
+      title: `Chapter ${201 + i}`, global: 201 + i,
+      problems: ['costs 5 coins on the site, not 55'],
+    }))
+    setup({ planDoc: plan([item(72)], { audit }) })
+    const line = await screen.findByText(/but not as set/i)
+    expect(line.textContent).toContain('costs 5 coins on the site, not 55 (60)')
+    expect(line.textContent).not.toContain('Chapter 201')
+  })
+
+  it('stays quiet when the site agrees with the series', async () => {
+    setup({ planDoc: plan([item(72)], { audit: [] }) })
+    await screen.findByText('Ready')   // exact: /ready/i also hits the pricing pill
+    expect(screen.queryByText(/but not as set/i)).toBeNull()
+  })
 })
 
 describe('starting a run', () => {

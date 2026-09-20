@@ -220,6 +220,42 @@ describe('what the page shows', () => {
     expect(screen.getByText(/1 already on the site/)).toBeTruthy()
   })
 
+  // audit_pricing spans the WHOLE back catalogue, not this run, so one changed coin
+  // price puts every posted chapter in it at once. Listing them per chapter would be
+  // thousands of characters; the page has to fold them the way `held` folds.
+  it('folds a mispriced back catalogue into one line with a count', async () => {
+    const audit = Array.from({ length: 60 }, (_, i) => ({
+      title: `Chapter ${201 + i}`, global: 201 + i,
+      problems: ['costs 5 coins on the site, not 55'],
+    }))
+    setup({ planDoc: plan([item(72)], { audit }) })
+    await screen.findByText(/already on the site, but not as set/i)
+    expect(screen.getByText(/costs 5 coins on the site, not 55 \(60\)/)).toBeTruthy()
+    // the chapters themselves are NOT named -- that is the whole point
+    expect(screen.queryByText(/Chapter 201/)).toBeNull()
+  })
+
+  it('does not call a correctly priced chapter mispriced just because it is hidden', async () => {
+    // audit_pricing reports a wrong STATE independently of the price, so the heading has
+    // to cover both. "On the site at the wrong price" would be a lie for this row.
+    setup({
+      planDoc: plan([item(72)], {
+        audit: [{ title: 'Chapter 300', global: 300,
+                  problems: ['is private on the site, so readers cannot see it'] }],
+      }),
+    })
+    await screen.findByText(/already on the site, but not as set/i)
+    expect(screen.getByText(/is private on the site, so readers cannot see it \(1\)/))
+      .toBeTruthy()
+    expect(screen.queryByText(/wrong price/i)).toBeNull()
+  })
+
+  it('says nothing when the site agrees with the series', async () => {
+    setup({ planDoc: plan([item(72)], { audit: [] }) })
+    await screen.findByText(/Test Novel/i)
+    expect(screen.queryByText(/but not as set/i)).toBeNull()
+  })
+
   it('admits when nobody has read the site yet', async () => {
     setup()
     expect(await screen.findByText(/don’t know what’s on the site yet/i)).toBeTruthy()

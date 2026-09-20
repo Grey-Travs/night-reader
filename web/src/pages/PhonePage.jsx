@@ -99,6 +99,14 @@ export default function PhonePage() {
                   </p>
                 )}
 
+                {c.audit.length > 0 && (
+                  <p className="text-xs text-hint">
+                    Already on the site, but not as set: {c.audit
+                      .map(([problem, n]) => `${problem} (${n})`)
+                      .join(' · ')}
+                  </p>
+                )}
+
                 {c.site?.fetched_at && c.site.trusted !== false && (
                   <p className="text-xs text-muted">{pickupLine(c.nextUp)}</p>
                 )}

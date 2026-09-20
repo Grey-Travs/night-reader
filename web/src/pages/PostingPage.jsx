@@ -108,6 +108,22 @@ export default function PostingPage() {
                 </p>
               )}
 
+              {/* A report about the SITE, like the held line below -- not a warning about
+                  the reading, which is what the pill above is for. The count goes in
+                  brackets because each problem is already a third-person predicate
+                  ("costs 5 coins on the site, not 55"), so "58 costs ..." would not read. */}
+              {c.audit.length > 0 && (
+                <p className="mt-1 text-xs text-hint">
+                  Already on the site, but not as set:{' '}
+                  {c.audit.map(([problem, n], k) => (
+                    <span key={problem}>
+                      {k > 0 && ' · '}
+                      {problem} ({n})
+                    </span>
+                  ))}
+                </p>
+              )}
+
               {c.site?.fetched_at && c.site.trusted !== false && (
                 <p className="mt-1 text-xs text-muted">{pickupLine(c.nextUp)}</p>
               )}
