@@ -1955,28 +1955,36 @@ async function postBatch({ count, state, upTo, run = null }) {
         // The one exception is a chapter we created earlier and did not finish: there,
         // "already on the site" is the shell we mean to fill, not a duplicate.
         const remembered = readPending()
-        const isResume = !!(q.resumable
+        let isResume = !!(q.resumable
           && nrTitleKey(q.resumable.title) === nrTitleKey(payload.title))
           || !!(remembered
             && nrTitleKey(remembered.title) === nrTitleKey(payload.title))
         if (!isResume) {
           const live = await alreadyOnSite(pinned, payload.title)
           if (live) {
-            // Also say whether the copy up there is saved WRONGLY, measured by the same
-            // rule the save uses. A chapter that failed its settings check is left on the
-            // site and recorded, so the next run finds it here rather than in the resume
-            // path -- and naming only "it is already there" sends you looking for a
-            // duplicate while the price it is actually charging stays wrong.
+            // Two different situations wear the same face here, and the settings say
+            // which -- measured by the same rule the save itself uses:
+            //
+            //   * up there and CORRECT: a real duplicate. Stop, as before.
+            //   * up there and saved WRONGLY: ours, left behind by a run that stopped on
+            //     its own settings check. Repair it and carry on.
+            //
+            // Repairing creates no second copy and rewrites no text -- it re-saves the
+            // settings the chapter should have had. Throwing instead left the chapter
+            // mispriced AND blocked every chapter queued behind it, so a single bad save
+            // halted the run permanently: the next run met it here, stopped again, and
+            // nothing after it was ever attempted.
             const wrong = nrSettingsWrong(live, { state: want.state, coins: item.coins })
-            throw new Error(
-              `"${payload.title}" is already on the site (id ${live.id || '?'}`
-              + `${live.state ? ', ' + String(live.state).toLowerCase() : ''}`
-              + `${Number(live.coins) > 0 ? ', ' + live.coins + ' coins' : ''})`
-              + ' — stopping rather than posting a second copy.'
-              + (wrong.length
-                ? ` It is also saved wrongly up there (${wrong.join('; ')})`
-                  + ' — correct it on the site, or delete it there and run this again.'
-                : ''))
+            if (!wrong.length) {
+              throw new Error(
+                `"${payload.title}" is already on the site (id ${live.id || '?'}`
+                + `${live.state ? ', ' + String(live.state).toLowerCase() : ''}`
+                + `${Number(live.coins) > 0 ? ', ' + live.coins + ' coins' : ''})`
+                + ' — stopping rather than posting a second copy.')
+            }
+            say(`    already up there but saved wrongly (${wrong.join('; ')})`
+              + ' — repairing its settings rather than making a second copy')
+            isResume = true
           }
         }
 
