@@ -350,6 +350,96 @@ def test_confirming_the_number_releases_it(client):
     assert not freed["blockers"]
 
 
+# ---- taking a chapter back out of the ledger ------------------------------
+
+# Until this existed the ledger could only ever be added to: no route, UI or script could
+# amend it, so the one way past a stale "already posted" was to CHANGE THE TITLE -- the
+# same title-keying that let one chapter be published three times under three different
+# numbers. Repairing a real series meant hand-editing the JSON on disk.
+
+ONE = "One." + chr(10)
+TWO = "Two." + chr(10)
+
+
+def _posted(client, sid, title, **kw):
+    body = {"sid": sid, "target_id": "t1", "title": title, "status": "posted", **kw}
+    return client.post("/api/posting/result", json=body)
+
+
+def _forget(client, **params):
+    return client.request("DELETE", "/api/posting/ledger", params=params)
+
+
+def test_a_title_differing_only_in_case_updates_the_one_entry(client):
+    # record() compared raw titles with !=, while plan_run reads the same entries back
+    # through site_title_key. The two sides therefore disagreed about how many chapters
+    # the ledger holds, and one chapter could occupy two rows.
+    a = _novel(client, "Casing", [1], translated=[(1, ONE)])
+    sid = _series(client, "Casing", [a])
+    _posted(client, sid, "Chapter 1")
+    _posted(client, sid, "  chapter 1  ")
+    led = client.get("/api/posting/ledger", params={"sid": sid, "target_id": "t1"}).json()
+    assert len(led["entries"]) == 1
+
+
+def test_forgetting_a_chapter_lets_it_post_again(client):
+    a = _novel(client, "Forget", [1, 2], translated=[(1, ONE), (2, TWO)])
+    sid = _series(client, "Forget", [a])
+    _posted(client, sid, "Chapter 1")
+    first = next(i for i in _plan(client, sid)["items"] if i["global"] == 1)
+    assert "already in the ledger as posted" in first["blockers"]
+
+    r = _forget(client, sid=sid, target_id="t1", title="Chapter 1")
+    assert r.status_code == 200
+    assert [e["title"] for e in r.json()["removed"]] == ["Chapter 1"]
+
+    freed = next(i for i in _plan(client, sid)["items"] if i["global"] == 1)
+    assert freed["blockers"] == []
+
+
+def test_a_chapter_can_be_forgotten_by_where_it_lives(client):
+    # After a renumber the title has moved, so the title is the one thing you cannot use
+    # to name the entry you want gone.
+    a = _novel(client, "Moved", [1], translated=[(1, ONE)])
+    sid = _series(client, "Moved", [a])
+    _posted(client, sid, "Chapter 41", project_id=a, index=1)
+    r = _forget(client, sid=sid, target_id="t1", project_id=a, index=1)
+    assert r.status_code == 200
+    assert [e["title"] for e in r.json()["removed"]] == ["Chapter 41"]
+    assert r.json()["entries"] == []
+
+
+def test_an_index_on_its_own_never_forgets_anything(client):
+    # index is a tab's POSITION, re-derived on every source read. Without the document it
+    # belongs to it identifies nothing, so it must never match on its own.
+    a = _novel(client, "Loose", [1], translated=[(1, ONE)])
+    sid = _series(client, "Loose", [a])
+    _posted(client, sid, "Chapter 1", project_id=a, index=1)
+    r = _forget(client, sid=sid, target_id="t1", index=1)
+    assert r.status_code == 404
+    led = client.get("/api/posting/ledger", params={"sid": sid, "target_id": "t1"}).json()
+    assert len(led["entries"]) == 1
+
+
+def test_forgetting_a_chapter_that_was_never_posted_says_so(client):
+    a = _novel(client, "Never", [1], translated=[(1, ONE)])
+    sid = _series(client, "Never", [a])
+    assert _forget(client, sid=sid, target_id="t1", title="Chapter 9").status_code == 404
+
+
+def test_forgetting_does_not_unpost_anything_on_the_site(client):
+    # The site is the other record and is untouched: a forgotten chapter that is still
+    # live stays blocked by the snapshot, which is the safe direction.
+    a = _novel(client, "Live", [1], translated=[(1, ONE)])
+    sid = _series(client, "Live", [a])
+    _posted(client, sid, "Chapter 1")
+    client.post("/api/posting/site", json={
+        "sid": sid, "target_id": "t1", "titles": ["Chapter 1"]})
+    _forget(client, sid=sid, target_id="t1", title="Chapter 1")
+    first = next(i for i in _plan(client, sid)["items"] if i["global"] == 1)
+    assert "already on the site" in first["blockers"]
+
+
 def test_a_chapter_already_in_the_ledger_is_blocked(client):
     a = _novel(client, "Again", [1, 2],
                translated=[(1, "One.\n"), (2, "Two.\n")])

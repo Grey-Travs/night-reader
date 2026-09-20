@@ -4012,6 +4012,27 @@ def posting_ledger(sid: str, target_id: str = "default") -> dict:
     return posting.load_ledger(sid, target_id)
 
 
+@app.delete("/api/posting/ledger")
+def forget_posting_entry(sid: str, target_id: str = "default", title: str | None = None,
+                         project_id: str | None = None, index: int | None = None) -> dict:
+    """Take a chapter back out of the ledger, so it can be posted again.
+
+    Deliberately a separate route from recording one. Everything else here only ever adds
+    to the ledger, and the only way past a stale "already posted" was to change the
+    chapter's title -- the same title-keying that let one chapter go up three times under
+    three different numbers. Repairing that by hand meant editing the JSON on disk.
+
+    Removing an entry does NOT touch the site: the chapter stays published until it is
+    deleted there. This only says "stop treating it as already done".
+    """
+    require_series(sid)
+    try:
+        return posting.forget(sid, target_id, title=title,
+                              project_id=project_id, index=index)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @app.post("/api/posting/result")
 def posting_result(body: PostResult) -> dict:
     """Record what happened to one chapter.

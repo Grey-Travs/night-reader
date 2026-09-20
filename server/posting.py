@@ -633,12 +633,59 @@ def record(sid: str, target_id: str, entry: dict) -> dict:
     user works with too.
     """
     doc = load_ledger(sid, target_id)
-    entries = [e for e in doc.get("entries", []) if e.get("title") != entry.get("title")]
+    # Through site_title_key, like every other comparison of two chapter titles in this
+    # app. A raw != meant a title differing only in case or spacing produced a SECOND row
+    # for one chapter -- and since plan_run reads the same entries back through
+    # site_title_key, the two sides disagreed about how many chapters the ledger holds.
+    # That is the fifth spelling server/titles.py was written to remove; record() was the
+    # one that never got converted.
+    key = site_title_key(entry.get("title"))
+    entries = [e for e in doc.get("entries", []) if site_title_key(e.get("title")) != key]
     entries.append(entry)
     entries.sort(key=lambda e: (e.get("global") is None, e.get("global") or 0,
                                 e.get("title") or ""))
     doc["entries"] = entries
     return _write_json(ledger_path(sid, target_id), doc)
+
+
+def forget(sid: str, target_id: str, *, title: str | None = None,
+           project_id: str | None = None, index: int | None = None) -> dict:
+    """Remove ledger entries, so a chapter the ledger blocks can be posted again.
+
+    The ledger is the only record that says "this is already published", and until now
+    nothing could amend it: the endpoints only ever appended, and no UI, route or script
+    could take an entry back. The single accidental way out was to CHANGE THE CHAPTER'S
+    TITLE, because every match in plan_run is keyed on the title -- which is the same
+    defect that let one chapter be published three times under three different numbers.
+
+    So this exists before that defect is tightened, not after. Any rule strict enough to
+    catch a renamed duplicate is also strict enough to block a chapter wrongly, and the
+    honest answer to "what do I do when it is wrong?" cannot be "hand-edit the JSON",
+    which is what repairing this series actually required.
+
+    Matched by title (through the shared key) or by (project_id, index), whichever is
+    given. Returns the ledger, with ``removed`` listing the entries taken out so the
+    caller can show what it just forgot -- and so it is recoverable by re-posting.
+    """
+    doc = load_ledger(sid, target_id)
+    entries = doc.get("entries", [])
+    key = site_title_key(title) if title is not None else None
+
+    def matches(e: dict) -> bool:
+        if key is not None and site_title_key(e.get("title")) == key:
+            return True
+        # Deliberately requires BOTH, never index alone: index is a tab's POSITION and is
+        # re-derived on every source read, so it means nothing without the document it
+        # belongs to -- and even then only for as long as no tab is inserted before it.
+        return (project_id is not None and index is not None
+                and e.get("project_id") == project_id and e.get("index") == index)
+
+    removed = [e for e in entries if matches(e)]
+    if not removed:
+        raise ValueError("no ledger entry matches that chapter")
+    doc["entries"] = [e for e in entries if not matches(e)]
+    saved = _write_json(ledger_path(sid, target_id), doc)
+    return {**saved, "removed": removed}
 
 
 # ---------------------------------------------------------------------------
