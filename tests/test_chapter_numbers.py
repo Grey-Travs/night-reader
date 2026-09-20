@@ -148,6 +148,46 @@ def test_a_one_chapter_overlap_is_believed_rather_than_shifted():
     assert [r.global_number for r in rows] == [100, 101, 102]
 
 
+# ---- a restart, or genuinely earlier chapters? ----------------------------
+
+# The hint cannot tell these apart on its own, because it is only ever "carry on from the
+# member before". What separates them is whether anyone else already HOLDS those numbers.
+#
+# This cost real money. A 16-tab document whose headers read 201..216 was seeded to start
+# at 240 -- a member deleted from disk still held 224..239 -- so every chapter was shifted
+# +39 and published as "Chapter 240" upward. The same 16 chapters had already gone up as
+# "Chapter 224".."Chapter 239", so readers were sold the same chapters twice under two
+# different wrong names, and the duplicate guard saw nothing because it compares TITLES.
+
+
+def test_headers_below_the_hint_are_believed_when_nobody_holds_those_numbers():
+    # 201..216 against a hint of 240. Free space, so the document is telling the truth.
+    rows = infer_mapping(_doc(range(201, 217)), start_hint=240,
+                         taken=set(range(1, 200)) | set(range(224, 240)))
+    assert [r.global_number for r in rows] == list(range(201, 217))
+    assert {r.confidence for r in rows} == {"high"}
+
+
+def test_headers_below_the_hint_are_still_corrected_when_they_collide():
+    # The real restart: headers read 1..20 while the series already holds 1..100. Taking
+    # them at face value would put this document on top of the first one.
+    rows = infer_mapping(_doc(range(1, 21)), start_hint=101, taken=set(range(1, 101)))
+    assert [r.global_number for r in rows] == list(range(101, 121))
+
+
+def test_a_partial_collision_is_enough_to_correct():
+    # Only some of the claimed numbers are held. Overlapping at all means publishing over
+    # a chapter that exists, so the hint wins -- the safe direction.
+    rows = infer_mapping(_doc(range(98, 104)), start_hint=201, taken={100})
+    assert [r.global_number for r in rows] == list(range(201, 207))
+
+
+def test_with_no_occupancy_known_the_old_behaviour_stands():
+    # Callers that pass no `taken` (and every existing test) keep the previous rule.
+    rows = infer_mapping(_doc(range(1, 21)), start_hint=101)
+    assert [r.global_number for r in rows] == list(range(101, 121))
+
+
 # ---- the anomalies --------------------------------------------------------
 
 

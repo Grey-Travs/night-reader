@@ -540,6 +540,11 @@ def resolve_mapping(series: dict, chapters_by_pid: dict[str, list]) -> dict:
     previous = (load_mapping(series["id"]) or {}).get("members") or {}
     members: dict[str, dict] = {}
     running = 0
+    # Every global the members BEFORE this one already hold. It is what lets infer_mapping
+    # tell a document that restarted its numbering from one that genuinely holds earlier
+    # chapters -- the start hint alone cannot, because it is only ever "carry on from the
+    # member before", and a member that no longer exists on disk still contributes one.
+    taken: set[int] = set()
 
     for member in series.get("members") or []:
         pid = member.get("project_id")
@@ -562,9 +567,10 @@ def resolve_mapping(series: dict, chapters_by_pid: dict[str, list]) -> dict:
                 if isinstance(r.get("global"), int)
             ]
             running = max(numbers) if numbers else running
+            taken.update(numbers)
             continue
 
-        inferred = infer_mapping(chapters, start_hint=start)
+        inferred = infer_mapping(chapters, start_hint=start, taken=taken)
         rows = _keep_manual([r.as_dict() for r in inferred], previous.get(pid))
         members[pid] = {
             "offline": False,
@@ -576,6 +582,7 @@ def resolve_mapping(series: dict, chapters_by_pid: dict[str, list]) -> dict:
         # inference would ignore every human decision made on this member.
         numbers = [r.get("global") for r in rows if isinstance(r.get("global"), int)]
         running = max(numbers) if numbers else running
+        taken.update(numbers)
 
     doc = {"members": members}
     doc.update(_series_totals(doc))

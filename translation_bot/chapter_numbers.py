@@ -253,13 +253,18 @@ def _split_runs(candidates: list[int | None]) -> list[_Run]:
     return runs
 
 
-def infer_mapping(chapters, *, start_hint: int | None = None) -> list[Row]:
+def infer_mapping(chapters, *, start_hint: int | None = None,
+                  taken: set[int] | None = None) -> list[Row]:
     """Resolve every tab's global chapter number.
 
     ``chapters`` is a list of ``docs_extract.Chapter`` (anything with ``index``, ``title``,
     ``text`` and ``metrics``). ``start_hint`` is the global number the caller believes the
-    document's first chapter has -- from the series manifest -- and it OVERRIDES the
+    document's first chapter has -- from the series manifest -- and it overrides the
     measured offset for the first run, because some documents' own headers restart at 1.
+
+    ``taken`` is the set of global numbers the members BEFORE this one already hold. It is
+    what decides whether numbering below the hint is a restart or the truth: see the note
+    on the shift below.
 
     The result is a suggestion. Rows at ``CONF_LOW`` must be confirmed by a human before
     anything downstream relies on them.
@@ -293,11 +298,26 @@ def infer_mapping(chapters, *, start_hint: int | None = None) -> list[Row]:
                 if run.pairs:
                     first_position, first_number = run.pairs[0]
                     expected = start_hint + (first_position - run.start)
-                    # Only numbering that runs backwards into the previous document's
-                    # range is a restart the hint has to correct. Anything at or ahead of
-                    # what the series expects is believed: see _RESTART_TOLERANCE.
+                    # Numbering that runs backwards from what the series expects is
+                    # either a document that RESTARTED at 1, or a document that genuinely
+                    # holds earlier chapters -- and the hint cannot tell them apart,
+                    # because the hint is only ever "carry on after the member before".
+                    #
+                    # What tells them apart is whether anyone else already holds those
+                    # numbers. A real restart collides head-on with the document before it
+                    # (headers 1..100 against a series that already has 1..100); a
+                    # document of genuinely earlier chapters lands in free space.
+                    #
+                    # Measured: a 16-tab document whose headers read 201..216 was seeded
+                    # to start at 240 -- because a DELETED member still held 224..239 --
+                    # and every chapter was shifted +39 and published as "Chapter 240"
+                    # upward, twice, under two different wrong names. Nothing said so:
+                    # the rows recorded source="header" and confidence="high" beside a
+                    # global that was neither.
                     if first_number < expected - _RESTART_TOLERANCE:
-                        shift = expected - first_number
+                        claimed = {number for _, number in run.pairs}
+                        if not taken or (claimed & taken):
+                            shift = expected - first_number
                     if offset is not None:
                         offset += shift
                 else:
