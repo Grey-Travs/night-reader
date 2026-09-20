@@ -116,6 +116,56 @@ describe('adding a document to a series', () => {
     await waitFor(() => expect(api.seriesMapping).toHaveBeenCalledWith('s1', true))
   })
 
+  // Where a document starts decides how the whole of it is numbered, and those numbers
+  // become the chapter titles that get published. It was shown on this page and there
+  // was no way to change it -- the endpoint existed and nothing called it.
+  it('saves a start chapter and reads the numbering again', async () => {
+    setup()
+    api.updateSeries.mockResolvedValue({ ...SERIES })
+    const box = await screen.findByLabelText(/start chapter for imported novel/i)
+    fireEvent.change(box, { target: { value: '41' } })
+    api.seriesMapping.mockClear()
+    fireEvent.blur(box)
+    await waitFor(() => expect(api.updateSeries)
+      .toHaveBeenCalledWith('s1', { starts: { p1: 41 } }))
+    // A start is only a HINT -- a document whose tabs state their own numbers is
+    // believed over it -- so the page re-reads rather than assuming it took.
+    await waitFor(() => expect(api.seriesMapping).toHaveBeenCalledWith('s1', true))
+  })
+
+  it('clears a start back to carrying on from the document before', async () => {
+    setup()
+    api.updateSeries.mockResolvedValue({ ...SERIES })
+    const box = await screen.findByLabelText(/start chapter for imported novel/i)
+    fireEvent.change(box, { target: { value: '' } })
+    fireEvent.blur(box)
+    await waitFor(() => expect(api.updateSeries)
+      .toHaveBeenCalledWith('s1', { starts: { p1: null } }))
+  })
+
+  it('does not re-resolve anything when the number was not changed', async () => {
+    // Tabbing through the list must not re-read the numbering of every document it
+    // passes -- that is a network read per member.
+    setup()
+    const box = await screen.findByLabelText(/start chapter for imported novel/i)
+    api.seriesMapping.mockClear()
+    fireEvent.blur(box)
+    await waitFor(() => expect(screen.getByText(/documents, in reading order/i)).toBeTruthy())
+    expect(api.updateSeries).not.toHaveBeenCalled()
+    expect(api.seriesMapping).not.toHaveBeenCalled()
+  })
+
+  it('does not leave a refused number sitting in the box', async () => {
+    // 0 would be stored as falsy and silently mean "number it automatically", so it is
+    // refused -- and the box has to snap back rather than look accepted.
+    setup()
+    const box = await screen.findByLabelText(/start chapter for imported novel/i)
+    fireEvent.change(box, { target: { value: '0' } })
+    fireEvent.blur(box)
+    await waitFor(() => expect(box.value).toBe('1'))
+    expect(api.updateSeries).not.toHaveBeenCalled()
+  })
+
   it('will not add until a novel is picked', async () => {
     setup()
     await screen.findByLabelText(/add a document/i)

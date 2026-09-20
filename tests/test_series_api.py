@@ -138,6 +138,67 @@ def test_suggest_stops_offering_a_series_once_it_is_linked(client):
     assert client.get("/api/series/suggest").json()["groups"] == []
 
 
+# ---- editing where a document starts --------------------------------------
+
+# A member's start chapter decides how a whole document is numbered, and its numbers
+# become the chapter TITLES that get published. Getting it wrong renumbers the document
+# and publishes it under names nothing is watching for -- which is how one novel went up
+# three times under three different numbers.
+#
+# resolve_mapping reads it as ``member.get("start_chapter") or (running + 1)``, so 0 is
+# FALSY and silently means "number it automatically" rather than being rejected. None
+# means that on purpose; 0 meant it by accident.
+
+
+def _starts(client, sid, mapping):
+    return client.post(f"/api/series/{sid}", json={"starts": mapping})
+
+
+def test_a_member_can_be_told_where_it_starts(client):
+    a = _novel(client, "Start Novel", [1, 2, 3])
+    b = _novel(client, "Start Novel2", [4, 5])
+    sid = _series(client, "Start Novel", [a, b])
+    r = _starts(client, sid, {b: 40})
+    assert r.status_code == 200
+    got = {m["project_id"]: m["start_chapter"] for m in r.json()["members"]}
+    assert got[b] == 40
+
+
+def test_a_start_chapter_of_zero_is_refused(client):
+    # Stored, it would read as falsy and quietly revert that document to automatic
+    # numbering -- the failure looks like "my edit did nothing".
+    a = _novel(client, "Zero Novel", [1, 2])
+    sid = _series(client, "Zero Novel", [a])
+    r = _starts(client, sid, {a: 0})
+    assert r.status_code == 400
+    # errors are wrapped: {code, title, what, fixes}
+    assert "1 or more" in r.json()["detail"]["title"]
+    assert client.get(f"/api/series/{sid}").json()["members"][0]["start_chapter"] == 1
+
+
+def test_a_negative_start_chapter_is_refused(client):
+    a = _novel(client, "Neg Novel", [1, 2])
+    sid = _series(client, "Neg Novel", [a])
+    assert _starts(client, sid, {a: -5}).status_code == 400
+
+
+def test_a_start_can_be_cleared_back_to_carrying_on(client):
+    # The way out of a wrong start. Without this there is no way to say "never mind,
+    # just follow the document before it" once a number has been set.
+    a = _novel(client, "Clear Novel", [1, 2, 3])
+    b = _novel(client, "Clear Novel2", [4, 5])
+    sid = _series(client, "Clear Novel", [a, b])
+    _starts(client, sid, {b: 40})
+    r = _starts(client, sid, {b: None})
+    assert r.status_code == 200
+    got = {m["project_id"]: m["start_chapter"] for m in r.json()["members"]}
+    assert got[b] is None
+    # and the numbering carries on from the member before it again
+    doc = client.get(f"/api/series/{sid}/mapping", params={"refresh": True}).json()
+    rows = doc["members"][b]["rows"]
+    assert [row["global"] for row in rows] == [4, 5]
+
+
 def test_create_seeds_each_member_start_chapter(client):
     a = _novel(client, "Test Novel", [1, 2, 3, 4, 5])
     b = _novel(client, "Test Novel2", [6, 7, 8])

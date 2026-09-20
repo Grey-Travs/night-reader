@@ -3648,6 +3648,26 @@ class CreateSeries(BaseModel):
     project_ids: list[str] = Field(default_factory=list)
 
 
+def _checked_starts(starts: dict) -> dict:
+    """Each member's start chapter: a real chapter number, or None for "carry on".
+
+    Validated rather than stored as given, because resolve_mapping reads it as
+    ``member.get("start_chapter") or (running + 1)`` -- so a stored 0 is FALSY and
+    silently means "number this document automatically" instead of being rejected, and a
+    negative one seeds numbering below the document before it. None means auto on
+    purpose; 0 meant it by accident, which is the kind of difference that renumbers a
+    whole novel and publishes it under the wrong names.
+    """
+    for pid, value in (starts or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise HTTPException(
+                400, f"A start chapter has to be 1 or more, or empty to carry on from "
+                     f"the document before it ({pid} got {value!r}).")
+    return starts
+
+
 class UpdateSeries(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = None
@@ -3655,7 +3675,7 @@ class UpdateSeries(BaseModel):
     status: str | None = None
     # Member order IS reading order, so reordering is a first-class edit.
     members: list[str] | None = None
-    starts: dict[str, int] | None = None
+    starts: dict[str, int | None] | None = None
     publish_targets: list[dict] | None = None
 
 
@@ -3820,9 +3840,10 @@ def update_series_route(sid: str, body: UpdateSeries) -> dict:
             raise HTTPException(400, "Reordering must list exactly the current members.")
         series["members"] = [current[pid] for pid in body.members]
     if body.starts is not None:
+        starts = _checked_starts(body.starts)
         for member in series.get("members") or []:
-            if member.get("project_id") in body.starts:
-                member["start_chapter"] = body.starts[member["project_id"]]
+            if member.get("project_id") in starts:
+                member["start_chapter"] = starts[member["project_id"]]
     series_mod.write_series(series)
     return _series_summary(series, series_mod.load_mapping(sid))
 

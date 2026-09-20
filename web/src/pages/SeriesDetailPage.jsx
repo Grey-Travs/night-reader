@@ -40,6 +40,10 @@ export default function SeriesDetailPage() {
   const [busy, setBusy] = useState('')
   const [unlinked, setUnlinked] = useState([])
   const [addPid, setAddPid] = useState('')
+  // Typed-but-unsaved start chapters, keyed by document. The box reads from here when
+  // present and from the server otherwise, and the entry is dropped on every outcome --
+  // so a value the server refuses cannot sit in the box looking accepted.
+  const [starts, setStarts] = useState({})
 
   const load = useCallback(async (refresh = false) => {
     try {
@@ -150,6 +154,44 @@ export default function SeriesDetailPage() {
     }
   }
 
+  // Where a document starts decides how the whole of it is numbered, and those numbers
+  // become the chapter titles that get published -- so a wrong one renumbers a document
+  // and publishes it under names nothing is watching for.
+  //
+  // Saved on blur and ONLY when it changed: tabbing through the list must not re-resolve
+  // the numbering of every document it passes.
+  const saveStart = async (m, raw) => {
+    const pid = m.project_id
+    const forget = () => setStarts((prev) => {
+      const next = { ...prev }
+      delete next[pid]
+      return next
+    })
+    const text = String(raw).trim()
+    const value = text === '' ? null : Number(text)
+    if (value === (m.start_chapter ?? null)) return forget()
+    if (value !== null && (!Number.isInteger(value) || value < 1)) {
+      toast('A start chapter has to be a whole number, 1 or more')
+      return forget()
+    }
+    setBusy(`start:${pid}`)
+    try {
+      await api.updateSeries(sid, { starts: { [pid]: value } })
+      // Re-read rather than assume it took: a start is a HINT, and a document whose tabs
+      // state their own numbers is believed over it. Claiming "starts at 41" here would
+      // be asserting something the server never promised.
+      await load(true)
+      toast(value === null
+        ? 'Now carries on from the document before it'
+        : 'Saved — the numbering was read again')
+    } catch (e) {
+      toast(e.message || 'Could not save that start chapter')
+    } finally {
+      forget()
+      setBusy('')
+    }
+  }
+
   const series = data?.series
   const flaggedCount = rows.filter(isFlagged).length
   const visible = onlyFlagged ? rows.filter(isFlagged) : rows
@@ -206,6 +248,22 @@ export default function SeriesDetailPage() {
                     {m.name || m.project_id}
                   </Link>
                   <span className="shrink-0 text-hint">{m.chapter_count} tabs</span>
+                  <label className="flex shrink-0 items-baseline gap-1 text-hint">
+                    <span aria-hidden="true">·</span>
+                    <span>starts at</span>
+                    <input
+                      type="number"
+                      min="1"
+                      aria-label={`Start chapter for ${m.name || m.project_id}`}
+                      className="w-14 rounded border border-line bg-transparent px-1 py-0.5 text-xs"
+                      placeholder="auto"
+                      disabled={busy === `start:${m.project_id}`}
+                      value={starts[m.project_id] ?? (m.start_chapter ?? '')}
+                      onChange={(e) => setStarts((prev) => (
+                        { ...prev, [m.project_id]: e.target.value }))}
+                      onBlur={(e) => saveStart(m, e.target.value)}
+                    />
+                  </label>
                   {m.sealed && <span className="shrink-0 text-hint">· sealed</span>}
                   {m.offline && <span className="shrink-0 text-hint">· not readable</span>}
                   {m.missing && <span className="shrink-0 pill-review px-1">missing</span>}
