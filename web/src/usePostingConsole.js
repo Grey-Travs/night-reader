@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import {
-  blockedReason, chapterNumber, duplicates, eligible, heldReason, isLive, nextRun,
+  STALE_LEDGER, blockedReason, chapterNumber, duplicates, eligible, heldReason,
+  isLive, nextRun,
   snapshotWarning, suggestionLabel,
 } from './posting'
 
@@ -127,6 +128,14 @@ export function usePostingConsole() {
     return [...groups.entries()].sort((a, b) => b[1] - a[1])
   }, [items])
 
+  // Chapters the LEDGER alone is holding: our record says posted and the site's own list
+  // does not have them, which is a stale record rather than a published chapter. The only
+  // case worth offering to undo -- and the only one where undoing it changes anything,
+  // since a chapter still up there is blocked by the site whatever the ledger says.
+  const ledgerHeld = useMemo(
+    () => items.filter((i) => i.blockers.length === 1 && i.blockers[0] === STALE_LEDGER),
+    [items])
+
   // Chapters already up that do not match this series' own pricing, grouped by PROBLEM
   // for the same reason `held` groups by reason: the plan covers the whole back
   // catalogue rather than this run, so one changed coin price puts every posted chapter
@@ -247,6 +256,16 @@ export function usePostingConsole() {
     } catch (e) { setError(e) }
   }, [sid, targetId])
 
+  // Undoes a record, never a publication: the chapter stays wherever it is. If it turns
+  // out to be on the site after all, the next plan blocks it again on the snapshot.
+  const forget = useCallback(async (title, onDone) => {
+    try {
+      const out = await api.forgetPosted(sid, targetId, title)
+      await loadPlan()
+      onDone?.(out)
+    } catch (e) { setError(e) }
+  }, [sid, targetId, loadPlan])
+
   const resume = useCallback(async (onDone) => {
     try {
       const d = await api.resumePostingRun(sid, targetId)
@@ -265,7 +284,7 @@ export function usePostingConsole() {
     from, setFrom, to, setTo, upTo, setUpTo, limit, setLimit,
     postState, setPostState, starting, start, cancel, resume,
     site, nextUp, suggestion, suggestionApplies, applyNextRun, clearRange,
-    sideExcluded, siteWarning, dupes, rangeLabel,
+    sideExcluded, siteWarning, dupes, rangeLabel, ledgerHeld, forget,
     blocked: blockedReason({ willPost, savedCoins, savedFree, priceDirty, dupes }),
   }
 }

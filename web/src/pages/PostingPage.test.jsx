@@ -19,6 +19,9 @@ vi.mock('react-router-dom', () => ({
 }))
 
 vi.mock('../toast', () => ({ useToast: () => () => {} }))
+// Without this useConfirm falls back to the default context, which resolves false, and
+// every destructive action silently no-ops instead of running.
+vi.mock('../confirm', () => ({ useConfirm: () => async () => true }))
 
 vi.mock('../api', () => ({
   api: {
@@ -29,6 +32,7 @@ vi.mock('../api', () => ({
     cancelPostingRun: vi.fn(),
     resumePostingRun: vi.fn(),
     updateSeries: vi.fn(),
+    forgetPosted: vi.fn(),
   },
 }))
 
@@ -248,6 +252,51 @@ describe('what the page shows', () => {
     expect(screen.getByText(/is private on the site, so readers cannot see it \(1\)/))
       .toBeTruthy()
     expect(screen.queryByText(/wrong price/i)).toBeNull()
+  })
+
+  // A ledger record whose chapter is NOT on the site is a stale record, and until now
+  // the only way past one was to change the chapter's title -- the same title-keying
+  // that let one chapter go up three times under three different numbers.
+  it('offers to forget a record with no chapter behind it', async () => {
+    setup({
+      planDoc: plan([
+        item(72),
+        item(80, { blockers: ['already in the ledger as posted'] }),
+      ]),
+    })
+    await screen.findByText(/held by a record with no chapter behind it/i)
+    expect(screen.getByText('Chapter 80')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /post it again/i })).toBeTruthy()
+  })
+
+  it('does not offer it for a chapter that is still up there', async () => {
+    // Forgetting this one would buy nothing but a duplicate on the next run: the site
+    // blocks it whatever our record says.
+    setup({
+      planDoc: plan([
+        item(72),
+        item(81, {
+          blockers: ['already in the ledger as posted, and still on the site'],
+        }),
+      ]),
+    })
+    await screen.findByText(/held back/i)
+    expect(screen.queryByText(/no chapter behind it/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: /post it again/i })).toBeNull()
+  })
+
+  it('forgets the record and re-plans, so the chapter comes back as ready', async () => {
+    setup({
+      planDoc: plan([item(80, { blockers: ['already in the ledger as posted'] })]),
+    })
+    await screen.findByText(/no chapter behind it/i)
+    api.forgetPosted.mockResolvedValue({ entries: [], removed: [{ title: 'Chapter 80' }] })
+    api.postingPlan.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: /post it again/i }))
+    await waitFor(() => expect(api.forgetPosted)
+      .toHaveBeenCalledWith('s1', expect.any(String), 'Chapter 80'))
+    // re-read rather than assumed: the server decides what is ready now
+    await waitFor(() => expect(api.postingPlan).toHaveBeenCalled())
   })
 
   it('says nothing when the site agrees with the series', async () => {

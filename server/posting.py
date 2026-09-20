@@ -391,13 +391,22 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     untrusted = (f"the site reading for this novel is unusable ({site['why']}) — open it "
                  f"on meiko.studio so its chapter list is read again"
                  ) if not site.get("trusted", True) else None
+    # At most ONE of these is reported, because they answer the same question and the
+    # site outranks the ledger. But "in the ledger" alone used to hide whether the
+    # chapter is ALSO still up there, and the two need different actions: a ledger entry
+    # for a chapter that is no longer on the site is a stale record and can be taken
+    # back (DELETE /api/posting/ledger), while one that is still live is simply true and
+    # forgetting it would achieve nothing but a duplicate on the next run.
     for item in items:
         key = site_title_key(item["title"])
+        live = key in on_site
         if untrusted:
             item["blockers"] = [*item["blockers"], untrusted]
         elif key in posted:
-            item["blockers"] = [*item["blockers"], "already in the ledger as posted"]
-        elif key in on_site:
+            item["blockers"] = [*item["blockers"], (
+                "already in the ledger as posted, and still on the site" if live
+                else "already in the ledger as posted")]
+        elif live:
             item["blockers"] = [*item["blockers"], "already on the site"]
 
     ready = [i for i in items if not i["blockers"]]

@@ -208,6 +208,11 @@ export const api = {
     post('/api/posting/run', { sid, target_id: targetId, options }),
   cancelPostingRun: (sid, targetId = 'default') =>
     del(`/api/posting/run?${new URLSearchParams({ sid, target_id: targetId })}`),
+  // Take a chapter back out of the posting ledger, so a stale record stops blocking it.
+  // Does NOT touch the site: a chapter still published there stays blocked by the
+  // snapshot, which is the safe direction.
+  forgetPosted: (sid, targetId, title) =>
+    del(`/api/posting/ledger?${new URLSearchParams({ sid, target_id: targetId, title })}`),
   resumePostingRun: (sid, targetId = 'default') =>
     post('/api/posting/run/resume', { sid, target_id: targetId }),
 

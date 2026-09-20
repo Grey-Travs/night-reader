@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom'
 import { SkeletonRows } from '../components/ui'
 import { useToast } from '../toast'
+import { useConfirm } from '../confirm'
 import {
   NUMBERING, ago, clock, formatRuns, pickupLine, priceLine, range, runHeadline,
   unnumberedLabel,
@@ -25,7 +26,24 @@ import { usePostingConsole } from '../usePostingConsole'
 // the layout is here.
 export default function PostingPage() {
   const toast = useToast()
+  const confirm = useConfirm()
   const c = usePostingConsole()
+
+  // Undoes a RECORD, never a publication. Offered only for chapters the ledger alone is
+  // holding -- ours says posted and the site's own list does not have them -- because
+  // that pair is the only one where forgetting changes anything. A chapter still up
+  // there is blocked by the site whatever the ledger says.
+  const forgetOne = async (title) => {
+    const ok = await confirm({
+      title: `Post “${title}” again?`,
+      body: 'Night Reader has this recorded as posted, but the site’s own chapter list '
+        + 'does not have it. Forgetting the record lets it post again. Nothing on the '
+        + 'site changes — if it is up there after all, the next reading will block it.',
+      confirmLabel: 'Forget the record',
+    })
+    if (!ok) return
+    c.forget(title, () => toast(`“${title}” can be posted again`))
+  }
 
   return (
     <div className="page">
@@ -142,6 +160,31 @@ export default function PostingPage() {
                     </span>
                   ))}
                 </p>
+              )}
+
+              {c.ledgerHeld.length > 0 && (
+                <details className="mt-1 text-xs text-hint">
+                  <summary className="cursor-pointer">
+                    {c.ledgerHeld.length} held by a record with no chapter behind it
+                  </summary>
+                  <ul className="mt-1 space-y-1">
+                    {c.ledgerHeld.map((i) => (
+                      <li
+                        key={`${i.project_id}:${i.index}`}
+                        className="flex items-baseline gap-2"
+                      >
+                        <span className="min-w-0 flex-1 truncate">{i.title}</span>
+                        <button
+                          type="button"
+                          className="shrink-0 underline hover:no-underline"
+                          onClick={() => forgetOne(i.title)}
+                        >
+                          post it again
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
               )}
 
               <RunPanel

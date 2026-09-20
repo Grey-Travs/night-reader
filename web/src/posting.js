@@ -12,6 +12,12 @@ export const NUMBERING = 'waiting on a chapter number'
 // Blockers are written as sentences for a person reading one chapter. Grouped into a count
 // they need a short label instead, and the numbering one is the only kind that is one
 // click from being releasable — so it is the only one worth linking.
+// A ledger record with no chapter behind it any more. Matched EXACTLY on purpose: the
+// server says "already in the ledger as posted, and still on the site" when the chapter
+// is also live, and that one must not match -- forgetting it would buy nothing but a
+// duplicate on the next run.
+export const STALE_LEDGER = 'already in the ledger as posted'
+
 export function heldReason(blocker) {
   const b = blocker || ''
   if (b.includes('not confirmed')) return NUMBERING

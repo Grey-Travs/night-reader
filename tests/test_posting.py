@@ -427,6 +427,27 @@ def test_forgetting_a_chapter_that_was_never_posted_says_so(client):
     assert _forget(client, sid=sid, target_id="t1", title="Chapter 9").status_code == 404
 
 
+def test_a_ledger_block_says_whether_the_chapter_is_still_up(client):
+    """The difference decides what you can do about it.
+
+    A ledger entry for a chapter that is NO LONGER on the site is a stale record, and
+    taking it back lets the chapter post again. One for a chapter that is still up there
+    is simply true, and forgetting it would achieve nothing but a duplicate on the next
+    run. Reported identically, the two were indistinguishable.
+    """
+    a = _novel(client, "BothOrOne", [1, 2], translated=[(1, ONE), (2, TWO)])
+    sid = _series(client, "BothOrOne", [a])
+    _posted(client, sid, "Chapter 1")
+    _posted(client, sid, "Chapter 2")
+    # the site's own list carries only the first of them
+    client.post("/api/posting/site", json={
+        "sid": sid, "target_id": "t1", "titles": ["Chapter 1"]})
+    by = {i["title"]: i for i in _plan(client, sid)["items"]}
+    assert by["Chapter 1"]["blockers"] == [
+        "already in the ledger as posted, and still on the site"]
+    assert by["Chapter 2"]["blockers"] == ["already in the ledger as posted"]
+
+
 def test_forgetting_does_not_unpost_anything_on_the_site(client):
     # The site is the other record and is untouched: a forgotten chapter that is still
     # live stays blocked by the snapshot, which is the safe direction.
