@@ -50,7 +50,7 @@ export function formatRuns(pairs) {
 
 // Contiguous runs read far better than a list of forty numbers.
 export function range(rows) {
-  return formatRuns(runs(rows.map((i) => i.global)))
+  return formatRuns(runs(rows.map(chapterNumber)))
 }
 
 export function ago(iso) {
@@ -86,17 +86,32 @@ export function runHeadline(run) {
   return `Cancelled · ${posted.length} posted`
 }
 
+// The number a chapter RANGE is matched against, or null when a range cannot reach the
+// row at all.
+//
+// Side content is never range-selectable, even when it carries a number of its own. That
+// exception is the whole reason this exists: two series number their side stories 1..10 in
+// their own sequence, which collides exactly with their chapters 1..10. Reading `i.global`
+// directly — as every function below used to — made a side story's ordinal look like a
+// chapter number, so a run for chapters 1-10 swept ten side stories in, and the site's own
+// posted range 1..125 marked all ten as already-posted duplicates.
+//
+// Mirrors `is_side` in server/posting.py::plan_run. These two must agree: the server
+// decides what a run contains, this decides what the page PROMISES it contains.
+export const chapterNumber = (i) => ((i && i.kind !== 'side' && i.global != null)
+  ? i.global : null)
+
 // Which of the ready chapters this run would actually post, applying the four controls in
-// the same order the server does. A numeric range never sweeps up a side story, because a
-// side story has no global number to compare.
+// the same order the server does. A numeric range never sweeps up a side story.
 export function eligible(ready, { from, to, upTo, limit }) {
   let rows = ready.filter((i) => {
-    if (from && (i.global == null || i.global < Number(from))) return false
-    if (to && (i.global == null || i.global > Number(to))) return false
+    const n = chapterNumber(i)
+    if (from && (n == null || n < Number(from))) return false
+    if (to && (n == null || n > Number(to))) return false
     return true
   })
   const cap = Number(upTo) || 0
-  if (cap) rows = rows.filter((i) => i.global != null && i.global <= cap)
+  if (cap) rows = rows.filter((i) => chapterNumber(i) != null && chapterNumber(i) <= cap)
   const most = Number(limit) || 0
   if (most) rows = rows.slice(0, most)
   return rows
@@ -170,8 +185,8 @@ export function snapshotWarning(site) {
 // site orders chapters by number: posting 223 while 201-222 are missing publishes a novel
 // with a hole the reader can see.
 export function nextRun(ready) {
-  const numbered = ready.map((i) => i.global).filter((n) => n != null)
-  const sides = ready.filter((i) => i.global == null).length
+  const numbered = ready.map(chapterNumber).filter((n) => n != null)
+  const sides = ready.filter((i) => chapterNumber(i) == null).length
   const pairs = runs(numbered)
   if (!pairs.length) {
     return { from: null, to: null, count: 0, apart: [], sides, covers: true }
@@ -190,7 +205,10 @@ const inRuns = (n, pairs) => (pairs || []).some(([a, b]) => n >= a && n <= b)
 // drift looks like — "Chapter 118: The Duel" up there against "Chapter 118" here — and it
 // is exactly how the same chapter gets posted twice.
 export function duplicates(willPost, site) {
-  return willPost.filter((i) => i.global != null && inRuns(i.global, site?.posted))
+  return willPost.filter((i) => {
+    const n = chapterNumber(i)
+    return n != null && inRuns(n, site?.posted)
+  })
 }
 
 // Chapters below the site's highest number that it does not have: a hole. Could be a
@@ -198,8 +216,10 @@ export function duplicates(willPost, site) {
 export function belowSite(willPost, site) {
   const max = site?.max_posted
   if (max == null) return []
-  return willPost.filter((i) => i.global != null && i.global < max
-    && !inRuns(i.global, site?.posted))
+  return willPost.filter((i) => {
+    const n = chapterNumber(i)
+    return n != null && n < max && !inRuns(n, site?.posted)
+  })
 }
 
 // The one-tap offer. Names the evidence, then the effect — the same shape as the coin
@@ -227,7 +247,7 @@ export function pickupLine(next) {
 
 // "1 side story is" / "2 chapters without a number are" — `kind` is on every plan item.
 export function unnumberedLabel(rows) {
-  const loose = rows.filter((i) => i.global == null)
+  const loose = rows.filter((i) => chapterNumber(i) == null)
   if (!loose.length) return ''
   const allSide = loose.every((i) => i.kind === 'side')
   const noun = allSide

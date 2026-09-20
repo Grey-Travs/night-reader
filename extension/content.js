@@ -691,7 +691,7 @@ function writePending(value) {
  * The shell test is reliable because apiCreateChapter always creates private with no
  * pages, so 'present but empty' cannot mean anything else.
  */
-async function reconcilePending(pinned, title) {
+async function reconcilePending(pinned, title, want) {
   const live = await alreadyOnSite(pinned, title)
   if (!live) return { action: 'create' }
   const uid = String(live.uid || '')
@@ -713,9 +713,16 @@ async function reconcilePending(pinned, title) {
       + 'stopping rather than risk a second copy')
   }
   if (!full) return { action: 'create' }
-  return chapterHtml(full).length > 0
-    ? { action: 'done', record: full }
-    : { action: 'resume', record: full }
+  if (chapterHtml(full).length === 0) return { action: 'resume', record: full }
+  // It has its text -- which used to be the whole test for "finished". But a chapter that
+  // FAILED the settings check at 3/3 also has its text: the save writes the text and the
+  // settings together, so a wrong price leaves a complete-looking chapter behind. Calling
+  // that done recorded it as posted and nothing ever went back to it, which is how a side
+  // story stayed free through repeated re-runs.
+  const wrong = nrSettingsWrong(full, want || {})
+  return wrong.length
+    ? { action: 'fix', record: full, why: wrong.join('; ') }
+    : { action: 'done', record: full }
 }
 
 /**
@@ -729,11 +736,12 @@ async function postViaApi({ payload, coins, state, pinned, resume = false }) {
   say(`\n## ${payload.title}  (${state}, ${coins ? `${coins} coins` : 'free'})`)
 
   const pending = readPending()
+  let html = payload.html
   const resuming = resume
     || (pending && nrTitleKey(pending.title) === nrTitleKey(payload.title))
   let created
   if (resuming && pinned) {
-    const what = await reconcilePending(pinned, payload.title)
+    const what = await reconcilePending(pinned, payload.title, { state, coins })
     if (what.action === 'done') {
       // It was finished all along and only the reply went missing. Recording it is the
       // whole fix; re-saving would overwrite text a reader may already have moved past.
@@ -747,6 +755,14 @@ async function postViaApi({ payload, coins, state, pinned, resume = false }) {
     if (what.action === 'resume') {
       created = what.record
       say(`1/3 filling the empty chapter created earlier (id ${created.id})`)
+    }
+    if (what.action === 'fix') {
+      created = what.record
+      say(`1/3 posted earlier but saved wrongly (${what.why}) — correcting its settings`)
+      // Re-saved with the chapter's OWN text, never ours. The text is already right and a
+      // reader may be part-way through it; only the settings were wrong, so only those
+      // change. Falls back to our copy if the site somehow hands back nothing.
+      html = chapterHtml(what.record) || html
     }
   } else if (resuming && pending.data?.id) {
     // No series pinned (a panel run), so fall back to what this tab remembers.
@@ -780,7 +796,7 @@ async function postViaApi({ payload, coins, state, pinned, resume = false }) {
   }
 
   say('2/3 saving its settings and text')
-  const saved = await apiSaveChapter(created, { state, coins, html: payload.html })
+  const saved = await apiSaveChapter(created, { state, coins, html })
   const after = saved?.data || {}
   say(`    ${after.displayName || payload.title}: state=${after.state} type=${after.type}`
     + ` paid=${after.paid} coins=${after.coins}`)
@@ -791,19 +807,12 @@ async function postViaApi({ payload, coins, state, pinned, resume = false }) {
   // to readers, or paid content given away free.
   // Compared loosely on purpose: the server normalises what it is given, returning `paid`
   // as 1/0 where `true` was sent. Comparing strictly turned a correct save into a failure.
-  const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase()
-  const wrong = []
-  if (!same(after.type, 'notes')) wrong.push(`type is "${after.type}"`)
-  if (!same(after.state, state)) wrong.push(`state is "${after.state}"`)
-  if (Number(after.coins || 0) !== Number(coins || 0)) wrong.push(`coins is ${after.coins}`)
-  const wantPaid = Number(coins) > 0
-  const gotPaid = after.paid === true || Number(after.paid) === 1
-  if (gotPaid !== wantPaid) wrong.push(`paid is ${after.paid}`)
+  const wrong = nrSettingsWrong(after, { state, coins })
   if (wrong.length) throw new Error(`saved wrongly — ${wrong.join('; ')}`)
   say('    settings confirmed by the site')
   // Only now: the chapter is complete, so there is nothing left to resume into.
   writePending(null)
-  return { title: payload.title, id: created.id, chars: payload.html.length }
+  return { title: payload.title, id: created.id, chars: html.length }
 }
 
 // --- finding things --------------------------------------------------------
@@ -1953,11 +1962,21 @@ async function postBatch({ count, state, upTo, run = null }) {
         if (!isResume) {
           const live = await alreadyOnSite(pinned, payload.title)
           if (live) {
+            // Also say whether the copy up there is saved WRONGLY, measured by the same
+            // rule the save uses. A chapter that failed its settings check is left on the
+            // site and recorded, so the next run finds it here rather than in the resume
+            // path -- and naming only "it is already there" sends you looking for a
+            // duplicate while the price it is actually charging stays wrong.
+            const wrong = nrSettingsWrong(live, { state: want.state, coins: item.coins })
             throw new Error(
               `"${payload.title}" is already on the site (id ${live.id || '?'}`
               + `${live.state ? ', ' + String(live.state).toLowerCase() : ''}`
               + `${Number(live.coins) > 0 ? ', ' + live.coins + ' coins' : ''})`
-              + ' — stopping rather than posting a second copy.')
+              + ' — stopping rather than posting a second copy.'
+              + (wrong.length
+                ? ` It is also saved wrongly up there (${wrong.join('; ')})`
+                  + ' — correct it on the site, or delete it there and run this again.'
+                : ''))
           }
         }
 

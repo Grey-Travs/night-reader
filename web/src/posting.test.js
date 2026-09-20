@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  SNAPSHOT_STALE_HOURS, belowSite, blockedReason, duplicates, formatRuns, nextRun,
+  SNAPSHOT_STALE_HOURS, belowSite, blockedReason, chapterNumber, duplicates, eligible,
+  formatRuns, nextRun,
   pickupLine, range, runs, snapshotWarning, suggestionLabel, unnumberedLabel,
 } from './posting'
 
@@ -189,5 +190,60 @@ describe('saying what a range leaves out', () => {
 
   it('says nothing when everything has a number', () => {
     expect(unnumberedLabel([item(5)])).toBe('')
+  })
+})
+
+// ---- a side story that carries its own number ----------------------------
+
+// Two series number their side stories 1..10 in their own sequence, colliding exactly with
+// their chapters 1..10. Every helper here used to read `i.global` directly, so a side
+// story's ordinal passed for a chapter number: a range of 1-10 swept ten side stories in,
+// and the site's own posted range 1..125 marked all ten as duplicates of real chapters.
+//
+// The fixture above cannot express this — it derives `kind` from `global == null` — which
+// is why it went unnoticed on both sides of the app.
+const numberedSide = (n) => ({
+  global: n, title: `Side Stories ${n}`, kind: 'side', paid: true, blockers: [],
+})
+
+describe('a side story that carries its own number', () => {
+  it('has no chapter number, however it is numbered', () => {
+    expect(chapterNumber(item(7))).toBe(7)
+    expect(chapterNumber(numberedSide(7))).toBe(null)
+    expect(chapterNumber(item(null))).toBe(null)
+  })
+
+  it('is never swept into a chapter range', () => {
+    const ready = [item(1), item(2), numberedSide(1), numberedSide(2)]
+    const got = eligible(ready, { from: '1', to: '2' }).map((i) => i.title)
+    expect(got).toEqual(['Chapter 1', 'Chapter 2'])
+  })
+
+  it('is not reachable by a stop-at bound either', () => {
+    const ready = [item(1), numberedSide(1)]
+    expect(eligible(ready, { upTo: '5' }).map((i) => i.title)).toEqual(['Chapter 1'])
+  })
+
+  it('is not a duplicate of the chapter that shares its number', () => {
+    // The site holds chapters 1-125. Side story 1 is not chapter 1.
+    const site = { posted: [[1, 125]], max_posted: 125 }
+    expect(duplicates([numberedSide(1)], site)).toEqual([])
+    expect(duplicates([item(1)], site).map((i) => i.title)).toEqual(['Chapter 1'])
+    expect(belowSite([numberedSide(1)], site)).toEqual([])
+  })
+
+  it('counts as unreachable, so the page can say so', () => {
+    expect(unnumberedLabel([item(5), numberedSide(1)])).toBe('1 side story is')
+  })
+
+  it('does not lend its ordinal to the next-run suggestion', () => {
+    const next = nextRun([numberedSide(1), numberedSide(2), item(198), item(199)])
+    expect(next.from).toBe(198)
+    expect(next.to).toBe(199)
+    expect(next.sides).toBe(2)
+  })
+
+  it('stays out of a displayed range of chapter numbers', () => {
+    expect(range([item(67), item(68), numberedSide(1)])).toBe('67–68')
   })
 })

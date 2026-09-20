@@ -297,9 +297,13 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     items = []
     for row in rows:
         number = row.get("global")
-        # A row with no global number is a side story or an extra; only ranges of real
-        # chapters are selectable, so those are offered but never auto-included.
-        if number is not None:
+        # Only real chapters are range-selectable; side content is offered but never
+        # auto-included. Keyed on KIND rather than on "has no global number", which is
+        # what this used to test: two series number their side stories 1..10 in their own
+        # sequence, and that collides exactly with their chapters 1..10 -- so a run for
+        # chapters 1-10 silently swept ten side stories in with them.
+        is_side = row.get("kind") == "side"
+        if number is not None and not is_side:
             if start is not None and number < start:
                 continue
             if end is not None and number > end:
@@ -313,10 +317,16 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
         status = _chapter_status(pid, index)
         html = markdown_to_html(strip_leading_heading(md or ""),
                                 strip_part_markers=True) if md else ""
-        # Numbered chapters go by the cutoff; side stories have no number to compare, so
-        # they follow the series' own side_paid setting.
-        paid = (number > free_through) if number is not None else (
-            side_paid and row.get("kind") == "side")
+        # Real chapters go by the free/paid cutoff; side content follows the series' own
+        # side_paid setting. Keyed on KIND, for the same reason as the range filter above.
+        #
+        # Testing "has no number" instead is what made every side story free on the two
+        # series that number theirs: with globals 1..10 the first branch won, so each side
+        # story's own ordinal was compared against the CHAPTER cutoff (66) and lost, while
+        # side_paid sat at its default of True and was never consulted. Twenty side
+        # stories across two series priced at zero, and giving them away is the direction
+        # that cannot be undone by re-posting -- a reader who bought nothing keeps it.
+        paid = side_paid if is_side else (number is not None and number > free_through)
         blockers = []
         if status not in POSTABLE_STATUSES:
             blockers.append(f"not finished ({status})")

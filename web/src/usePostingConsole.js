@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import {
-  blockedReason, duplicates, eligible, heldReason, isLive, nextRun, snapshotWarning,
-  suggestionLabel,
+  blockedReason, chapterNumber, duplicates, eligible, heldReason, isLive, nextRun,
+  snapshotWarning, suggestionLabel,
 } from './posting'
 
 // Everything a screen needs to configure and start a posting run, minus the markup.
@@ -150,8 +150,12 @@ export function usePostingConsole() {
 
   // A numeric bound cannot reach a side story, in eligible() or on the server. Said where
   // it happens rather than warned about in the abstract.
+  //
+  // Through chapterNumber, not `i.global == null`: on the two series that number their own
+  // side stories this listed NOTHING while the server excluded ten of them, so the run
+  // quietly lost them and the page said everything was included.
   const sideExcluded = useMemo(
-    () => ((from || to || upTo) ? ready.filter((i) => i.global == null) : []),
+    () => ((from || to || upTo) ? ready.filter((i) => chapterNumber(i) == null) : []),
     [ready, from, to, upTo])
 
   const siteWarning = useMemo(() => snapshotWarning(site), [site])

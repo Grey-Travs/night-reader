@@ -1410,6 +1410,70 @@ def test_free_side_stories_need_no_price(client):
     assert run["state"] == "queued" and run["progress"]["total"] == 3
 
 
+# ---- a side story that carries its own number -----------------------------
+
+# The case every test above this one missed: they all set ``global`` to None, so the
+# side_paid branch was the only branch they could reach.
+#
+# Two real series number their side stories 1..10 in their OWN sequence, which collides
+# exactly with their chapters 1..10. Both the pricing rule and the range filter asked "does
+# this row have a number?" rather than "is this side content", so those twenty rows took
+# the CHAPTER branch: each side story's ordinal was compared against the chapter cutoff
+# (66) and lost, and all twenty planned as free while side_paid sat at its default of True
+# and was never consulted. Giving them away is the direction that cannot be undone -- a
+# reader who paid nothing keeps the chapter.
+
+
+def _with_numbered_sides(client, name, **kw):
+    """Two chapters (1, 2) and two side stories numbered 1 and 2 in their OWN sequence.
+
+    So side story 1 shares the number 1 with chapter 1, and side story 2 shares 2 with
+    chapter 2 -- the exact collision the two real series have.
+    """
+    a = _novel(client, name, [1, 2, 3, 4],
+               translated=[(1, "One.\n"), (2, "Two.\n"), (3, "Three.\n"), (4, "Four.\n")])
+    sid = _series(client, name, [a], **kw)
+    client.put(f"/api/series/{sid}/mapping", json={"overrides": [
+        {"project_id": a, "index": 3, "global": 1, "kind": "side"},
+        {"project_id": a, "index": 4, "global": 2, "kind": "side"},
+    ]})
+    return sid
+
+
+def test_a_numbered_side_story_is_priced_by_the_series_not_by_the_cutoff(client):
+    # Both side stories carry numbers at or below the cutoff, so the chapter rule would
+    # call them free. The series says side content is paid, and that is what decides.
+    sid = _with_numbered_sides(client, "NumberedSides", free_through=5, coin_price=55)
+    by_title = {i["title"]: i for i in _plan(client, sid)["items"]}
+    assert by_title["Side Stories 1"]["paid"] is True
+    assert by_title["Side Stories 1"]["coins"] == 55
+    assert by_title["Side Stories 2"]["paid"] is True
+    # ...and the real chapter sharing the number 1 is still judged by the cutoff.
+    assert by_title["Chapter 1"]["paid"] is False
+
+
+def test_a_numbered_side_story_can_still_be_made_free(client):
+    # The other direction, so this cannot pass by always answering "paid": with the cutoff
+    # at 0 the chapter rule would price BOTH side stories as paid.
+    sid = _with_numbered_sides(client, "NumberedFree", free_through=0, coin_price=55)
+    series = client.get(f"/api/series/{sid}").json()
+    target = {**series["publish_targets"][0], "side_paid": False}
+    client.post(f"/api/series/{sid}", json={"publish_targets": [target]})
+    by_title = {i["title"]: i for i in _plan(client, sid)["items"]}
+    assert by_title["Side Stories 1"]["paid"] is False
+    assert by_title["Side Stories 1"]["coins"] == 0
+    assert by_title["Chapter 1"]["paid"] is True
+
+
+def test_a_chapter_range_cannot_reach_a_numbered_side_story(client):
+    # 1-2 names the chapters. The side stories carry 1 and 2 in a different sequence, and
+    # a chapter range must not confuse the two -- it used to sweep them both in.
+    sid = _with_numbered_sides(client, "RangedSides", free_through=0, coin_price=55)
+    titles = [i["title"] for i in posting.plan_run(sid, start=1, end=2)["items"]]
+    assert "Chapter 1" in titles and "Chapter 2" in titles
+    assert [t for t in titles if t.startswith("Side")] == []
+
+
 # ---- the panel and the claim must agree on where they are -----------------
 
 # Two matchers now exist: /api/posting/match, which tells the panel which novel it is
