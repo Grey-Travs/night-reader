@@ -22,7 +22,7 @@ from .google_auth import build_docs_service, get_credentials
 from .sanitize import (
     remove_snippets,
     strip_export_footer,
-    strip_leading_heading,
+    strip_export_heading,
     strip_reasoning,
     strip_source_header,
 )
@@ -251,7 +251,7 @@ def _drop_leaked_heading(result: TranslationResult, chapter: Chapter) -> None:
     paragraph checks compare the output against the stripped source, so a header left in
     makes a faithful translation look long by one paragraph.
     """
-    cleaned, dropped = strip_leading_heading(result.prose, _source_number(chapter))
+    cleaned, dropped = strip_export_heading(result.prose, _source_number(chapter))
     if dropped:
         result.prose = cleaned
         result.warnings = [*result.warnings, "removed a translated export heading"]

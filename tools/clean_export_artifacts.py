@@ -22,7 +22,7 @@ new translations are clean. This repairs the ones already on disk.
 
 Two rules, both deliberately conservative — this rewrites the prose of hundreds of files:
 
-* a leading block is removed only when ``sanitize.strip_leading_heading`` recognises it
+* a leading block is removed only when ``sanitize.strip_export_heading`` recognises it
   as the export's own chapter heading: a line reading only "Chapter 203"/"Episode 188",
   a number carrying markdown heading marks ("# 101"), or the novel's translated title
   sitting directly on top of one of those. An unmarked bare number is removed only when
@@ -59,7 +59,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from translation_bot.pipeline import _AUDIT_TRANSLATION_MARK  # noqa: E402
 from translation_bot.sanitize import (  # noqa: E402
     strip_export_footer,
-    strip_leading_heading,
+    strip_export_heading,
     strip_source_header,
 )
 from translation_bot.text_source import records_to_chapters  # noqa: E402
@@ -129,15 +129,15 @@ def source_numbers(pdir: pathlib.Path) -> dict[int, str] | None:
 def clean_prose(prose: str, number: str | None) -> tuple[str, bool, bool]:
     """Return (cleaned, dropped_number, dropped_notice) for one chapter's English.
 
-    The heading rules live in ``sanitize.strip_leading_heading`` so that this repair and
+    The heading rules live in ``sanitize.strip_export_heading`` so that this repair and
     the pipeline that prevents a repeat cannot drift apart. ``number`` is still passed
     where it is known — it is what allows an UNMARKED bare number to be removed — but it
     is no longer required, which is the whole point: the chapters that survived every
     earlier run are exactly the ones whose source number could not be read.
     """
-    body, dropped_number = strip_leading_heading(prose or "", number)
+    body, dropped_number = strip_export_heading(prose or "", number)
     # Compare on the SAME normalisation strip_export_footer emits — it splits on blank
-    # lines and rejoins with exactly one. strip_leading_heading deliberately returns the
+    # lines and rejoins with exactly one. strip_export_heading deliberately returns the
     # text byte-for-byte when it drops nothing, so comparing the footer's output against
     # that raw text reports every file whose spacing merely differs (a trailing newline
     # is enough) as one carrying a notice: 6,748 of them, against a real population of

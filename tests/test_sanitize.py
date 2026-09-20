@@ -273,13 +273,13 @@ def test_a_number_that_differs_from_the_chapter_is_in_story_content():
 # number could not be read. The cleanup kept reporting "0 remaining" while the headings
 # were still on screen.
 
-from translation_bot.sanitize import strip_leading_heading  # noqa: E402
+from translation_bot.sanitize import strip_export_heading  # noqa: E402
 
 BODY = "He opened the door and stepped into the corridor."
 
 
 def _head(*blocks, number=None):
-    return strip_leading_heading(SEP.join(blocks), number)
+    return strip_export_heading(SEP.join(blocks), number)
 
 
 def test_the_title_and_the_chapter_line_both_come_off_without_a_known_number():
@@ -373,13 +373,13 @@ def test_nothing_to_strip_returns_the_text_byte_for_byte():
     # This rewrites files in place, so a no-op must not renormalise the prose it was not
     # asked to touch -- splitting on blank lines and rejoining would do exactly that.
     original = "First line." + (chr(10) * 3) + "Second, after a wide gap." + chr(10)
-    clean, dropped = strip_leading_heading(original)
+    clean, dropped = strip_export_heading(original)
     assert dropped is False
     assert clean == original
 
 
 def test_the_body_below_a_dropped_heading_keeps_its_own_spacing():
     original = SEP.join(["Chapter 202", "First." + (chr(10) * 3) + "Second."])
-    clean, dropped = strip_leading_heading(original)
+    clean, dropped = strip_export_heading(original)
     assert dropped is True
     assert clean == "First." + (chr(10) * 3) + "Second."

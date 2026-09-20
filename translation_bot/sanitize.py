@@ -314,8 +314,13 @@ def _drop_leading_blocks(text: str, n: int) -> str:
     return s
 
 
-def strip_leading_heading(text: str, number: str | None = None) -> tuple[str, bool]:
+def strip_export_heading(text: str, number: str | None = None) -> tuple[str, bool]:
     """Drop the export's chapter heading from the top of a TRANSLATED chapter.
+
+    Named ``strip_export_heading``, not ``strip_leading_heading``: ``mdhtml`` already has
+    a ``strip_leading_heading`` that takes markdown and returns a string, and
+    ``server/posting.py`` imports THAT one. Two functions of the same name with different
+    return types, one returning a tuple, is an import away from a silent bug.
 
     :func:`strip_source_header` removes this before the model ever sees it — but only
     when the header is recognisable in the source. When it is not, the model translates
