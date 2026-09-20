@@ -196,6 +196,37 @@ export default function ChaptersPage() {
         </div>
       )}
 
+      {/* source_changed on its own cannot tell an edit from the whole novel sitting off
+          its own tabs, and the second must NOT be answered by re-translating. Gated on
+          !offline like the Translate control below: a cached copy can read as drifted,
+          and there is no button here to warn away from. */}
+      {!offline && data?.index_drift && (
+        <div
+          className="mb-6 rounded-card border border-line p-4 text-sm"
+          style={{ background: 'var(--b-review-bg)', color: 'var(--b-review-tx)' }}
+        >
+          <div className="font-medium">
+            ⚠ {data.index_drift.count} finished chapters are filed under the wrong number
+            {data.index_drift.shift != null && (
+              <> — each one sits {data.index_drift.shift > 0 ? '+' : ''}
+                {data.index_drift.shift} from its own text</>
+            )}
+          </div>
+          <div className="mt-1 opacity-90">
+            Their translations are safe and none of them needs doing again. A chapter is
+            filed under its tab’s position, so adding tabs anywhere but the end leaves
+            every chapter after them pointing at the wrong text — which is why they read
+            as needing translation. Preview the repair (it changes nothing):
+            <code className="mt-1 block break-all font-mono text-xs opacity-90">
+              python tools/realign_chapter_indices.py --project {pid}
+            </code>
+            Add <code className="font-mono text-xs">--apply</code> to move them, with
+            Night Reader closed. It copies the novel first, and never guesses: each
+            chapter goes to the tab holding the source it was translated from.
+          </div>
+        </div>
+      )}
+
       {/* slim stats strip */}
       <div className="mb-5 flex flex-wrap gap-x-6 gap-y-2 rounded-card border border-line px-4 py-3 text-sm" style={{ background: 'var(--surface)' }}>
         <span className="text-muted">Total <strong className="text-ink tabular-nums">{data?.total ?? '—'}</strong></span>

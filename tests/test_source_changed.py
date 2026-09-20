@@ -178,3 +178,110 @@ def test_the_helper_itself(client):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---- telling drift from an edit -------------------------------------------
+
+# Staleness alone cannot say WHY a chapter no longer matches its source, and the two
+# answers are opposites: an edited chapter should be re-translated, while a whole novel
+# sitting a few tabs off its own text must NOT be -- that is paid work, intact, merely
+# filed under the wrong number.
+#
+# It happened: 10 tabs added to the front of a 56-tab document left all 56 validated
+# chapters pointing at the wrong text. Every one read as stale and the page offered to
+# re-translate the book. Run against that project's backup, this reports exactly
+# {"count": 56, "shift": 10}; against the repaired copy, and against four healthy
+# novels, it reports nothing.
+
+from types import SimpleNamespace  # noqa: E402
+
+from server.app import DRIFT_MIN, index_drift  # noqa: E402
+
+
+def _tabs(hashes):
+    """Chapter-likes at indices 1..N holding these source hashes, in order."""
+    return [SimpleNamespace(index=i, metrics=SimpleNamespace(content_hash=h))
+            for i, h in enumerate(hashes, 1)]
+
+
+def _state(recorded):
+    """``{index: source_hash}`` as state.json holds it, all validated."""
+    return SimpleNamespace(chapters={
+        str(i): {"source_hash": h, "status": "validated"} for i, h in recorded.items()})
+
+
+def _rows(tabs, state):
+    return [{"source_changed":
+             (state.chapters.get(str(c.index)) or {}).get("source_hash")
+             not in (None, c.metrics.content_hash)}
+            for c in tabs]
+
+
+def _call(tab_hashes, recorded):
+    tabs, st = _tabs(tab_hashes), _state(recorded)
+    return index_drift(tabs, st, _rows(tabs, st))
+
+
+def test_a_block_inserted_at_the_front_is_named_with_its_shift():
+    # Tabs x,y were added above a,b,c,d. The four translations still say a,b,c,d.
+    got = _call(["x", "y", "a", "b", "c", "d"], {1: "a", 2: "b", 3: "c", 4: "d"})
+    assert got == {"count": 4, "shift": 2}
+
+
+def test_a_healthy_novel_is_silent():
+    assert _call(["a", "b", "c", "d"], {1: "a", 2: "b", 3: "c", 4: "d"}) is None
+
+
+def test_genuinely_edited_chapters_are_not_drift():
+    # Every source changed and none of the old text is anywhere in the document. That is
+    # editing, and re-translating IS the right answer -- so this must stay quiet.
+    assert _call(["A", "B", "C", "D"], {1: "a", 2: "b", 3: "c", 4: "d"}) is None
+
+
+def test_a_couple_of_moved_chapters_are_not_a_pattern():
+    # Below the threshold: two is a coincidence, and a banner on a coincidence is noise.
+    assert DRIFT_MIN == 3
+    assert _call(["x", "a", "b"], {1: "a", 2: "b"}) is None
+
+
+def test_a_source_on_two_tabs_is_never_placed():
+    # Duplicated text: "where does this belong" has two answers, and the repair refuses
+    # that one rather than guessing. Sized so the answer proves it: b and c are genuinely
+    # moved, and if the ambiguous a were placed too the count would reach three and this
+    # would report drift. It stays silent, so a was not counted.
+    assert _call(["a", "a", "b", "c"], {1: "a", 2: "b", 3: "c"}) is None
+
+
+def test_a_block_inserted_in_the_middle_shifts_only_the_tail():
+    # Still one offset, because everything after the insertion moves together -- the
+    # chapters above it do not move at all and are not counted.
+    got = _call(["a", "b", "z", "c", "d", "e"], {1: "a", 2: "b", 3: "c", 4: "d", 5: "e"})
+    assert got == {"count": 3, "shift": 1}
+
+
+def test_a_reordering_reports_no_single_number():
+    # Two chapters swapped AND the rest pushed down: the offsets disagree, so there is no
+    # one number to name. It is still drift, and the repair still handles it.
+    got = _call(["b", "a", "x", "c"], {1: "a", 2: "b", 3: "c"})
+    assert got == {"count": 3, "shift": None}
+
+
+def test_two_translations_landing_on_one_tab_are_refused():
+    # Two records share a source hash, so both want the same index. The repair empties its
+    # whole move set on that and does nothing, and this has to refuse on the same terms.
+    assert _call(["x", "y", "a", "b", "c"],
+                 {1: "a", 2: "a", 3: "b", 4: "c"}) is None
+
+
+def test_an_untranslated_chapter_contributes_nothing():
+    # No recorded hash, so nothing to place. It cannot read as stale and cannot drift.
+    assert _call(["x", "y", "a", "b", "c"], {1: "a", 2: "b", 3: "c"}) == {
+        "count": 3, "shift": 2}
+
+
+def test_it_reports_nothing_when_no_chapter_reads_as_stale():
+    # The gate is stale ROWS: that is what inflates the count and makes the page offer to
+    # re-translate. With nothing stale the function returns before building anything.
+    tabs = _tabs(["a", "b", "c"])
+    st = _state({1: "a", 2: "b", 3: "c"})
+    assert index_drift(tabs, st, [{"source_changed": False}] * 3) is None

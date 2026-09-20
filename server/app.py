@@ -677,6 +677,68 @@ def source_changed(ch: Chapter, rec: dict) -> bool:
                 and stored != ch.metrics.content_hash)
 
 
+# One or two stale chapters is editing. A BLOCK of them, each with its own source still
+# in the document at a DIFFERENT index, is not editing -- it is the whole novel sitting
+# some tabs off its own text. Two is a coincidence; three is a pattern.
+DRIFT_MIN = 3
+
+
+def index_drift(chapters: list, state, rows: list[dict]) -> dict | None:
+    """Translations whose own source is still in the document, at ANOTHER index.
+
+    A chapter's index is its tab's POSITION, re-derived on every read, and every finished
+    translation is filed under it. So inserting tabs anywhere but the END leaves each
+    translation one block short of its own source. ``source_changed`` compares a chapter
+    against whatever now sits at its index, so they all read as stale at once and the list
+    offers to re-translate a novel that is already paid for.
+
+    Measured: 10 tabs added to the front of a 56-tab document did exactly that to 56
+    validated chapters, and nothing in the app said so -- it had to be noticed by eye.
+
+    What tells drift from a real edit is evidence the app already holds: the recorded
+    ``source_hash`` turning up somewhere ELSE in the same document. This is the read-only
+    half of ``tools/realign_chapter_indices.py::plan`` and keeps all THREE of its
+    refusals, so the banner can never name a command that would then refuse to run.
+
+    Costs nothing on a healthy novel: nothing stale means it returns before building
+    anything, and a genuinely edited chapter's old hash is nowhere to be found.
+    """
+    if sum(1 for r in rows if r.get("source_changed")) < DRIFT_MIN:
+        return None
+
+    at: dict[str, list[int]] = {}
+    for ch in chapters:
+        at.setdefault(ch.metrics.content_hash, []).append(ch.index)
+
+    # Counted from STATE, not from the stale rows. source_changed only fires for a
+    # DONE status, so a needs-review chapter is misfiled without ever reading stale --
+    # and the repair tool moves it regardless. Counting rows would promise a number the
+    # tool then contradicts.
+    moved: dict[int, int] = {}
+    for key, rec in (getattr(state, "chapters", None) or {}).items():
+        if not str(key).isdigit():
+            continue
+        where = at.get((rec or {}).get("source_hash") or "") or []
+        # One home only. A hash on two tabs has two answers, and the repair refuses that
+        # rather than guessing, so this must not claim it either.
+        if len(where) == 1 and where[0] != int(key):
+            moved[int(key)] = where[0]
+
+    # The repair empties its whole move set when two chapters would land on one index,
+    # and then does nothing. A banner naming it has to refuse on the same terms.
+    if len(moved) < DRIFT_MIN or len(set(moved.values())) != len(moved):
+        return None
+
+    shifts = {new - old for old, new in moved.items()}
+    return {
+        "count": len(moved),
+        # Saying "+10" out loud is what makes the diagnosis recognisable. None when the
+        # rearrangement is not uniform: the repair handles that too, but the banner
+        # should not claim a number it cannot name.
+        "shift": shifts.pop() if len(shifts) == 1 else None,
+    }
+
+
 def series_of(pid: str) -> tuple[dict | None, dict | None]:
     """``(series, mapping)`` for a novel that is part of one, else ``(None, None)``.
 
@@ -2043,6 +2105,10 @@ def list_chapters(pid: str, refresh: bool = False) -> dict:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     return {"project": project, "total": total, "chapters": rows,
             "counts": counts, "totals": state.totals(), "offline": offline,
+            # None on every healthy novel. Never computed for an offline copy: that reads
+            # from a cached source, so "drifted" there would be an artefact of the cache,
+            # and the page has no Translate button to warn away from anyway.
+            "index_drift": None if offline else index_drift(chapters, state, rows),
             "series": _series_brief(series, mapping, pid)}
 
 
