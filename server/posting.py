@@ -1267,8 +1267,14 @@ def request_run(sid: str, target_id: str | None = None, *, options: dict | None 
         "options": opts,
         # Copied in rather than read live, so editing the coin price mid-run cannot change
         # what the rest of the run charges.
+        # All THREE inputs to what a chapter costs. side_paid runs the identical path to
+        # coin_price -- read live at plan time, it decides `paid` for every side row and
+        # so decides its coins -- and twenty side stories have already been given away
+        # through it. Snapshotting two of the three and calling it a pricing guard would
+        # be overclaiming.
         "pricing": {"free_through": int(target.get("free_through") or 0),
-                    "coin_price": int(target.get("coin_price") or 0)},
+                    "coin_price": int(target.get("coin_price") or 0),
+                    "side_paid": bool(target.get("side_paid", True))},
         "requested_at": _now(),
         "claimed_by": None,
         "claimed_at": None,
@@ -1429,14 +1435,34 @@ def resume_run(sid: str, target_id: str | None = None) -> dict:
     the site snapshot are what stop those chapters going out a second time.
     """
     _series, target = _resolve_target(sid, target_id)
-    # No pricing check: this run passed one when it was requested, and it carries the
-    # pricing it passed with. Re-deriving it from the series now would let a price edited
-    # in between quietly change what the rest of the run charges.
     run = load_run(sid, target["id"])
     if run is None:
         raise ValueError("No run to resume.")
     if _live(run):
         raise ValueError("That run is still going.")
+    # What actually holds a price steady is the PLAN, not this run: the browser fetches
+    # one plan per claim and posts the coins it carries, so a price edited while a batch
+    # is running cannot reach that batch. A resume fetches a SECOND plan, and plan_run
+    # reads the target live -- so the rest of the run would go out at whatever the price
+    # is now, priced differently from the part already published, with no way to tell
+    # afterwards which chapter got which. The snapshot was written at request time and
+    # read by nothing until here; this is what it was for.
+    now = {"free_through": int(target.get("free_through") or 0),
+           "coin_price": int(target.get("coin_price") or 0),
+           "side_paid": bool(target.get("side_paid", True))}
+    # Compared over the keys the RUN carries, not over `now`: a run written before a
+    # field existed carries fewer of them, and must not be refused for what it could
+    # never have stored.
+    was = run.get("pricing") or {}
+    # Named rather than described, so the message is true whichever field moved: quoting
+    # the coin price when side_paid is what changed would print two identical numbers.
+    changed = [key for key, value in was.items() if key in now and now[key] != value]
+    if changed:
+        moved = ", ".join(f"{key} {was[key]} -> {now[key]}" for key in changed)
+        raise ValueError(
+            f"The pricing changed after this run was requested ({moved}). Resuming "
+            f"would charge the rest of it differently from the part already posted — "
+            f"cancel it and press Start to re-plan at the new price.")
     run["state"] = "queued"
     run["claimed_by"] = None
     run["claimed_at"] = None

@@ -1150,8 +1150,10 @@ def test_a_run_is_queued_for_the_browser_to_find(client):
     assert run["progress"]["total"] == 4
     assert run["progress"]["first"] == "Chapter 1"
     assert run["progress"]["last"] == "Chapter 4"
-    # Copied in, so editing the price mid-run cannot change what the rest of it charges.
-    assert run["pricing"] == {"free_through": 0, "coin_price": 55}
+    # Snapshotted so a RESUME can be checked against it. It does not hold the price
+    # steady on its own -- the plan fetched at claim time does that -- and until the
+    # resume guard existed nothing read this at all.
+    assert run["pricing"] == {"free_through": 0, "coin_price": 55, "side_paid": True}
 
 
 def test_a_run_will_not_start_without_a_stated_price(client):
@@ -1292,6 +1294,61 @@ def test_a_live_run_cannot_be_resumed(client):
     posting.request_run(sid, "t1")
     with pytest.raises(ValueError, match="still going"):
         posting.resume_run(sid, "t1")
+
+
+# A resume fetches a SECOND plan, and plan_run reads the series' pricing live -- so the
+# rest of a run would go out at whatever the price is now, priced differently from the
+# part already published, with no way to tell afterwards which chapter got which. The
+# snapshot taken at request time was written and then read by nothing until this guard.
+
+
+def _reprice(client, sid, **fields):
+    series = client.get(f"/api/series/{sid}").json()
+    target = {**series["publish_targets"][0], **fields}
+    client.post(f"/api/series/{sid}", json={"publish_targets": [target]})
+
+
+def test_a_run_will_not_resume_at_a_different_price(client):
+    sid = _run_novel(client, "Repriced")
+    posting.request_run(sid, "t1")
+    posting.cancel_run(sid, "t1")
+    _reprice(client, sid, coin_price=99)
+    with pytest.raises(ValueError, match="pricing changed"):
+        posting.resume_run(sid, "t1")
+
+
+def test_giving_side_stories_away_after_the_fact_refuses_too(client):
+    # side_paid runs the identical path to the coin price and decides what every side row
+    # costs. Guarding two of the three inputs would not be a pricing guard.
+    sid = _run_novel(client, "SideFlip")
+    posting.request_run(sid, "t1")
+    posting.cancel_run(sid, "t1")
+    _reprice(client, sid, side_paid=False)
+    with pytest.raises(ValueError, match="side_paid"):
+        posting.resume_run(sid, "t1")
+
+
+def test_a_run_resumes_when_the_price_has_not_moved(client):
+    sid = _run_novel(client, "Unmoved")
+    posting.request_run(sid, "t1")
+    posting.cancel_run(sid, "t1")
+    assert posting.resume_run(sid, "t1")["state"] == "queued"
+
+
+def test_a_run_saved_before_side_paid_was_recorded_still_resumes(client):
+    """Why the comparison walks the RUN's keys rather than today's.
+
+    A run written before a field existed carries fewer of them, and refusing it for what
+    it could never have stored would strand every run already on disk.
+    """
+    sid = _run_novel(client, "Older")
+    posting.request_run(sid, "t1")
+    posting.cancel_run(sid, "t1")
+    path = posting.run_path(sid, "t1")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["pricing"].pop("side_paid")
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    assert posting.resume_run(sid, "t1")["state"] == "queued"
 
 
 def test_stop_at_chapter_caps_the_run(client):
