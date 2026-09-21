@@ -107,6 +107,12 @@ export default function PhonePage() {
                   </p>
                 )}
 
+                {c.gaps.length > 0 && (
+                  <p className="text-xs text-hint">
+                    {range(c.gaps)} would fill a gap below what the site already has.
+                  </p>
+                )}
+
                 {c.site?.fetched_at && c.site.trusted !== false && (
                   <p className="text-xs text-muted">{pickupLine(c.nextUp)}</p>
                 )}

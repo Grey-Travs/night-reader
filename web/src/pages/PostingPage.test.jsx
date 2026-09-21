@@ -299,6 +299,36 @@ describe('what the page shows', () => {
     await waitFor(() => expect(api.postingPlan).toHaveBeenCalled())
   })
 
+  // belowSite() has computed this since the run range was built and nothing rendered it.
+  // A chapter below the site's newest that the site does not have is a HOLE: deliberate
+  // if it was deleted up there, worth a second look otherwise. It warns rather than
+  // refuses -- duplicates() is the one that refuses.
+  it('warns when a chapter would fill a gap rather than extend the end', async () => {
+    setup({
+      planDoc: plan([item(46)], {
+        site: {
+          fetched_at: new Date().toISOString(), count: 196, posted: [[1, 45], [47, 196]],
+          max_posted: 196, numbered: 196, trusted: true, why: '', age_seconds: 60,
+        },
+      }),
+    })
+    expect(await screen.findByText(/would fill a gap below what the site already has/i))
+      .toBeTruthy()
+  })
+
+  it('says nothing about gaps when the run extends the end', async () => {
+    setup({
+      planDoc: plan([item(197)], {
+        site: {
+          fetched_at: new Date().toISOString(), count: 196, posted: [[1, 196]],
+          max_posted: 196, numbered: 196, trusted: true, why: '', age_seconds: 60,
+        },
+      }),
+    })
+    await screen.findByText(/Test Novel/i)
+    expect(screen.queryByText(/would fill a gap/i)).toBeNull()
+  })
+
   it('says nothing when the site agrees with the series', async () => {
     setup({ planDoc: plan([item(72)], { audit: [] }) })
     await screen.findByText(/Test Novel/i)

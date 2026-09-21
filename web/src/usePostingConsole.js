@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import {
-  STALE_LEDGER, blockedReason, chapterNumber, duplicates, eligible, heldReason,
+  STALE_LEDGER, belowSite, blockedReason, chapterNumber, duplicates,
+  eligible, heldReason,
   isLive, nextRun,
   snapshotWarning, suggestionLabel,
 } from './posting'
@@ -187,6 +188,11 @@ export function usePostingConsole() {
 
   const siteWarning = useMemo(() => snapshotWarning(site), [site])
   const dupes = useMemo(() => duplicates(willPost, site), [willPost, site])
+  // Chapters this run would post that sit BELOW the site's newest and are missing from
+  // it: a hole rather than the end of the queue. It only warns -- `dupes` above is the
+  // one that refuses -- because a hole is deliberate when a chapter was deleted up there
+  // on purpose. Computed ever since the run range was built, and shown nowhere until now.
+  const gaps = useMemo(() => belowSite(willPost, site), [willPost, site])
   const rangeLabel = from && to ? `${from}–${to}`
     : from ? `from ${from}` : to ? `to ${to}`
     : upTo ? `up to ${upTo}` : limit ? `at most ${limit}` : ''
@@ -284,7 +290,7 @@ export function usePostingConsole() {
     from, setFrom, to, setTo, upTo, setUpTo, limit, setLimit,
     postState, setPostState, starting, start, cancel, resume,
     site, nextUp, suggestion, suggestionApplies, applyNextRun, clearRange,
-    sideExcluded, siteWarning, dupes, rangeLabel, ledgerHeld, forget,
+    sideExcluded, siteWarning, dupes, gaps, rangeLabel, ledgerHeld, forget,
     blocked: blockedReason({ willPost, savedCoins, savedFree, priceDirty, dupes }),
   }
 }

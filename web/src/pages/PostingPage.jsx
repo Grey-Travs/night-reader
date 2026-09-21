@@ -142,6 +142,13 @@ export default function PostingPage() {
                 </p>
               )}
 
+              {c.gaps.length > 0 && (
+                <p className="mt-1 text-xs text-hint">
+                  {range(c.gaps)} would fill a gap below what the site already has,
+                  rather than adding to the end — deliberate if you deleted it there.
+                </p>
+              )}
+
               {c.site?.fetched_at && c.site.trusted !== false && (
                 <p className="mt-1 text-xs text-muted">{pickupLine(c.nextUp)}</p>
               )}
