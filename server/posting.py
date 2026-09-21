@@ -1214,8 +1214,13 @@ def check_pricing(target: dict, queue: list[dict]) -> None:
     So the question is the precise one: does this run contain a chapter the site will mark
     paid, and if so is there a price for it? A series that is genuinely free all the way
     has no paid chapter in the run, needs no price, and passes without anyone having to
-    express "free" as a magic number. 21 of the 22 linked series currently have no price
-    at all, so this is the check standing between them and a batch published for nothing.
+    express "free" as a magic number.
+
+    Counted today: 38 publish targets across 39 series, 28 of them priced and 10 with a
+    free cutoff but no coin price -- exactly the shape described above. Not one chapter
+    has ever been posted above one of those cutoffs, which is this check doing its job
+    rather than the hole being narrow. (The figure here used to read "21 of the 22 linked
+    series", which was true of a much smaller library and had long since stopped being.)
     """
     coin_price = int(target.get("coin_price") or 0)
     if coin_price > 0:
