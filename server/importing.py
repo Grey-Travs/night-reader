@@ -373,11 +373,18 @@ def link_into_series(pid: str, name: str, rows: list[dict], *, series_url: str =
         for row in ((mapping.get("members") or {}).get(pid) or {}).get("rows") or []
     }
 
+    # Keyed on index rather than zipped: Chapter.index is built FROM row["index"] above,
+    # so a lookup is exact, where zip would silently truncate to the shorter list if the
+    # two ever stopped lining up.
+    source_hashes = {c.index: c.metrics.content_hash for c in chapters}
     for row in rows:
         posting.record(sid, "t1", {
             "title": row["title"],
             "project_id": pid,
             "index": row["index"],
+            # Written at import so an imported back catalogue is protected from arrival,
+            # rather than only the chapters posted from here on.
+            "source_hash": source_hashes.get(row["index"], ""),
             "global": globals_by_index.get(row["index"]),
             "status": "posted",
             "remote_url": series_url,

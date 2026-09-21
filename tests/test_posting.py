@@ -85,7 +85,10 @@ def _novel(client, name, numbers, *, translated=(), status=STATUS_VALIDATED):
     state = State.load(cfg.paths.state_file)
     for index, text in translated:
         (cfg.paths.output_dir / f"chapter-{index:02d}.md").write_text(text, encoding="utf-8")
-        state.update(index, status=status, title=f"Tab {index}", source_hash="x")
+        # Distinct per chapter. A shared literal makes every chapter in a fixture look
+        # like the same Korean, which silently DISABLES any guard keyed on that hash --
+        # a test that passes while proving nothing.
+        state.update(index, status=status, title=f"Tab {index}", source_hash=f"h{index}")
     state.save(cfg.paths.state_file)
     A._chapter_cache.pop(pid, None)
     return pid
@@ -348,6 +351,75 @@ def test_confirming_the_number_releases_it(client):
     freed = next(i for i in after["items"] if i["index"] == stuck["index"])
     assert freed["confidence"] == "high"
     assert not freed["blockers"]
+
+
+# ---- the same chapter under a different name ------------------------------
+
+# The defect every guard here shared: they all compare TITLES, and a renumber changes the
+# title a chapter generates while leaving its Korean untouched. One novel was published
+# three times under three different numbers that way -- the ledger missed it because the
+# title had moved, and the site snapshot missed it because the site still showed the old
+# name. The source hash is the one thing that does not move.
+
+
+def _same_korean(pid, indexes, digest="shared"):
+    """Give these chapters identical Korean, as two tabs holding the same text would."""
+    cfg = pj.project_config(Config(), pj.get_project(pid))
+    state = State.load(cfg.paths.state_file)
+    for i in indexes:
+        state.update(i, source_hash=digest)
+    state.save(cfg.paths.state_file)
+    A._chapter_cache.pop(pid, None)
+
+
+def test_a_renumbered_chapter_is_recognised_by_its_korean(client):
+    a = _novel(client, "Renamed", [1, 2], translated=[(1, ONE), (2, TWO)])
+    sid = _series(client, "Renamed", [a])
+    # Posted earlier under a different number. Same chapter, same Korean, moved title.
+    _posted(client, sid, "Chapter 99", project_id=a, index=1)
+    by = {i["title"]: i for i in _plan(client, sid)["items"]}
+    assert by["Chapter 1"]["blockers"] == [
+        'already posted as "Chapter 99" — the same Korean, under a different number']
+    # and its neighbour, which really has not been posted, is untouched
+    assert by["Chapter 2"]["blockers"] == []
+
+
+def test_an_entry_with_no_hash_still_blocks_by_its_title(client):
+    # Every entry written before this carries no hash. They must keep working exactly as
+    # they did, or a whole published back catalogue would offer itself up again.
+    a = _novel(client, "OldStyle", [1], translated=[(1, ONE)])
+    sid = _series(client, "OldStyle", [a])
+    _posted(client, sid, "Chapter 1")          # no project_id/index, so no hash
+    by = {i["title"]: i for i in _plan(client, sid)["items"]}
+    assert by["Chapter 1"]["blockers"] == ["already in the ledger as posted"]
+
+
+def test_two_chapters_with_the_same_korean_are_left_alone(client):
+    # The hash then names two chapters, so it names none of them. Blocking on it would be
+    # a coin flip over whether a real chapter ever gets published.
+    a = _novel(client, "Twins", [1, 2], translated=[(1, ONE), (2, TWO)])
+    sid = _series(client, "Twins", [a])
+    _same_korean(a, [1, 2])
+    _posted(client, sid, "Chapter 99", project_id=a, index=1)
+    by = {i["title"]: i for i in _plan(client, sid)["items"]}
+    assert by["Chapter 1"]["blockers"] == []
+    assert by["Chapter 2"]["blockers"] == []
+
+
+def test_a_range_cannot_hide_the_chapter_that_makes_a_hash_ambiguous(client):
+    """The reason ambiguity is counted per PROJECT and not across the plan.
+
+    A chapter range drops rows before the plan is built, so a count taken over the plan's
+    items sees only what is in range -- ask for chapter 2 alone and the duplicate at
+    chapter 1 becomes invisible, making a hash that names two chapters look unique.
+    """
+    a = _novel(client, "Ranged", [1, 2], translated=[(1, ONE), (2, TWO)])
+    sid = _series(client, "Ranged", [a])
+    _same_korean(a, [1, 2])
+    _posted(client, sid, "Chapter 99", project_id=a, index=1)
+    only_two = posting.plan_run(sid, start=2, end=2)["items"]
+    assert [i["title"] for i in only_two] == ["Chapter 2"]
+    assert only_two[0]["blockers"] == []
 
 
 # ---- taking a chapter back out of the ledger ------------------------------

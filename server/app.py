@@ -4135,6 +4135,11 @@ def posting_result(body: PostResult) -> dict:
         "title": body.title,
         "project_id": body.project_id,
         "index": body.index,
+        # The Korean this chapter was translated from. Recorded so the ledger can still
+        # recognise it after a renumber has changed the title it generates -- which is
+        # the one thing every other guard here is blind to. Empty when the caller did not
+        # say which chapter it was, and the title carries it as before.
+        "source_hash": posting.source_digest(body.project_id, body.index),
         "global": body.global_number,
         "status": body.status,
         "remote_url": body.remote_url,

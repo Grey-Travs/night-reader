@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   SNAPSHOT_STALE_HOURS, belowSite, blockedReason, chapterNumber, duplicates, eligible,
-  formatRuns, nextRun,
+  formatRuns, heldReason, nextRun,
   pickupLine, range, runs, snapshotWarning, suggestionLabel, unnumberedLabel,
 } from './posting'
 
@@ -245,5 +245,23 @@ describe('a side story that carries its own number', () => {
 
   it('stays out of a displayed range of chapter numbers', () => {
     expect(range([item(67), item(68), numberedSide(1)])).toBe('67–68')
+  })
+})
+
+
+// The held line shows one short phrase per reason, so every blocker the server can send
+// needs a phrase -- an unmapped one falls through and prints the whole sentence.
+describe('naming why a chapter is held', () => {
+  it('has a short phrase for a chapter posted under another number', () => {
+    expect(heldReason(
+      'already posted as "Chapter 224" — the same Korean, under a different number'))
+      .toBe('already posted under another number')
+  })
+
+  it('keeps the plain ledger and site phrases apart', () => {
+    expect(heldReason('already in the ledger as posted')).toBe('already posted')
+    expect(heldReason('already in the ledger as posted, and still on the site'))
+      .toBe('already posted')
+    expect(heldReason('already on the site')).toBe('already on the site')
   })
 })

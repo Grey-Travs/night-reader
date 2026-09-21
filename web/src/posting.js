@@ -23,6 +23,7 @@ export function heldReason(blocker) {
   if (b.includes('not confirmed')) return NUMBERING
   if (b.startsWith('already on the site')) return 'already on the site'
   if (b.startsWith('already in the ledger')) return 'already posted'
+  if (b.startsWith('already posted as')) return 'already posted under another number'
   if (b.startsWith('not finished')) return 'not finished'
   if (b.startsWith('no translation')) return 'not translated yet'
   if (b.startsWith('too long')) return 'too long for the editor'

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 import tomllib
 import uuid
 from datetime import datetime, timezone
@@ -85,13 +86,39 @@ def _chapter_markdown(pid: str, index: int) -> str | None:
         return None
 
 
-def _chapter_status(pid: str, index: int) -> str:
+def _chapter_record(pid: str, index: int) -> tuple[str, str, bool]:
+    """``(status, source hash, is that hash on another chapter of this project?)``.
+
+    One state.json parse, which was already happening once per chapter -- the record
+    carrying the hash was read and thrown away, so the hash costs nothing.
+
+    The ambiguity flag is per PROJECT rather than per plan on purpose. A chapter range
+    drops rows before the plan ever sees them, so counting digests across the plan's
+    items can only see what is in range: ask for one chapter and a duplicate of it
+    sitting outside the range becomes invisible. ``State.load`` has already parsed every
+    record in this project, so answering from that same parse is free and complete.
+    """
     project = pj.get_project(pid)
     if project is None:
-        return "missing"
+        return "missing", "", False
     cfg = pj.project_config(Config(), project)
-    rec = State.load(cfg.paths.state_file).get(index) or {}
-    return rec.get("status") or "pending"
+    state = State.load(cfg.paths.state_file)
+    rec = state.get(index) or {}
+    digest = rec.get("source_hash") or ""
+    twice = bool(digest) and sum(
+        1 for other in (state.chapters or {}).values()
+        if (other or {}).get("source_hash") == digest) > 1
+    return rec.get("status") or "pending", digest, twice
+
+
+def source_digest(project_id: str, index: int | None) -> str:
+    """The fingerprint of the Korean a chapter was translated from, for the ledger."""
+    if not project_id or index is None:
+        return ""
+    try:
+        return _chapter_record(project_id, int(index))[1]
+    except (OSError, ValueError, TypeError):
+        return ""
 
 
 def chapter_title(row: dict, adapter: dict, side_ordinal: int | None = None,
@@ -294,6 +321,8 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
 
     rows = series_mod.reading_order(series, mapping)
     ordinals = _side_ordinals(rows)
+    # (project, index) -> (source hash, is that hash on another chapter there)
+    digests: dict[tuple[str, int], tuple[str, bool]] = {}
     items = []
     for row in rows:
         number = row.get("global")
@@ -314,7 +343,8 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
         pid, index = row["project_id"], row["index"]
         title = chapter_title(row, adapter, ordinals.get((pid, index)), naming)
         md = _chapter_markdown(pid, index)
-        status = _chapter_status(pid, index)
+        status, digest, digest_twice = _chapter_record(pid, index)
+        digests[(pid, index)] = (digest, digest_twice)
         html = markdown_to_html(strip_leading_heading(md or ""),
                                 strip_part_markers=True) if md else ""
         # Real chapters go by the free/paid cutoff; side content follows the series' own
@@ -360,6 +390,40 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     ledger = load_ledger(sid, target["id"])
     posted = {site_title_key(e["title"])
               for e in ledger.get("entries", []) if e.get("status") == "posted"}
+
+    # The same chapter under a different NAME.
+    #
+    # Every other guard here compares titles, and a renumber changes the title a chapter
+    # GENERATES while leaving its Korean -- and so its hash -- untouched. That is exactly
+    # how one novel was published three times under three different numbers: the ledger
+    # missed it because the title moved, and the site snapshot missed it too because the
+    # site still showed the old name.
+    #
+    # The stored hash is the provenance of the English already on disk. realign_chapter_
+    # indices moves a chapter file and its state record together, so a translation keeps
+    # its digest across a tab insertion that changes its index -- which is precisely
+    # where (project_id, index) fails, and why identity is keyed on this instead.
+    #
+    # Entries written before this carry no hash and fall back to the title, so nothing
+    # that used to post stops posting.
+    posted_hashes: dict[str, str] = {}
+    shared_in_ledger: set[str] = set()
+    for entry in ledger.get("entries", []):
+        if entry.get("status") != "posted":
+            continue
+        digest = entry.get("source_hash") or ""
+        if not digest:
+            continue
+        if digest in posted_hashes:
+            shared_in_ledger.add(digest)
+        posted_hashes.setdefault(digest, entry.get("title") or "")
+
+    # Counted across the WHOLE plan, and over every item rather than only the postable
+    # ones: the one real collision in this library is two chapters that are both already
+    # posted, which a postable-only count would never see. This catches a digest shared
+    # across two MEMBERS of a series, which the per-project check inside _chapter_record
+    # cannot see.
+    plan_counts = Counter(digest for digest, _ in digests.values() if digest)
     # Chapters the browser said it was ABOUT to create and never reported finishing.
     #
     # The window this closes: the create succeeds on the site, the reply is lost, and the
@@ -400,12 +464,27 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     for item in items:
         key = site_title_key(item["title"])
         live = key in on_site
+        digest, digest_twice = digests.get(
+            (item["project_id"], item["index"]), ("", False))
+        # Only ever acted on when the hash means ONE chapter: ambiguous either within its
+        # own project, across the series, or in the ledger, and it identifies nothing.
+        renamed = (posted_hashes.get(digest)
+                   if digest and not digest_twice
+                   and plan_counts[digest] == 1
+                   and digest not in shared_in_ledger
+                   else None)
         if untrusted:
             item["blockers"] = [*item["blockers"], untrusted]
         elif key in posted:
             item["blockers"] = [*item["blockers"], (
                 "already in the ledger as posted, and still on the site" if live
                 else "already in the ledger as posted")]
+        elif renamed is not None and site_title_key(renamed) != key:
+            # A re-translation does NOT clear this: the hash fingerprints the Korean, not
+            # the English. DELETE /api/posting/ledger is the way out.
+            item["blockers"] = [*item["blockers"],
+                                f'already posted as "{renamed}" — the same Korean, '
+                                f'under a different number']
         elif live:
             item["blockers"] = [*item["blockers"], "already on the site"]
 
