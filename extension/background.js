@@ -88,9 +88,16 @@ const HANDLERS = {
   }),
   // The chapter names read off the site. Python has no session there and no business
   // having one, so this push is the only way the plan can know what is already published.
-  site: ({ sid, targetId = 'default', titles, prices }) => post('/api/posting/site', {
-    sid, target_id: targetId, titles, prices,
-  }),
+  // Forwards what the content script actually sends. It used to destructure `titles` and
+  // `prices` -- the shape from before the site reading carried rows -- so every push
+  // arrived with both undefined and `rows`/`mode`/`source` dropped on the floor. The
+  // server then refused the empty list and content.js swallowed the refusal by design
+  // ("never let it interrupt a run"), so the snapshot silently stopped updating at all:
+  // no prices, no state, and a chapter list frozen at whatever it last held.
+  site: ({ sid, targetId = 'default', rows, mode, source, titles, prices }) =>
+    post('/api/posting/site', {
+      sid, target_id: targetId, rows, mode, source, titles, prices,
+    }),
 
   // --- reading a published novel back into the library --------------------
   //
