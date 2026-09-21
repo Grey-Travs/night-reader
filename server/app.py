@@ -3672,6 +3672,10 @@ class UpdateSeries(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = None
     archived: bool | None = None
+    # The ongoing/completed/hiatus label. It belongs to the SERIES rather than only to the
+    # project because a four-document series is one novel to the person reading it --
+    # "This Priest ...", "...2", "...3" are not three stories with three separate fates.
+    # A standalone project keeps its own.
     status: str | None = None
     # Member order IS reading order, so reordering is a first-class edit.
     members: list[str] | None = None

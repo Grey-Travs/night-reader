@@ -159,7 +159,6 @@ export const api = {
   listSeries: () => get('/api/series'),
   suggestSeries: () => get('/api/series/suggest'),
   createSeries: (name, projectIds) => post('/api/series', { name, project_ids: projectIds }),
-  series: (sid) => get(`/api/series/${sid}`),
   updateSeries: (sid, body) => post(`/api/series/${sid}`, body),
   // Unlinks the series only — the member novels are never deleted.
   deleteSeries: (sid) => del(`/api/series/${sid}`),
@@ -195,8 +194,6 @@ export const api = {
     if (end) q.set('end', String(end))
     return get(`/api/posting/plan?${q}`)
   },
-  postingLedger: (sid, targetId = 'default') =>
-    get(`/api/posting/ledger?${new URLSearchParams({ sid, target_id: targetId })}`),
 
   // Starting a run. The app cannot post — only the extension, inside the logged-in
   // browser, can — so pressing Start leaves a request in a file that an open meiko tab

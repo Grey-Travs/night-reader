@@ -30,7 +30,6 @@ glossary, so detaching it returns the novel to its pre-merge names.
 
 from __future__ import annotations
 
-from pathlib import Path
 
 from translation_bot.glossary import (
     Glossary,
@@ -316,6 +315,3 @@ def merge_glossaries(sid: str, picks: dict[str, str] | None = None,
     series_mod.write_series(series)
     return result
 
-
-def series_glossary_dir(sid: str) -> Path:
-    return series_mod.series_root() / sid

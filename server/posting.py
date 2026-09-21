@@ -30,8 +30,6 @@ from . import remote
 from . import series as series_mod
 from .titles import learn_naming, site_title_key
 
-ADAPTERS_DIR = pj.PROJECT_ROOT / "adapters"
-
 # A chapter has to be finished before it can go out. `validated` is the only status the
 # engine treats as done; needs-review, failed and empty are all explicitly not.
 POSTABLE_STATUSES = DONE_STATUSES

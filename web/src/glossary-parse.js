@@ -1,8 +1,6 @@
 // Shared parsing for the glossary bulk-add box and the file Import button.
-// No React imports on purpose: there is no JS test runner in this repo, so
-// plain `node` must be able to exercise parseBulk directly.
+// No React imports on purpose, so parseBulk can be exercised on its own.
 
-export const MAX_ROWS = 2000     // mirrors server/bulk.py
 export const MAX_UNTYPED = 200
 const MAX_TERM_LEN = 100
 

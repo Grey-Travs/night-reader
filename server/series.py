@@ -46,15 +46,6 @@ def series_root() -> Path:
 
 _SERIES_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
-# Fields a user may edit on a series. Everything else (id, created_at, and the resolved
-# chapter mapping) is server-managed.
-#
-# ``status`` is the ongoing/completed/hiatus label from ``pj.NOVEL_STATUSES``. It belongs
-# here rather than only on the project because a four-document series is ONE novel to the
-# person reading it -- "This Priest ...", "...2", "...3" are not three stories with three
-# separate fates. A standalone project keeps its own.
-EDITABLE_FIELDS = {"name", "archived", "status"}
-
 # ---------------------------------------------------------------------------
 # Title matching
 #
@@ -645,14 +636,6 @@ def apply_overrides(doc: dict, overrides: list[dict]) -> dict:
     doc.update(_series_totals(doc))
     return doc
 
-
-def global_for(sid: str, pid: str, index: int) -> int | None:
-    doc = load_mapping(sid) or {}
-    member = (doc.get("members") or {}).get(pid) or {}
-    for row in member.get("rows") or []:
-        if row.get("index") == index:
-            return row.get("global")
-    return None
 
 
 # Kinds you would never turn a page onto. A DUPLICATE is literally the same text again,

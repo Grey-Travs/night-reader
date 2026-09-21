@@ -25,7 +25,6 @@ is testable without credentials.
 
 from __future__ import annotations
 
-from pathlib import Path
 
 from translation_bot import docsmake
 from translation_bot.chapter_numbers import infer_mapping
@@ -176,9 +175,3 @@ def _verify(docs_service, doc_id: str, part: list[dict]) -> dict:
                 "differed": []}
     return docsmake.check(part, fetched)
 
-
-def can_write(token_file) -> bool:
-    """Whether the saved token was granted the write scope."""
-    from translation_bot.google_auth import _load_token, missing_scopes
-    creds = _load_token(Path(token_file))
-    return bool(creds) and not missing_scopes(creds, WRITE_SCOPES)
