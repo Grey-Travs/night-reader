@@ -46,11 +46,14 @@ export const api = {
   updateProject: (pid, body) => post(`/api/projects/${pid}`, body),
   deleteProject: (pid) => del(`/api/projects/${pid}`),
 
-  // Scanned pages (photographed / screenshotted novels).
+  // Scanned pages (photographed / screenshotted novels), kept in chapter boxes. A box
+  // (`batch`) is a chapter: its photos, in order, become that chapter when it's built.
   // One image per request as a raw body, like importBundle — it keeps the backend
   // free of a multipart dependency and gives per-file progress and per-file failure.
-  // Thread the `batch` returned by the first upload through the rest of one drop:
-  // a batch is how the reader says "these photos are one chapter".
+  // An upload goes INTO a box by id, at its end; an empty id starts a new box at the
+  // end of the novel, and an id the server doesn't know is refused (404) rather than
+  // quietly becoming a chapter of its own. Every upload and box change answers with the
+  // fresh list as `pages`, stamped with `rev`, so a slower answer can't undo a newer one.
   scans: () => get('/api/scans'),
   pages: (pid) => get(`/api/projects/${pid}/pages`),
   page: (pid, pageId) => get(`/api/projects/${pid}/pages/${pageId}`),
@@ -64,14 +67,32 @@ export const api = {
     })
   },
   savePage: (pid, pageId, body) => post(`/api/projects/${pid}/pages/${pageId}`, body),
-  reorderPages: (pid, ids) => post(`/api/projects/${pid}/pages/reorder`, { ids }),
+  // `before` is the photo to land in front of; null means the end of the box.
+  movePages: (pid, { ids, batch, before = null }) =>
+    post(`/api/projects/${pid}/pages/move`, { ids, batch, before }),
+  // `after` places the new box (default: last); `ids` are moved into it, in that order,
+  // in the same request — so "Split chapter here" can't leave an empty box behind.
+  // Keys left undefined are dropped by JSON.stringify, and the server refuses unknown ones.
+  createPageBatch: (pid, { label, after, ids } = {}) =>
+    post(`/api/projects/${pid}/pages/batches`, { label, after, ids }),
+  // The full box order. Built chapters keep their places; the server refuses otherwise.
+  reorderPageBatches: (pid, ids) => post(`/api/projects/${pid}/pages/batches/order`, { ids }),
+  renamePageBatch: (pid, batchId, label) =>
+    post(`/api/projects/${pid}/pages/batches/${batchId}`, { label }),
+  // `expect_page_ids` is the photo list the confirm showed. A photo that arrived after
+  // it makes the server refuse, so "Delete 8 photos?" can never delete 9.
+  deletePageBatch: (pid, batchId, { expect_page_ids } = {}) =>
+    post(`/api/projects/${pid}/pages/batches/${batchId}/delete`, { expect_page_ids }),
   deletePages: (pid, ids) => post(`/api/projects/${pid}/pages/delete`, { ids }),
   // readPages / verifyPages QUEUE work on the novel's worker (like resolveChapter),
   // so they stream to the live console and honour Stop and the rate-limit resume.
   readPages: (pid, ids) => post(`/api/projects/${pid}/pages/ocr`, { ids: ids || [] }),
   verifyPages: (pid, ids) => post(`/api/projects/${pid}/pages/verify`, { ids: ids || [] }),
   stitchPages: (pid, body) => post(`/api/projects/${pid}/pages/stitch`, body || {}),
-  buildChapters: (pid, body) => post(`/api/projects/${pid}/pages/build`, body || {}),
+  // Each box becomes one chapter, in box order. `preview` answers with exactly what a
+  // build would do — added, updated, waiting and why — and writes nothing.
+  buildChapters: (pid, { include, append, force, preview } = {}) =>
+    post(`/api/projects/${pid}/pages/build`, { include, append, force, preview }),
 
   // Move / back up novels between devices (portable .zip bundles).
   // `images` also packs a scanned novel's original photos — off by default, because

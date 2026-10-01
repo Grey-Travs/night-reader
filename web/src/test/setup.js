@@ -28,6 +28,12 @@ if (!global.requestAnimationFrame) {
   global.cancelAnimationFrame = (id) => clearTimeout(id)
 }
 
+// The Pages tab scrolls a chapter box or a photo back into view after a change, and to
+// the top when a photo opens. jsdom lacks the first and only logs "not implemented"
+// for the second, so either would fail or litter a test that is about something else.
+if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => {}
+window.scrollTo = () => {}
+
 if (!window.EventSource) {
   // ProjectLayout opens one on mount. Tests that don't exercise streaming just need
   // it to exist and stay quiet.

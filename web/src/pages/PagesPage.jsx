@@ -1,56 +1,113 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useOutletContext } from 'react-router-dom'
+import { useNavigate, useOutletContext, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
-import { reorderIds } from '../reorder'
 import { useToast } from '../toast'
 import { useConfirm } from '../confirm'
-import { Modal, PageBadge, SkeletonRows } from '../components/ui'
+import { SkeletonRows } from '../components/ui'
+import ChapterBoxes from '../components/ChapterBoxes'
+import PagePhotoView from '../components/PagePhotoView'
+import BuildChaptersDialog from '../components/BuildChaptersDialog'
+import {
+  BUSY, NEW_BOX, REFUSED, applyBoxOrder, applyMove, boxName, checkDrop, groupBoxes, hasText,
+  isBuilt, locate, neighbourId, planBoxMove, planPhotoMove, planSplit, sortFilesForUpload,
+  stoppedMessage, uploadReport,
+} from '../pageBoxes'
 
-// The scanned-page workbench: photo on one side, the Korean read out of it on the
-// other, and the seams between pages made visible in the middle.
+// The scanned-page workbench. The overview is the novel's chapters as boxes, in reading
+// order, each holding its photos in order; a photo opens beside the Korean read out of
+// it, with the seam to the photo before it.
 //
 // The seams are the part that matters. Photographing a print book, a sentence
 // routinely runs across a page break; if each page is split into paragraphs on its
 // own, every one of those becomes a false paragraph break, and the translator
-// faithfully preserves it into the English. So the joins live IN the page rail as
-// editable chips rather than hidden in a dialog.
+// faithfully preserves it into the English. So the joins sit between the photos, where
+// they can be seen and changed, rather than hidden in a dialog.
 
-const JOIN_CHIP = {
-  sentence: { label: '→ continues', cls: 'pill-translated', hint: 'The sentence runs straight across this break — no paragraph break here.' },
-  paragraph: { label: '↵ new paragraph', cls: 'pill-muted', hint: 'A paragraph ends on the previous page.' },
-  chapter: { label: '📖 new chapter', cls: 'pill-english', hint: 'A new chapter starts on this page.' },
-  gap: { label: '⚠ page missing?', cls: 'pill-review', hint: "The text doesn't follow on — a page may never have been photographed." },
+// What a queued write hands back once it has been sent: the fresh summary (every upload
+// and box endpoint answers with one), RELOAD to fetch one, or — for a page save, which
+// answers with that page alone — { rev, patch } to fold the page into the rail.
+const RELOAD = Symbol('reload')
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+// The rail row and the page record are different shapes: `has_text` exists only on the
+// row, so a plain spread leaves it STALE. Recompute it with `chars`, or a page that just
+// gained text keeps has_text false and the Build / Work-out-the-joins buttons stay hidden.
+function withRecord(rail, record) {
+  if (!rail) return rail
+  const { text, raw_text: _raw, rev: _rev, ...fields } = record
+  return {
+    ...rail,
+    pages: rail.pages.map((p) => (p.id === record.id
+      ? { ...p, ...fields, chars: (text || '').length, has_text: hasText(text) } : p)),
+  }
 }
-const JOIN_ORDER = ['sentence', 'paragraph', 'chapter', 'gap']
 
-// Below this the built chapter is treated as already-English and silently skipped by
-// the translator, so it has to be visible per page, before that ever happens.
-const MIN_HANGUL = 0.15
+const patchPage = (rail, pageId, fields) => rail && {
+  ...rail,
+  pages: rail.pages.map((p) => (p.id === pageId ? { ...p, ...fields } : p)),
+}
 
-const CONFIDENCE_CLS = { high: 'pill-translated', medium: 'pill-queued', low: 'pill-review' }
-
-export default function PagesPage() {
-  const { pid, running, submitTask, showError, reload, setProjectMeta } = useOutletContext()
-  const toast = useToast()
-  const confirm = useConfirm()
-
+/**
+ * The boxes on screen, and every way they change.
+ *
+ * Three things write to the rail: the poll, the answers to uploads, and this tab's own
+ * edits, which show at once and reach the server later. Left to race, a poll that left
+ * before a drag and answered after it put the old order back, and a second drag planned
+ * from that screen silently undid the first. And edits sent side by side could be
+ * applied in any order — the server serves requests from a thread pool on a lock that
+ * keeps no queue, and a phone link reorders them on its own — so three quick "Later"
+ * taps could land the photo somewhere the screen never showed.
+ *
+ * So edits go out one at a time, in order, and only the last one's answer is shown
+ * (each earlier one would undo the moves queued after it). Polls and upload answers wait
+ * while any edit is pending, and anything stamped with an older `rev` than the screen
+ * already shows is dropped.
+ */
+function useRail(pid, showError) {
   const [rail, setRail] = useState(null)
   const [railError, setRailError] = useState(null)
-  const [selectedId, setSelectedId] = useState(null)
-  const [current, setCurrent] = useState(null)
-  const [draft, setDraft] = useState('')
-  const [busy, setBusy] = useState('')
-  const [uploading, setUploading] = useState(null)
-  const [zoom, setZoom] = useState(1)
-  const [showBuild, setShowBuild] = useState(false)
-  const fileRef = useRef(null)
-  const saveTimer = useRef(null)
-  // The edit waiting on the debounce, so it can be FLUSHED rather than dropped when
-  // the reader navigates away inside the 700ms window.
-  const pendingSave = useRef(null)
+  const railRef = useRef(null)
+  const pidRef = useRef(pid)
+  const shown = useRef(-1)       // the newest rev on screen
+  const missed = useRef(-1)      // the newest rev passed over while edits were pending
+  const pending = useRef(0)      // edits queued or in flight
+  const behind = useRef(false)   // an earlier answer was passed over, or an edit failed
+  const chain = useRef(Promise.resolve())
+  const generation = useRef(0)
 
-  const pages = rail?.pages || []
-  const counts = rail?.counts || {}
+  const show = useCallback((next) => { railRef.current = next; setRail(next) }, [])
+
+  // A new novel starts from nothing: its revs have nothing to do with the last one's, and
+  // edits still finishing there must not hold this one's rail back.
+  useEffect(() => {
+    pidRef.current = pid
+    generation.current += 1
+    shown.current = -1
+    missed.current = -1
+    pending.current = 0
+    behind.current = false
+    show(null)
+    setRailError(null)
+  }, [pid, show])
+
+  const apply = useCallback((payload) => {
+    if (!payload) return
+    if (payload.rev != null) {
+      if (payload.rev < shown.current) return
+      shown.current = payload.rev
+    }
+    show(payload)
+  }, [show])
+
+  // A poll's or an upload's answer. Never shown over edits still on their way — the
+  // screen already has them and this payload may not — but remembered, so the rail is
+  // fetched again if the edits' own answer turns out to be older.
+  const offer = useCallback((payload, forPid) => {
+    if (!payload || forPid !== pidRef.current) return
+    if (pending.current > 0) missed.current = Math.max(missed.current, payload.rev ?? Infinity)
+    else apply(payload)
+  }, [apply])
 
   // `quiet` refreshes never open the modal. The background poll used to call
   // showError on every failure, so a backend that died mid-run reopened an
@@ -58,17 +115,106 @@ export default function PagesPage() {
   // only way out was reloading the browser. Poll failures show inline instead.
   const loadRail = useCallback(async ({ quiet = false } = {}) => {
     try {
-      setRail(await api.pages(pid))
-      setRailError(null)
+      offer(await api.pages(pid), pid)
+      if (pid === pidRef.current) setRailError(null)
       return true
     } catch (e) {
+      if (pid !== pidRef.current) return false
       setRailError(e)
       if (!quiet) showError(e, { context: 'loading the pages' })
       return false
     }
-  }, [pid, showError])
+  }, [pid, offer, showError])
+
+  // `send` makes the request and says what to show for it (see RELOAD). `optimistic`
+  // changes the screen now; returning null from it means "can't say, wait for the answer".
+  // Resolves true once the edit has been sent and accepted.
+  const write = useCallback((send, { context, optimistic } = {}) => {
+    const gen = generation.current
+    if (optimistic && railRef.current) {
+      const next = optimistic(railRef.current)
+      if (next) show(next)
+    }
+    pending.current += 1
+    const step = async () => {
+      let result = null
+      let ok = true
+      try {
+        result = await send()
+      } catch (e) {
+        ok = false
+        showError(e, { context })
+      }
+      if (gen !== generation.current) return ok   // another novel is on screen now
+      pending.current -= 1
+      if (!ok) behind.current = true
+      if (pending.current > 0) {
+        // A page save's answer is one record; anything else passed over here only
+        // reaches the screen with the last answer if that one is a summary too.
+        if (result && !result.patch) behind.current = true
+        return ok
+      }
+      const reload = result === RELOAD || behind.current
+      behind.current = false
+      if (result?.patch) {
+        if (result.rev == null || result.rev >= shown.current) {
+          if (result.rev != null) shown.current = result.rev
+          show(result.patch(railRef.current))
+        }
+      } else if (result && result !== RELOAD) apply(result)
+      if (reload || missed.current > shown.current) loadRail({ quiet: true })
+      missed.current = -1
+      return ok
+    }
+    const run = chain.current.then(step)
+    chain.current = run.catch(() => false)   // one broken step must never stall the rest
+    return run
+  }, [show, apply, loadRail, showError])
+
+  // Resolves once every edit queued so far has been sent. A build reads the photos the
+  // server has, so it waits for these first.
+  const whenWritten = useCallback(() => chain.current, [])
+
+  return { rail, railError, railRef, pidRef, loadRail, offer, write, whenWritten }
+}
+
+export default function PagesPage() {
+  const { pid, running, submitTask, showError, reload, setProjectMeta, chapters = [] } = useOutletContext()
+  const toast = useToast()
+  const confirm = useConfirm()
+  const navigate = useNavigate()
+  const [params, setParams] = useSearchParams()
+  const photoId = params.get('photo')
+
+  const { rail, railError, railRef, pidRef, loadRail, offer, write, whenWritten } = useRail(pid, showError)
+  const boxes = useMemo(() => (rail ? groupBoxes(rail.pages, rail.batches) : []), [rail])
+  // Moves are planned from the rail as it is NOW, optimistic changes included. A plan
+  // made from the last render could be a tap behind.
+  const boxesNow = () => groupBoxes(railRef.current?.pages, railRef.current?.batches)
+
+  const [current, setCurrent] = useState(null)
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState('')
+  const [zoom, setZoom] = useState(1)
+  const [showBuild, setShowBuild] = useState(false)
+  const [expanded, setExpanded] = useState({})
+  const [revealBox, setRevealBox] = useState(null)
+  const [notices, setNotices] = useState([])
+  const fileRef = useRef(null)
+  const pickTarget = useRef(NEW_BOX)
+  const saveTimer = useRef(null)
+  // The edit waiting on the debounce, so it can be FLUSHED rather than dropped when
+  // the reader navigates away inside the 700ms window.
+  const pendingSave = useRef(null)
+  const openedHere = useRef(false)
+  const returnTo = useRef(null)
+  const noticeSeq = useRef(0)
+
+  const pages = rail?.pages || []
+  const counts = rail?.counts || {}
 
   useEffect(() => { loadRail() }, [loadRail])
+  useEffect(() => { setExpanded({}); openedHere.current = false }, [pid])
 
   // While the worker is reading pages, keep the rail honest without a stream of its
   // own — the SSE console already shows the detail. Give up after a few consecutive
@@ -84,118 +230,321 @@ export default function PagesPage() {
     return () => clearInterval(id)
   }, [running, loadRail])
 
-  // Select the first page that still wants attention, once.
+  // One more look when the job ends: the last page often finishes between two ticks,
+  // and with the poll stopped it would sit on "Reading" until something else reloaded.
+  const wasRunning = useRef(running)
   useEffect(() => {
-    if (selectedId || !pages.length) return
-    const wanted = pages.find((p) => p.status === 'needs-check') || pages[0]
-    setSelectedId(wanted.id)
-  }, [pages, selectedId])
+    if (wasRunning.current && !running) loadRail({ quiet: true })
+    wasRunning.current = running
+  }, [running, loadRail])
+
+  const notice = useCallback((text, forPid) => {
+    noticeSeq.current += 1
+    const id = noticeSeq.current
+    setNotices((list) => [...list, { id, pid: forPid, text }])
+  }, [])
+
+  // ---- the open photo ---------------------------------------------------------------
+  const at = photoId ? locate(boxes, photoId) : null
+  const row = at ? at.box.pages[at.index] : null
 
   useEffect(() => {
-    if (!selectedId) { setCurrent(null); return undefined }
+    if (!photoId) { setCurrent(null); return undefined }
     let alive = true
-    api.page(pid, selectedId)
+    api.page(pid, photoId)
       .then((p) => { if (alive) { setCurrent(p); setDraft(p.text || ''); setZoom(1) } })
       .catch(() => { if (alive) setCurrent(null) })
     return () => { alive = false }
-  }, [pid, selectedId])
+  }, [pid, photoId])
 
-  const selectedIndex = pages.findIndex((p) => p.id === selectedId)
+  // Reading a photo replaces its text on the server, but the record on screen was
+  // fetched before that. Fetch it again the moment its row stops being busy, or the
+  // reader sits looking at an empty box beside a page that has long been read.
+  const rowId = row?.id
+  const rowStatus = row?.status
+  const seen = useRef(null)
+  useEffect(() => {
+    const was = seen.current
+    seen.current = rowId ? { id: rowId, status: rowStatus } : null
+    return undefined
+    let alive = true
+    api.page(pid, rowId)
+      .then((p) => { if (alive) { setCurrent(p); setDraft(p.text || '') } })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [pid, rowId, rowStatus])
 
-  function step(delta) {
-    const next = pages[selectedIndex + delta]
-    if (next) setSelectedId(next.id)
-  }
-
-  // ---- saving --------------------------------------------------------------
-  async function persist(fields, { quiet = false, pageId = null } = {}) {
-    const target = pageId || selectedId
-    if (!target) return
-    try {
-      const updated = await api.savePage(pid, target, fields)
+  // ---- saving ------------------------------------------------------------------------
+  // Every page save goes through the write queue like a move does, the autosave flush
+  // included: sent beside a move, it could reach the server first or last, and its
+  // answer could put back a row the move had already changed.
+  function saveFields(forPid, pageId, fields, {
+    quiet = true, refresh = false, optimistic = null, context = 'saving that page',
+  } = {}) {
+    return write(async () => {
+      const updated = await api.savePage(forPid, pageId, fields)
       // Only touch the editor if that page is STILL the one on screen. A debounced
       // save can land after the reader has moved on, and applying it then put page
       // A's confidence, notes and verify issues beside page B's photo.
       setCurrent((cur) => (cur && cur.id === updated.id ? updated : cur))
-      setRail((r) => r && {
-        ...r,
-        pages: r.pages.map((p) => (p.id === updated.id
-          ? {
-            ...p,
-            ...updated,
-            // The rail row and the detail record are different shapes: `has_text`
-            // exists only on the row, so the spread leaves it STALE. Recompute it
-            // with `chars`, or a page that just gained text keeps has_text false
-            // and the Build / Work-out-the-joins buttons stay hidden.
-            text: undefined,
-            raw_text: undefined,
-            chars: (updated.text || '').length,
-            has_text: Boolean((updated.text || '').trim()),
-          }
-          : p)),
-      })
       if (!quiet) toast('Saved ✓')
-    } catch (e) { showError(e, { context: 'saving that page' }) }
+      return refresh ? RELOAD : { rev: updated.rev, patch: (r) => withRecord(r, updated) }
+    }, { context, optimistic })
+  }
+
+  // A status change moves box pills and the Build button, which the page's own answer
+  // can't show, so it fetches the boxes again once the queue is clear.
+  function persist(fields, { quiet = false } = {}) {
+    if (!photoId) return null
+    const status = 'status' in fields
+    return saveFields(pid, photoId, fields, {
+      quiet,
+      refresh: status,
+      optimistic: status ? (r) => patchPage(r, photoId, { status: fields.status }) : null,
+    })
   }
 
   function onDraft(value) {
     setDraft(value)
-    pendingSave.current = { pageId: selectedId, text: value }
+    // The id of the record being edited, not the URL's: the two differ for the moment
+    // between stepping to a photo and its text arriving.
+    if (!current) return
+    pendingSave.current = { pid, pageId: current.id, text: value }
     clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(() => {
-      pendingSave.current = null
-      persist({ text: value, pageId: selectedId }, { quiet: true })
-    }, 700)
+    saveTimer.current = setTimeout(() => flushSave(), 700)
   }
 
-  // FLUSH a pending autosave, don't cancel it — on unmount, when the novel changes,
-  // and when the reader moves to another page. This cleanup used to call
-  // clearTimeout despite claiming to flush, so a correction typed within the 700ms
-  // window and then navigated away from was discarded silently: no toast, no
-  // warning, no dirty indicator, and the typo was still there on return.
-  useEffect(() => () => {
+  function flushSave({ refresh = false } = {}) {
     clearTimeout(saveTimer.current)
     const p = pendingSave.current
     pendingSave.current = null
-    if (p) api.savePage(pid, p.pageId, { text: p.text }).catch(() => {})
-  }, [pid, selectedId])
+    if (p) saveFields(p.pid, p.pageId, { text: p.text }, { refresh })
+    return !!p
+  }
+  const flushRef = useRef(flushSave)
+  flushRef.current = flushSave
 
-  // ---- uploading -----------------------------------------------------------
-  async function upload(files) {
-    const list = Array.from(files || []).filter((f) => f.size)
-    if (!list.length) return
-    // One batch per drop: a batch is how you say "these photos are one chapter".
-    let batch = ''
-    let added = 0
-    let duplicates = 0
-    setUploading({ done: 0, total: list.length })
-    for (const [i, file] of list.entries()) {
-      try {
-        const res = await api.uploadPage(pid, file, { batch, label: '' })
-        batch = batch || res.batch || ''
-        if (res.duplicate) duplicates += 1
-        else added += 1
-      } catch (e) {
-        showError(e, { context: `uploading ${file.name || 'that image'}` })
-        break
-      }
-      setUploading({ done: i + 1, total: list.length })
+  // FLUSH a pending autosave, don't cancel it — on unmount, when the novel changes,
+  // and when the reader moves to another photo. This cleanup used to call
+  // clearTimeout despite claiming to flush, so a correction typed within the 700ms
+  // window and then navigated away from was discarded silently: no toast, no
+  // warning, no dirty indicator, and the typo was still there on return.
+  useEffect(() => () => flushRef.current(), [pid, photoId])
+
+  const setSeam = (pageId, kind) => saveFields(pid, pageId, { join_prev: kind }, {
+    refresh: true,
+    context: 'changing how those photos join',
+    optimistic: (r) => patchPage(r, pageId, { join_prev: kind, join_prev_source: 'user', join_reason: 'set by you' }),
+  })
+
+  // ---- moving between the boxes and a photo ------------------------------------------
+  function showPhoto(id, { replace = false } = {}) {
+    returnTo.current = id
+    setParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('photo', id)
+      return next
+    }, { replace })
+  }
+
+  function openPhoto(id) {
+    openedHere.current = true
+    showPhoto(id)
+    window.scrollTo(0, 0)   // the router keeps no scroll position of its own
+  }
+
+  // Steps replace the history entry, so the browser's Back button returns to the boxes
+  // instead of walking back through every photo looked at.
+  const stepPhoto = (delta) => {
+    const id = neighbourId(boxesNow(), photoId, delta)
+    if (id) showPhoto(id, { replace: true })
+  }
+
+  function leavePhoto() {
+    if (openedHere.current) {
+      openedHere.current = false
+      navigate(-1)
+    } else {
+      setParams((prev) => {
+        const next = new URLSearchParams(prev)
+        next.delete('photo')
+        return next
+      }, { replace: true })
     }
-    setUploading(null)
-    await loadRail()
-    const parts = []
-    if (added) parts.push(`${added} page${added === 1 ? '' : 's'} added`)
-    if (duplicates) parts.push(`${duplicates} already here`)
-    if (parts.length) toast(parts.join(' · '))
   }
 
-  const [dragOver, setDragOver] = useState(false)
-
-  function onDrop(e) {
-    e.preventDefault()
-    setDragOver(false)
-    upload(e.dataTransfer?.files)
+  function backToBoxes() {
+    // The boxes are fetched after the last save lands, so a pill doesn't come back
+    // showing the state from before the edit. A write with nothing to send does that
+    // when there's no save to flush.
+    if (!flushSave({ refresh: true })) write(async () => RELOAD)
+    if (at) setExpanded((e) => ({ ...e, [at.box.id]: true }))
+    leavePhoto()
   }
+
+  // Back on the boxes, bring the photo just looked at into view (its box was opened above).
+  useEffect(() => {
+    if (photoId || !returnTo.current || !rail) return
+    const el = document.querySelector(`[data-page-id="${returnTo.current}"]`)
+    returnTo.current = null
+    el?.scrollIntoView({ block: 'center' })
+    el?.focus()
+  }, [photoId, rail])
+
+  // A box just made: scroll to it, ready for photos. Its + tile gets focus, not the file
+  // picker — iOS refuses to open one that isn't the direct result of a tap.
+  useEffect(() => {
+    if (!revealBox || photoId) return
+    const box = document.getElementById(`box-${revealBox}`)
+    if (!box) return   // not on screen yet; the next rail update brings it
+    setRevealBox(null)
+    box.scrollIntoView({ block: 'center' })
+    box.querySelector('[data-add-photos]')?.focus()
+  }, [revealBox, rail, photoId])
+
+  // ---- uploading ---------------------------------------------------------------------
+  // One queue for every drop, so two drops can't interleave page by page. A drop's box
+  // is fixed when it's queued, and every job remembers its novel: switching novels
+  // mid-upload must not send the rest of one novel's photos into another.
+  const uploadQueue = useRef([])
+  const uploading = useRef(false)
+  const jobSeq = useRef(0)
+  const [uploads, setUploads] = useState([])
+  const showUploads = () => setUploads(uploadQueue.current.map((job) => ({ ...job })))
+
+  // The next job to send. A stopped drop holds back every later drop for the same novel
+  // until it's retried or cancelled: going on would put the next drop's photos ahead of
+  // the ones that never went in, or create its new chapter first.
+  const nextJob = () => uploadQueue.current.find((job, i, all) => !job.stopped
+    && !all.slice(0, i).some((j) => j.pid === job.pid && j.stopped))
+
+  function enqueueUpload(fileList, target) {
+    const { files, refused, skipped } = checkDrop(Array.from(fileList || []))
+    if (refused.length) {
+      notice(`Nothing was added — ${refused.length === 1 ? 'this photo' : 'these'} can’t go in:\n`
+        + refused.map((r) => `· ${r.name} — ${REFUSED[r.reason]}`).join('\n')
+        + (refused.some((r) => r.reason === 'heic')
+          ? '\n\nOn an iPhone: Settings → Camera → Formats → Most Compatible, then take or '
+            + 'export the photos again as JPEG.' : ''), pid)
+      return
+    }
+    if (!files.length) {
+      if (skipped.length) notice(`Nothing to add: ${skipped.map((s) => `${s.name} (${s.reason})`).join(', ')}.`, pid)
+      return
+    }
+    uploadQueue.current.push({
+      id: ++jobSeq.current, pid, target, batch: target === NEW_BOX ? '' : target,
+      files: sortFilesForUpload(files), next: 0, added: 0, here: 0, elsewhere: [], skipped,
+      number: null, stopped: null,
+    })
+    showUploads()
+    pumpUploads()
+  }
+
+  async function pumpUploads() {
+    if (uploading.current) return
+    uploading.current = true
+    try {
+      for (let job = nextJob(); job; job = nextJob()) {
+        await sendUpload(job)
+        if (!job.stopped) {
+          uploadQueue.current = uploadQueue.current.filter((j) => j !== job)
+          reportUpload(job)
+        }
+        showUploads()
+      }
+    } finally {
+      uploading.current = false
+    }
+  }
+
+  async function sendUpload(job) {
+    while (job.next < job.files.length) {
+      const file = job.files[job.next]
+      try {
+        const res = await api.uploadPage(job.pid, file, { batch: job.batch })
+        if (res.duplicate) {
+          if (job.batch && res.existing_batch === job.batch) job.here += 1
+          else {
+            job.elsewhere.push({ name: file.name, batch: res.existing_batch,
+                                 number: res.existing_number, pageId: res.page?.id })
+          }
+        } else {
+          job.added += 1
+          // Only a photo that really went in names the drop's box. A duplicate's box is
+          // some other chapter, and adopting it sent the rest of a new chapter there.
+          if (!job.batch) job.batch = res.batch
+          if (res.number != null) job.number = res.number
+        }
+        offer(res.pages, job.pid)
+      } catch (e) {
+        job.stopped = { index: job.next, name: file.name, error: e }
+        return
+      }
+      job.next += 1
+      showUploads()
+    }
+  }
+
+  function reportUpload(job) {
+    if (job.pid !== pidRef.current) return   // the reader has moved to another novel
+    const now = railRef.current
+    const { toast: message, notices: lines } = uploadReport(job, groupBoxes(now?.pages, now?.batches))
+    if (message) toast(message)
+    for (const line of lines) notice(line, job.pid)
+  }
+
+  function resumeUpload(jobId, { skip = false, asNewChapter = false } = {}) {
+    const job = uploadQueue.current.find((j) => j.id === jobId)
+    if (!job?.stopped) return
+    if (skip) {
+      job.skipped = [...job.skipped, { name: job.stopped.name, reason: 'skipped after it failed' }]
+      job.next += 1
+    }
+    // The box this drop was going into is gone; the rest becomes a chapter of its own.
+    if (asNewChapter) { job.batch = ''; job.target = NEW_BOX }
+    job.stopped = null
+    showUploads()
+    pumpUploads()
+  }
+
+  // Cancelling the rest also drops whatever was queued behind it for this novel — sent
+  // now, those photos would go in ahead of the ones that were never sent.
+  function cancelUploads(jobId) {
+    const all = uploadQueue.current
+    const from = all.findIndex((j) => j.id === jobId)
+    if (from === -1) return
+    const job = all[from]
+    uploadQueue.current = all.filter((j, i) => i < from || j.pid !== job.pid)
+    reportUpload(job)
+    showUploads()
+    pumpUploads()
+  }
+
+  function pickPhotos(target) {
+    pickTarget.current = target
+    fileRef.current?.click()
+  }
+
+  // A drop that misses every box would make the browser open the photo in place of the
+  // app, and whatever was typed and not yet saved went with it.
+  useEffect(() => {
+    const files = (e) => Array.from(e.dataTransfer?.types || []).includes('Files')
+    const over = (e) => { if (files(e)) e.preventDefault() }
+    const drop = (e) => {
+      if (!files(e) || e.defaultPrevented) return
+      e.preventDefault()
+      toast(photoId
+        ? 'To add photos, go back to the chapters and drop them onto a chapter box.'
+        : 'Drop photos onto a chapter box, or onto “New chapter” below the last one.')
+    }
+    window.addEventListener('dragover', over)
+    window.addEventListener('drop', drop)
+    return () => {
+      window.removeEventListener('dragover', over)
+      window.removeEventListener('drop', drop)
+    }
+  }, [photoId, toast])
 
   // ---- work ----------------------------------------------------------------
   async function run(what, fn, context) {
@@ -220,6 +569,7 @@ export default function PagesPage() {
 
   const unread = (counts.new || 0) + (counts.failed || 0)
   const flagged = counts['needs-check'] || 0
+  const confident = pages.filter((p) => p.status === 'needs-check' && p.confidence === 'high')
 
   const readAll = () => startPageWork(
     'read', () => api.readPages(pid, []), 'reading the pages',
@@ -231,93 +581,206 @@ export default function PagesPage() {
     () => toast(`Double-checking ${flagged} page${flagged === 1 ? '' : 's'}…`),
   )
 
+  const readBox = (box) => {
+    const ids = box.pages.filter((p) => p.status === 'new' || p.status === 'failed').map((p) => p.id)
+    return startPageWork(
+      'read', () => api.readPages(pid, ids), `reading ${boxName(box)}`,
+      () => toast(`Reading ${plural(ids.length, 'photo')}…`),
+    )
+  }
+
+  // Not queued with the edits: its model call can take many seconds, and every move
+  // behind it would wait. The server checks each seam it writes against the photos as
+  // they are by then, so its answer is offered like a poll's.
   const stitch = () => run('stitch', async () => {
     const res = await api.stitchPages(pid, { use_model: true })
-    setRail(res.pages)
-    toast(res.gaps
+    offer(res.pages, pid)
+    let message = res.gaps
       ? `${res.seams} seams · ${res.gaps} possible missing page${res.gaps === 1 ? '' : 's'}`
-      : `${res.seams} seam${res.seams === 1 ? '' : 's'} worked out`)
+      : `${res.seams} seam${res.seams === 1 ? '' : 's'} worked out`
+    if (res.remaining > 0) message += ` · ${res.remaining} more unsure — press again`
+    toast(message)
   }, 'working out how the pages join')
 
   const rereadOne = () => startPageWork(
-    'reread', () => api.readPages(pid, [selectedId]), 'reading that page',
+    'reread', () => api.readPages(pid, [photoId]), 'reading that page',
     () => toast('Re-reading that page…'),
   )
 
   const verifyOne = () => startPageWork(
-    'verify1', () => api.verifyPages(pid, [selectedId]), 'checking that page',
+    'verify1', () => api.verifyPages(pid, [photoId]), 'checking that page',
     () => toast('Checking that page against its photo…'),
   )
 
   async function acceptAllGood() {
-    const good = pages.filter((p) => p.status === 'needs-check' && p.confidence === 'high')
-    if (!good.length) { toast('Nothing to accept'); return }
+    if (!confident.length) { toast('Nothing to accept'); return }
     await run('accept', async () => {
-      for (const page of good) await api.savePage(pid, page.id, { status: 'ok' })
-      await loadRail()
-      toast(`${good.length} page${good.length === 1 ? '' : 's'} accepted`)
+      const done = await Promise.all(confident.map((p) => saveFields(pid, p.id, { status: 'ok' }, {
+        refresh: true,
+        context: 'accepting those pages',
+        optimistic: (r) => patchPage(r, p.id, { status: 'ok' }),
+      })))
+      const n = done.filter(Boolean).length
+      if (n) toast(`${n} page${n === 1 ? '' : 's'} accepted`)
     }, 'accepting those pages')
   }
 
-  async function removeSelected() {
-    if (!current) return
+  async function deletePhoto() {
+    if (!row) return
     const ok = await confirm({
-      title: 'Delete this page?',
+      title: 'Delete this photo?',
       body: 'The photo and everything read from it are removed. This cannot be undone.',
       confirmLabel: 'Delete', danger: true,
     })
     if (!ok) return
-    await run('delete', async () => {
-      await api.deletePages(pid, [current.id])
-      setSelectedId(null)
-      await loadRail()
-      toast('Page deleted')
-    }, 'deleting that page')
+    // A save still waiting on the debounce must never be sent for a page that's gone.
+    clearTimeout(saveTimer.current)
+    pendingSave.current = null
+    const gone = row.id
+    const now = boxesNow()
+    const next = neighbourId(now, gone, 1) || neighbourId(now, gone, -1)
+    if (next) showPhoto(next, { replace: true })
+    else leavePhoto()
+    const done = await write(async () => (await api.deletePages(pid, [gone])).pages,
+                             { context: 'deleting that photo' })
+    if (done) toast('Photo deleted')
   }
 
-  async function setJoin(pageId, kind) {
-    try {
-      await api.savePage(pid, pageId, { join_prev: kind })
-      setRail((r) => r && {
-        ...r,
-        pages: r.pages.map((p) => (p.id === pageId
-          ? { ...p, join_prev: kind, join_prev_source: 'user', join_reason: 'set by you' } : p)),
-      })
-    } catch (e) { showError(e, { context: 'changing how those pages join' }) }
+  const moveTo = (plan) => plan && write(
+    async () => (await api.movePages(pid, plan)).pages,
+    { context: 'moving that photo', optimistic: (r) => applyMove(r, plan) },
+  )
+
+  async function splitHere() {
+    const plan = planSplit(boxesNow(), photoId)
+    if (!plan) return
+    let made = null
+    const done = await write(async () => {
+      const res = await api.createPageBatch(pid, plan)
+      made = res.batch
+      return res.pages
+    }, { context: 'splitting the chapter' })
+    if (done && made) toast(`${boxName(made)} now starts at this photo`)
   }
 
-  // ---- reorder -------------------------------------------------------------
-  const dragId = useRef(null)
+  // ---- the boxes themselves ------------------------------------------------------------
+  function addBox() {
+    const last = boxesNow().filter((b) => !b.orphan).at(-1)
+    // An empty box at the end already is the new chapter. A second one would only hold
+    // up every box after it at Build time.
+    if (last && !isBuilt(last) && !last.pages.length) { setRevealBox(last.id); return }
+    let made = null
+    write(async () => {
+      const res = await api.createPageBatch(pid, {})
+      made = res.batch
+      return res.pages
+    }, { context: 'adding a chapter' }).then(() => { if (made) setRevealBox(made.id) })
+  }
 
-  async function dropOn(targetId) {
-    const from = dragId.current
-    dragId.current = null
-    if (!from || from === targetId) return
+  const newBoxFrom = (pageId) => write(
+    async () => (await api.createPageBatch(pid, { ids: [pageId] })).pages,
+    { context: 'starting a new chapter' },
+  )
 
-    // Built from the list as it stands NOW. Deriving the order from the render
-    // closure and then resolving ids against fresh state was a mismatch: the 2.5s
-    // poll can add or drop a page mid-drag, and the stale id list then produced
-    // `undefined` rows — a page silently missing from the rail, or a crash on
-    // page.id, and a reorder request that omitted a real page.
-    const next = reorderIds(pages.map((p) => p.id), from, targetId)
-    if (!next) return
-
-    setRail((r) => {
-      if (!r) return r
-      const byId = new Map(r.pages.map((p) => [p.id, p]))
-      const rows = next.map((i) => byId.get(i)).filter(Boolean)
-      // If a poll changed the set underneath us, skip the optimistic update and let
-      // the server's answer settle it rather than rendering a rail with holes.
-      return rows.length === r.pages.length ? { ...r, pages: rows } : r
+  function moveBox(id, delta) {
+    const ids = planBoxMove(boxesNow(), id, delta)
+    if (!ids) return
+    write(async () => (await api.reorderPageBatches(pid, ids)).pages, {
+      context: 'moving that chapter',
+      optimistic: (r) => applyBoxOrder(r, ids),
     })
-
-    try { await api.reorderPages(pid, next) } catch (e) {
-      showError(e, { context: 'reordering the pages' })
-      loadRail()
-    }
   }
 
+  const renameBox = (id, label) => write(async () => (await api.renamePageBatch(pid, id, label)).pages, {
+    context: 'renaming that chapter',
+    optimistic: (r) => ({ ...r, batches: r.batches.map((b) => (b.id === id ? { ...b, label } : b)) }),
+  })
+
+  async function deleteBox(box) {
+    // The photos the confirm names are the ones the server is told to expect, so one
+    // that arrives while the dialog is open makes it refuse instead of going with them.
+    const ids = box.pages.map((p) => p.id)
+    if (ids.length) {
+      const ok = await confirm({
+        title: `Delete ${boxName(box)}?`,
+        body: `${boxName(box)} and its ${plural(ids.length, 'photo')} are removed, with the `
+          + 'text read from them. This can’t be undone.',
+        confirmLabel: 'Delete', danger: true,
+      })
+      if (!ok) return
+    }
+    const done = await write(
+      async () => (await api.deletePageBatch(pid, box.id, { expect_page_ids: ids })).pages,
+      { context: 'deleting that chapter' },
+    )
+    if (done && ids.length) toast(`${boxName(box)} deleted`)
+  }
+
+  // A stable onClose: Modal refocuses itself whenever it changes, and an inline one
+  // changed on every 2.5s poll, pulling focus off whatever was being clicked.
+  const closeBuild = useCallback(() => setShowBuild(false), [])
+
+  const afterBuild = (res) => {
+    setProjectMeta?.(res.project || {})
+    reload?.(true)
+    loadRail({ quiet: true })
+  }
+
+  // ---- render ----------------------------------------------------------------------
+  const myUploads = uploads.filter((job) => job.pid === pid)
+  const uploadingInto = new Set(myUploads.map((job) => job.batch).filter(Boolean))
+  const myNotices = notices.filter((n) => n.pid === pid)
   const anyText = pages.some((p) => p.has_text)
+  const unbuilt = boxes.filter((b) => !b.orphan && !isBuilt(b)).length
+  const builtCount = rail?.chapter_count || 0
+
+  const banners = (
+    <>
+      <UploadStatus
+        jobs={myUploads} boxes={boxes}
+        onRetry={(id, opts) => resumeUpload(id, opts)} onCancel={cancelUploads}
+        onDetails={(e) => showError(e, { context: 'adding photos' })}
+      />
+      {myNotices.map((n) => (
+        <div key={n.id} className="mb-3 flex items-start gap-3 rounded-card px-3 py-2 text-sm pill-review">
+          <p className="flex-1 whitespace-pre-line">{n.text}</p>
+          <button
+            className="shrink-0 text-xs underline hover:no-underline"
+            onClick={() => setNotices((list) => list.filter((x) => x.id !== n.id))}
+          >Dismiss</button>
+        </div>
+      ))}
+    </>
+  )
+
+  if (photoId) {
+    return (
+      <div className="page">
+        {banners}
+        {rail == null ? (
+          <SkeletonRows rows={8} />
+        ) : !at ? (
+          <div className="rounded-card border border-dashed border-line p-10 text-center">
+            <p className="text-sm text-muted">That photo isn’t in this novel any more.</p>
+            <button className="btn btn-primary mt-3 px-4 py-2 text-sm" onClick={backToBoxes}>
+              Back to chapters
+            </button>
+          </div>
+        ) : (
+          <PagePhotoView
+            pid={pid} boxes={boxes} box={at.box} index={at.index} row={row} page={current}
+            draft={draft} onDraft={onDraft} onPersist={persist} zoom={zoom} setZoom={setZoom}
+            busy={busy} running={running}
+            onBack={backToBoxes} onStep={stepPhoto}
+            onReread={rereadOne} onVerify={verifyOne} onDelete={deletePhoto}
+            onSetSeam={(kind) => setSeam(photoId, kind)}
+            onMove={(how) => moveTo(planPhotoMove(boxesNow(), photoId, how))}
+            onSplit={splitHere}
+          />
+        )}
+      </div>
+    )
+  }
 
   return (
     <div className="page">
@@ -327,18 +790,30 @@ export default function PagesPage() {
           <p className="text-sm text-hint">
             {rail == null && railError ? "Couldn't load this novel's pages."
               : rail == null ? 'Loading…'
-              : pages.length === 0 ? 'Add photos or screenshots of the pages, and Claude reads the Korean out of them.'
-              : `${counts.total} page${counts.total === 1 ? '' : 's'} · ${counts.ok || 0} good · ${flagged} to check · ${counts.new || 0} not read yet`}
+              : boxes.length === 0 ? 'Add photos or screenshots of the pages, and Claude reads the Korean out of them.'
+              : `${plural(builtCount + unbuilt, 'chapter')} · ${builtCount} built · `
+                + `${plural(counts.total || 0, 'photo')} · ${(counts.ok || 0) + (counts.edited || 0)} good · `
+                + `${flagged} to check · ${counts.new || 0} not read yet`}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <input
             ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" multiple hidden
-            onChange={(e) => { upload(e.target.files); e.target.value = '' }}
+            onChange={(e) => { enqueueUpload(e.target.files, pickTarget.current); e.target.value = '' }}
           />
-          <button className="btn btn-quiet px-3 py-1.5 text-sm" onClick={() => fileRef.current?.click()}>
-            Add photos
-          </button>
+          {rail != null && (
+            <button
+              className="btn btn-quiet px-3 py-1.5 text-sm" onClick={addBox}
+              onDragOver={(e) => { if (Array.from(e.dataTransfer?.types || []).includes('Files')) e.preventDefault() }}
+              onDrop={(e) => {
+                if (!Array.from(e.dataTransfer?.types || []).includes('Files')) return
+                e.preventDefault()
+                enqueueUpload(e.dataTransfer.files, NEW_BOX)
+              }}
+            >
+              Add chapter
+            </button>
+          )}
           {unread > 0 && (
             <button className="btn btn-primary px-3 py-1.5 text-sm" disabled={!!busy || running} onClick={readAll}>
               Read {unread} page{unread === 1 ? '' : 's'}
@@ -349,12 +824,17 @@ export default function PagesPage() {
               Double-check {flagged}
             </button>
           )}
+          {confident.length > 0 && (
+            <button className="btn btn-quiet px-3 py-1.5 text-sm" disabled={!!busy} onClick={acceptAllGood}>
+              Accept {confident.length} confident
+            </button>
+          )}
           {anyText && (
             <button className="btn btn-quiet px-3 py-1.5 text-sm" disabled={!!busy || running} onClick={stitch}>
               {busy === 'stitch' ? 'Working…' : 'Work out the joins'}
             </button>
           )}
-          {anyText && (
+          {(anyText || builtCount > 0) && (
             <button className="btn btn-primary px-3 py-1.5 text-sm" disabled={!!busy || running} onClick={() => setShowBuild(true)}>
               Build chapters →
             </button>
@@ -362,11 +842,7 @@ export default function PagesPage() {
         </div>
       </div>
 
-      {uploading && (
-        <div className="mb-4 rounded-card px-3 py-2 text-sm pill-queued">
-          Uploading {uploading.done} of {uploading.total}…
-        </div>
-      )}
+      {banners}
 
       {rail == null && railError ? (
         // Without this the screen sat on a skeleton forever while an error dialog
@@ -384,319 +860,78 @@ export default function PagesPage() {
         </div>
       ) : rail == null ? (
         <SkeletonRows rows={8} />
-      ) : pages.length === 0 ? (
-        <div
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={onDrop}
-          className={`rounded-card border border-dashed p-10 text-center ${dragOver ? 'border-line-strong' : 'border-line'}`}
-        >
-          <p className="text-sm text-muted">Drop page photos here, or</p>
-          <button className="btn btn-primary mt-3 px-4 py-2 text-sm" onClick={() => fileRef.current?.click()}>
-            Choose images
-          </button>
-          <p className="mt-4 text-xs text-hint">
-            JPEG, PNG or WebP. Photos of print pages, screenshots and scans all work.
-            <br />
-            iPhone photos need Settings → Camera → Formats → Most Compatible.
-          </p>
-        </div>
       ) : (
-        <div
-          className="grid gap-4 lg:grid-cols-[15rem_minmax(0,1fr)_22rem]"
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={onDrop}
-        >
-          <PageRail
-            pid={pid} pages={pages} selectedId={selectedId} onSelect={setSelectedId}
-            onSetJoin={setJoin} dragId={dragId} onDropOn={dropOn}
-          />
-
-          <PageViewer
-            pid={pid} page={current} zoom={zoom} setZoom={setZoom}
-            index={selectedIndex} total={pages.length} onStep={step}
-          />
-
-          <PageEditor
-            page={current} draft={draft} onDraft={onDraft} onPersist={persist}
-            busy={busy} running={running}
-            onReread={rereadOne} onVerify={verifyOne} onDelete={removeSelected}
-            onAcceptAllGood={acceptAllGood}
-          />
-        </div>
+        <ChapterBoxes
+          pid={pid} boxes={boxes} chapters={chapters} expanded={expanded}
+          busy={busy} running={running} uploadingInto={uploadingInto}
+          onToggle={(id, open) => setExpanded((e) => ({ ...e, [id]: open }))}
+          onOpenPhoto={openPhoto} onAddPhotos={pickPhotos} onDropFiles={enqueueUpload}
+          onMove={moveTo} onNewBoxFrom={newBoxFrom} onAddBox={addBox}
+          onMoveBox={moveBox} onRenameBox={renameBox} onDeleteBox={deleteBox}
+          onReadBox={readBox} onSetSeam={setSeam}
+          onOpenChapter={(index) => navigate(`/novel/${pid}/chapter/${index}`)}
+        />
       )}
 
       {showBuild && (
-        <BuildDialog
-          pid={pid} counts={counts} build={rail?.build}
-          onClose={() => setShowBuild(false)}
-          onBuilt={(res) => {
-            setShowBuild(false)
-            setProjectMeta?.(res.project || {})
-            reload?.(true)
-            loadRail()
-            toast(`${res.added} chapter${res.added === 1 ? '' : 's'} built`)
-          }}
-          onError={(e) => showError(e, { context: 'building the chapters' })}
+        <BuildChaptersDialog
+          pid={pid} boxes={boxes} chapters={chapters} whenWritten={whenWritten}
+          onClose={closeBuild} onBuilt={afterBuild} showError={showError}
         />
       )}
     </div>
   )
 }
 
-// ---- the rail: pages, and the seams between them ---------------------------
-
-function PageRail({ pid, pages, selectedId, onSelect, onSetJoin, dragId, onDropOn }) {
-  return (
-    <section className="card max-h-[70vh] overflow-y-auto p-2">
-      {pages.map((page, i) => (
-        <div key={page.id}>
-          {i > 0 && <JoinChip page={page} onSet={(kind) => onSetJoin(page.id, kind)} />}
-          <button
-            draggable
-            onDragStart={() => { dragId.current = page.id }}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => { e.stopPropagation(); onDropOn(page.id) }}
-            onClick={() => onSelect(page.id)}
-            className={`rowhover flex w-full items-center gap-2 rounded-card p-2 text-left ${selectedId === page.id ? 'sunken' : ''}`}
-          >
-            <img
-              src={api.pageImageUrl(pid, page.id)} alt="" loading="lazy" decoding="async"
-              className="h-12 w-9 shrink-0 rounded object-cover"
-              style={{ background: 'var(--b-muted-bg)' }}
-            />
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm">{page.name || `Page ${page.seq}`}</span>
-              <span className="mt-0.5 block"><PageBadge status={page.status} /></span>
-            </span>
-          </button>
-        </div>
-      ))}
-    </section>
-  )
-}
-
-function JoinChip({ page, onSet }) {
-  const kind = page.join_prev || 'paragraph'
-  const chip = JOIN_CHIP[kind] || JOIN_CHIP.paragraph
-  const next = JOIN_ORDER[(JOIN_ORDER.indexOf(kind) + 1) % JOIN_ORDER.length]
-  return (
-    <div className="flex items-center gap-1 px-2 py-1">
-      <span className="h-px flex-1" style={{ background: 'var(--border)' }} />
-      <button
-        onClick={() => onSet(next)}
-        title={`${chip.hint}${page.join_reason ? `\n\n(${page.join_reason})` : ''}\n\nClick to change.`}
-        className={`pill ${chip.cls} !px-1.5 !py-0 text-[11px]`}
-      >
-        {chip.label}
-      </button>
-      <span className="h-px flex-1" style={{ background: 'var(--border)' }} />
-    </div>
-  )
-}
-
-// ---- the photo -------------------------------------------------------------
-
-function PageViewer({ pid, page, zoom, setZoom, index, total, onStep }) {
-  if (!page) return <section className="card p-5 text-sm text-hint">Pick a page.</section>
-  return (
-    <section className="card flex flex-col overflow-hidden">
-      <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
-        <div className="flex items-center gap-1">
-          <button className="btn btn-quiet px-2 py-1 text-sm" disabled={index <= 0} onClick={() => onStep(-1)}>←</button>
-          <span className="text-xs text-hint">{index + 1} / {total}</span>
-          <button className="btn btn-quiet px-2 py-1 text-sm" disabled={index >= total - 1} onClick={() => onStep(1)}>→</button>
-        </div>
-        <div className="flex items-center gap-1">
-          <button className="btn btn-quiet px-2 py-1 text-sm" onClick={() => setZoom((z) => Math.max(0.25, z - 0.25))}>−</button>
-          <button className="btn btn-quiet px-2 py-1 text-xs" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
-          <button className="btn btn-quiet px-2 py-1 text-sm" onClick={() => setZoom((z) => Math.min(5, z + 0.25))}>+</button>
-        </div>
-      </div>
-      <div className="max-h-[65vh] overflow-auto p-3" style={{ background: 'var(--b-muted-bg)' }}>
-        <img
-          src={api.pageImageUrl(pid, page.id)} alt={page.name || `Page ${page.seq}`}
-          className="mx-auto block origin-top"
-          style={{ transform: `scale(${zoom})`, maxWidth: '100%' }}
-        />
-      </div>
-    </section>
-  )
-}
-
-// ---- the text read out of it -----------------------------------------------
-
-function PageEditor({ page, draft, onDraft, onPersist, busy, running,
-                      onReread, onVerify, onDelete, onAcceptAllGood }) {
-  if (!page) return <section className="card p-5 text-sm text-hint">Nothing selected.</section>
-
-  const issues = page.verify?.issues || []
-  const lowKorean = (page.text || '').trim() && (page.hangul_fraction ?? 1) < MIN_HANGUL
-
-  function applyIssue(issue) {
-    if (!issue.where || !draft.includes(issue.where)) return
-    onDraft(draft.replace(issue.where, issue.suggest))
+// What the upload queue is doing, for this novel: the drop going in now, the ones
+// waiting behind it, and a drop that stopped — which says exactly where.
+function UploadStatus({ jobs, boxes, onRetry, onCancel, onDetails }) {
+  if (!jobs.length) return null
+  const stopped = jobs.find((job) => job.stopped)
+  const going = jobs.find((job) => !job.stopped)
+  const waiting = jobs.filter((job) => job !== stopped && job !== going)
+  const dest = (job) => {
+    const box = job.batch && boxes.find((b) => b.id === job.batch)
+    return box ? boxName(box) : job.batch ? 'its chapter' : 'a new chapter'
   }
-
   return (
-    <section className="card flex max-h-[70vh] flex-col overflow-y-auto p-4">
-      <div className="mb-2 flex flex-wrap items-center gap-2">
-        <PageBadge status={page.status} />
-        {page.confidence && (
-          <span className={`pill ${CONFIDENCE_CLS[page.confidence] || 'pill-muted'}`}>
-            {page.confidence} confidence
-          </span>
-        )}
-      </div>
-
-      {page.notes?.length > 0 && (
-        <ul className="mb-2 space-y-1 text-xs text-hint">
-          {page.notes.map((n, i) => <li key={i}>· {n}</li>)}
-        </ul>
-      )}
-
-      {issues.length > 0 && (
-        <div className="mb-3 space-y-2">
-          {issues.map((issue, i) => (
-            <div key={i} className="rounded-card border border-line p-2 text-xs">
-              <div className="mb-1 font-medium">{issue.kind}</div>
-              {issue.page_says && <div className="text-muted">The photo shows: {issue.page_says}</div>}
-              <button
-                className="btn btn-quiet mt-1 px-2 py-0.5 text-xs"
-                disabled={!issue.where || !draft.includes(issue.where)}
-                title={issue.where ? 'Replace that text' : "Couldn't locate this exactly — fix it by hand"}
-                onClick={() => applyIssue(issue)}
-              >
-                Apply
+    <div className="mb-3 space-y-2">
+      {stopped && (
+        <div className="rounded-card px-3 py-2 text-sm pill-review">
+          <p>{stoppedMessage(stopped, boxes)}</p>
+          {jobs.length > 1 && (
+            <p className="mt-1 text-xs">
+              {plural(jobs.length - 1, 'more drop')} {jobs.length === 2 ? 'is' : 'are'} waiting behind it.
+            </p>
+          )}
+          <div className="mt-2 flex flex-wrap gap-2">
+            {stopped.stopped.error?.status === 404 ? (
+              <button className="btn btn-primary px-3 py-1 text-xs" onClick={() => onRetry(stopped.id, { asNewChapter: true })}>
+                Add the rest as a new chapter
               </button>
-            </div>
-          ))}
+            ) : (
+              <button className="btn btn-primary px-3 py-1 text-xs" onClick={() => onRetry(stopped.id)}>
+                Try the rest again
+              </button>
+            )}
+            <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => onRetry(stopped.id, { skip: true })}>
+              Skip this photo
+            </button>
+            <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => onCancel(stopped.id)}>
+              Cancel the rest
+            </button>
+            <button className="btn btn-quiet px-3 py-1 text-xs" onClick={() => onDetails(stopped.stopped.error)}>
+              Details
+            </button>
+          </div>
         </div>
       )}
-
-      <textarea
-        className="input font-korean min-h-[16rem] flex-1 resize-y text-sm"
-        value={draft}
-        placeholder="Nothing read from this page yet."
-        onChange={(e) => onDraft(e.target.value)}
-      />
-
-      <div className="mt-1 flex items-center justify-between text-xs text-hint">
-        <span>{(draft || '').length} characters</span>
-        <span>{Math.round((page.hangul_fraction || 0) * 100)}% Korean</span>
-      </div>
-
-      {lowKorean && (
-        <div className="mt-2 rounded-card px-2 py-1.5 text-xs pill-review">
-          Very little Korean on this page. If it stays this way, the chapter built from
-          it will be treated as already-English and skipped by the translator.
+      {going && !stopped && (
+        <div className="rounded-card px-3 py-2 text-sm pill-queued">
+          Adding {Math.min(going.next + 1, going.files.length)} of {going.files.length} to {dest(going)}…
+          {waiting.length > 0 && ` Then ${plural(waiting.length, 'more drop')}.`}
         </div>
       )}
-
-      <div className="mt-3 flex flex-wrap gap-2">
-        <button className="btn btn-quiet px-2 py-1 text-xs" disabled={!!busy || running} onClick={onReread}>
-          Re-read from scratch
-        </button>
-        <button className="btn btn-quiet px-2 py-1 text-xs" disabled={!!busy || running || !draft.trim()} onClick={onVerify}>
-          Check against the photo
-        </button>
-        <button className="btn btn-quiet px-2 py-1 text-xs" onClick={() => onPersist({ status: 'ok' })}>
-          Looks good
-        </button>
-        <button className="btn btn-quiet px-2 py-1 text-xs" onClick={() => onPersist({ status: 'skipped' })}>
-          Skip (cover / blank)
-        </button>
-        <button className="btn btn-quiet px-2 py-1 text-xs" onClick={onAcceptAllGood}>
-          Accept all confident
-        </button>
-        <button className="btn btn-ghost px-2 py-1 text-xs" onClick={onDelete}>Delete</button>
-      </div>
-
-      <label className="mt-3 block text-xs text-hint">
-        Note for a re-read (optional)
-        {/* key={page.id} remounts the input when the reader picks another page.
-            defaultValue is read once on mount, and PageEditor is NOT remounted by a
-            prop change — so without this the box still held page A's note, and
-            clicking into the textarea blurred it straight onto page B. */}
-        <input
-          key={page.id}
-          className="input mt-1 w-full text-xs"
-          placeholder="e.g. the bottom two lines are cut off"
-          defaultValue={page.hint || ''}
-          onBlur={(e) => e.target.value !== (page.hint || '') && onPersist({ hint: e.target.value }, { quiet: true })}
-        />
-      </label>
-    </section>
-  )
-}
-
-// ---- turning pages into chapters -------------------------------------------
-
-function BuildDialog({ pid, counts, build, onClose, onBuilt, onError }) {
-  const [mode, setMode] = useState('batch')
-  const [include, setInclude] = useState('approved')
-  const [append, setAppend] = useState(true)
-  const [working, setWorking] = useState(false)
-
-  async function go(force = false) {
-    setWorking(true)
-    try {
-      onBuilt(await api.buildChapters(pid, { mode, include, append, force }))
-    } catch (e) {
-      // A rebuild that would renumber already-translated chapters is refused until
-      // it's confirmed — offer that rather than just reporting the wall.
-      if (e.status === 400 && /already translated|renumber/i.test(e.message || '') && !force) {
-        if (window.confirm(`${e.message}\n\nRebuild anyway?`)) return go(true)
-      } else onError(e)
-    } finally { setWorking(false) }
-  }
-
-  return (
-    <Modal onClose={onClose}>
-      <div className="p-5">
-        <h2 className="font-reading text-lg font-medium">Build chapters</h2>
-        <p className="mt-1 text-sm text-hint">
-          Joins the pages into chapters and hands them to the translator. Nothing about
-          the photos changes, so you can always build again.
-        </p>
-
-        <label className="mt-4 block text-sm">
-          How the pages divide into chapters
-          <select className="input mt-1 w-full" value={mode} onChange={(e) => setMode(e.target.value)}>
-            <option value="batch">Each batch of photos I added is one chapter</option>
-            <option value="heading">One pile — split where a chapter heading appears</option>
-            <option value="separator">One pile — split on a --- separator line</option>
-            <option value="single">All of it is one chapter</option>
-          </select>
-        </label>
-
-        <label className="mt-3 block text-sm">
-          Which pages to use
-          <select className="input mt-1 w-full" value={include} onChange={(e) => setInclude(e.target.value)}>
-            <option value="approved">Only pages I've accepted or edited ({(counts.ok || 0) + (counts.edited || 0)})</option>
-            <option value="all">Every page that has text on it</option>
-          </select>
-        </label>
-
-        <label className="mt-3 flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={append} onChange={(e) => setAppend(e.target.checked)} />
-          Add these as new chapters, keeping the ones already built
-        </label>
-        {build && !append && (
-          <p className="mt-1 text-xs pill-review rounded-card px-2 py-1">
-            Rebuilding renumbers every chapter. Any you've already translated would be
-            redone.
-          </p>
-        )}
-
-        <div className="mt-5 flex justify-end gap-2">
-          <button className="btn btn-quiet px-3 py-1.5 text-sm" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary px-3 py-1.5 text-sm" disabled={working} onClick={() => go(false)}>
-            {working ? 'Building…' : 'Build'}
-          </button>
-        </div>
-      </div>
-    </Modal>
+    </div>
   )
 }
