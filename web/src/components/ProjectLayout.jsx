@@ -1,4 +1,4 @@
-import { Suspense, useEffect, useRef, useState } from 'react'
+import { Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import { api } from '../api'
 import { errorTitle } from '../errors'
@@ -57,6 +57,18 @@ export default function ProjectLayout() {
   const resumeJobRef = useRef(null)
   const submittingRef = useRef(false)  // guards against double-submit races
   const dataRef = useRef(null)         // live `data` for long-lived stream closures
+  // The novel on screen now, for work a sub-page started earlier that finishes later (a
+  // build whose dialog was closed): its reload and setProjectMeta are this layout's, and
+  // the layout stays mounted when :pid changes, so it asks before touching anything. None
+  // once this layout is gone — the reader left for the library and opened another novel in
+  // a new one — or this layout's answer would still be the novel it last showed. Set as
+  // the new novel goes on screen, not a frame after: a build answering in that frame took
+  // the new novel for its own.
+  const pidRef = useRef(pid)
+  useLayoutEffect(() => {
+    pidRef.current = pid
+    return () => { pidRef.current = null }
+  }, [pid])
   // The SSE handler is attached once at stream start, so anything it calls has to be
   // reached through a ref rather than captured from this render's scope.
   const showError = useError()
@@ -423,6 +435,7 @@ export default function ProjectLayout() {
   const ctx = {
     pid, status, data, loading, error, reload: load, loadPending, pendingCount, glossary,
     setRowStatus, setProjectMeta, showError,
+    isShowing: (id) => pidRef.current === id,
     chapters, offline, counts, koreanTotal, done, remaining,
     running, submitting, log, live, totals: totals || data?.totals, paused, waiting,
     queue, chapterQueue, totalQueued, enqueue, cancelQueue, stopAll, resumeJob,

@@ -424,8 +424,9 @@ export default function ChapterReader({ pid, index, chapters, glossary = [], onC
   const fontFam = FONT[prefs.font] || FONT.serif
   // Glossary-name highlighting for the rendered translation (toggleable).
   const glossLookup = useMemo(() => buildGlossLookup(glossary), [glossary])
-  // A scanned chapter knows which photos it was built from (batch builds only — a
-  // whole-novel split can't attribute pages to a chapter, so it sends none).
+  // A scanned chapter knows which photos it was built from: its chapter box records them
+  // as it builds. Chapters built from one pile before chapter boxes existed can't say
+  // which photo went where, so they send none.
   const hasPhotos = (data?.page_ids || []).length > 0
   const sourceParas = useMemo(
     () => (data?.source || '').split(/\n{2,}/).map((p) => p.trim()).filter(Boolean),

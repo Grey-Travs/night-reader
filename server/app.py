@@ -1349,9 +1349,10 @@ def create_images_project(body: CreateImagesProject) -> dict:
 
 
 # ----------------------------------------------------------------------------- scanned pages
-# NOTE ON ROUTE ORDER: every literal path below (/pages/reorder, /pages/build, ...)
-# MUST stay declared before /pages/{page_id}, or FastAPI captures "reorder" as a
-# page id and the action silently 404s.
+# NOTE ON ROUTE ORDER: every literal path below (/pages/move, /pages/batches,
+# /pages/build, ...) MUST stay declared before /pages/{page_id}, or FastAPI captures
+# "move" as a page id and the action silently 404s. For the same reason
+# /pages/batches/order must come before /pages/batches/{batch_id}.
 
 def require_images_project(pid: str) -> dict:
     project = require_project(pid)
@@ -1368,15 +1369,66 @@ def _page_by_id(pid: str, page_id: str) -> tuple[dict, dict]:
     return doc, page
 
 
+@contextmanager
+def _box_errors():
+    """Answer a refused box change with the status and message it was refused with.
+
+    Wrap it OUTSIDE mutate_pages — ``with _box_errors(), pages_mod.mutate_pages(pid)``
+    — so the refusal leaves mutate_pages as an exception, which skips the save: a
+    half-applied change is never written.
+    """
+    try:
+        yield
+    except pages_mod.BoxError as exc:
+        raise HTTPException(exc.status, exc.message) from None
+
+
+def _require_box_id(batch_id: str) -> None:
+    """A box id from the URL is only ever a lookup key; one that can't be a box id is
+    refused before the manifest is even opened."""
+    if not pages_mod.is_box_id(batch_id):
+        raise HTTPException(404, pages_mod.BOX_GONE)
+
+
+def _rail(doc: dict) -> dict:
+    """What a change to the pages answers with: the rail exactly as it was saved.
+
+    Taken from the doc after mutate_pages has exited, so ``rev`` is the one this change
+    was saved under. The client keeps whichever answer is newest, which is what stops
+    a slow answer to an earlier change putting the old order back on screen.
+    """
+    return {"rev": doc["rev"], "pages": pages_mod.summary(doc)}
+
+
+def _box_answer(doc: dict, box_id: str) -> dict:
+    rail = _rail(doc)
+    return {"batch": next(row for row in rail["pages"]["batches"] if row["id"] == box_id),
+            **rail}
+
+
+def _unlink_page_files(pid: str, removed: list[dict]) -> None:
+    folder = pages_mod.pages_dir(pid)
+    for page in removed:
+        try:
+            (folder / str(page.get("file") or "")).unlink(missing_ok=True)
+        except OSError:
+            pass  # the manifest entry is gone; a stray file is harmless
+
+
 @app.post("/api/projects/{pid}/pages")
 async def upload_page(pid: str, request: Request, batch: str = "",
                       label: str = "", name: str = "") -> dict:
-    """Add one page image, sent as the raw request body.
+    """Add one page image, sent as the raw request body, at the end of chapter box
+    ``batch`` — or of a new box at the end of the novel when ``batch`` is empty.
 
     One image per request rather than a multipart batch: it keeps the app free of the
     python-multipart dependency (the same reasoning as /api/import), gives per-file
     progress for free, and means one unreadable photo fails on its own instead of
     taking a sixty-file drop down with it.
+
+    A box this novel doesn't have is refused, never quietly replaced by a new one: the
+    client sends the rest of a drop to the box it started in, so a box deleted
+    mid-drop used to split that one chapter into two.
     """
     require_images_project(pid)
 
@@ -1401,31 +1453,35 @@ async def upload_page(pid: str, request: Request, batch: str = "",
         raise HTTPException(400, pages_mod.unsupported_reason(data[:32]))
     digest = pages_mod.sha256_of(data)
 
-    with pages_mod.mutate_pages(pid) as doc:
+    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
         existing = pages_mod.find_by_hash(doc, digest)
-        if existing is not None:
-            # Re-dropping the same folder is a no-op, not a doubled novel.
-            return {"page": existing, "duplicate": True,
-                    "total": len(doc.get("pages", []))}
-        if len(doc.get("pages", [])) >= pages_mod.MAX_PAGES_PER_PROJECT:
-            raise HTTPException(
-                400, f"This novel already has {pages_mod.MAX_PAGES_PER_PROJECT} pages.")
+        if existing is None:
+            if len(doc.get("pages", [])) >= pages_mod.MAX_PAGES_PER_PROJECT:
+                raise HTTPException(
+                    400, f"This novel already has {pages_mod.MAX_PAGES_PER_PROJECT} pages.")
+            page = pages_mod.add_page(
+                doc, ext=ext, data_len=len(data), digest=digest, name=name,
+                batch=batch or pages_mod.create_box(doc, label)["id"])
+            target = pages_mod.pages_dir(pid) / page["file"]
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            except OSError as exc:
+                # Raising skips the save, so the manifest never names a file that
+                # isn't there.
+                raise HTTPException(500, f"Couldn't save that image: {exc}")
 
-        known = {b.get("id") for b in doc.get("batches", [])}
-        batch_id = batch if (batch and batch in known) else pages_mod.new_batch(doc, label)
-
-        page = pages_mod.add_page(doc, ext=ext, data_len=len(data), digest=digest,
-                                  batch=batch_id, name=name)
-        target = pages_mod.pages_dir(pid) / page["file"]
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-        except OSError as exc:
-            # Never leave a manifest entry pointing at a file that isn't there.
-            doc["pages"].remove(page)
-            raise HTTPException(500, f"Couldn't save that image: {exc}")
-        return {"page": dict(page), "duplicate": False, "batch": batch_id,
-                "total": len(doc["pages"])}
+    numbers = pages_mod.box_numbers(doc)
+    rail = {"total": len(doc["pages"]), **_rail(doc)}
+    if existing is not None:
+        # Re-dropping the same folder is a no-op, not a doubled novel. Where the photo
+        # already is goes under names of its own, never "batch": a client that takes
+        # the drop's box from each answer would send the rest of the drop there.
+        return {"page": dict(existing), "duplicate": True,
+                "existing_batch": existing["batch"],
+                "existing_number": numbers.get(existing["batch"]), **rail}
+    return {"page": dict(page), "duplicate": False, "batch": page["batch"],
+            "number": numbers[page["batch"]], **rail}
 
 
 @app.get("/api/projects/{pid}/pages")
@@ -1434,19 +1490,6 @@ def list_pages(pid: str) -> dict:
     would be several megabytes on every tab switch."""
     require_project(pid)
     return pages_mod.summary(pages_mod.load_pages(pid))
-
-
-class ReorderPages(BaseModel):
-    ids: list[str]
-
-
-@app.post("/api/projects/{pid}/pages/reorder")
-def reorder_pages(pid: str, body: ReorderPages) -> dict:
-    require_images_project(pid)
-    with pages_mod.mutate_pages(pid) as doc:
-        if not pages_mod.reorder(doc, body.ids):
-            raise HTTPException(400, "That page order doesn't match this novel's pages.")
-    return {"ok": True}
 
 
 class DeletePages(BaseModel):
@@ -1458,13 +1501,91 @@ def delete_pages(pid: str, body: DeletePages) -> dict:
     require_images_project(pid)
     with pages_mod.mutate_pages(pid) as doc:
         removed = pages_mod.delete_pages(doc, body.ids)
-    folder = pages_mod.pages_dir(pid)
-    for page in removed:
-        try:
-            (folder / str(page.get("file") or "")).unlink(missing_ok=True)
-        except OSError:
-            pass  # the manifest entry is gone; a stray file is harmless
-    return {"ok": True, "removed": len(removed)}
+    _unlink_page_files(pid, removed)
+    return {"ok": True, "removed": len(removed), **_rail(doc)}
+
+
+class MovePages(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: list[str]
+    batch: str
+    before: str | None = None
+
+
+@app.post("/api/projects/{pid}/pages/move")
+def move_pages(pid: str, body: MovePages) -> dict:
+    """Move photos, as one block in the order given, into chapter box ``batch`` just
+    before the photo ``before`` — or at the end of the box. Every seam whose neighbour
+    changes is reset; a photo put back where it already was changes nothing."""
+    require_images_project(pid)
+    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
+        changed = pages_mod.move_pages(doc, body.ids, body.batch, body.before)
+    return {"ok": True, "changed": changed, **_rail(doc)}
+
+
+class NewBox(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = ""
+    after: str | None = None
+    ids: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/projects/{pid}/pages/batches")
+def create_page_batch(pid: str, body: NewBox) -> dict:
+    """Add a chapter box — at the end, or straight after the box ``after`` — and move
+    the photos ``ids`` into it, all in one step (see pages.create_box)."""
+    require_images_project(pid)
+    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
+        box = pages_mod.create_box(doc, body.label, after=body.after, ids=body.ids)
+    return _box_answer(doc, box["id"])
+
+
+class BoxOrder(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: list[str]
+
+
+@app.post("/api/projects/{pid}/pages/batches/order")
+def order_page_batches(pid: str, body: BoxOrder) -> dict:
+    """Put the chapter boxes in a new order. ``ids`` names every box; the built ones at
+    the front keep their place."""
+    require_images_project(pid)
+    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
+        pages_mod.reorder_boxes(doc, body.ids)
+    return {"ok": True, **_rail(doc)}
+
+
+class BoxRename(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str
+
+
+@app.post("/api/projects/{pid}/pages/batches/{batch_id}")
+def rename_page_batch(pid: str, batch_id: str, body: BoxRename) -> dict:
+    """Retitle a chapter box. The title becomes the chapter's title when it builds."""
+    require_images_project(pid)
+    _require_box_id(batch_id)
+    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
+        pages_mod.rename_box(doc, batch_id, body.label)
+    return _box_answer(doc, batch_id)
+
+
+class DeleteBox(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # The photos the reader was shown when they confirmed (see pages.delete_box).
+    expect_page_ids: list[str] | None = None
+
+
+@app.post("/api/projects/{pid}/pages/batches/{batch_id}/delete")
+def delete_page_batch(pid: str, batch_id: str, body: DeleteBox | None = None) -> dict:
+    """Delete an unbuilt chapter box and its photos."""
+    require_images_project(pid)
+    _require_box_id(batch_id)
+    expect = body.expect_page_ids if body is not None else None
+    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
+        removed = pages_mod.delete_box(doc, batch_id, expect)
+    _unlink_page_files(pid, removed)
+    return {"ok": True, "removed": len(removed), **_rail(doc)}
 
 
 class PageWork(BaseModel):
@@ -1605,28 +1726,43 @@ class StitchRequest(BaseModel):
 
 @app.post("/api/projects/{pid}/pages/stitch")
 async def stitch_pages(pid: str, body: StitchRequest) -> dict:
-    """Work out how each page joins to the one before it.
+    """Work out how each page joins to the one before it in its chapter box.
 
     Cheapest first: deterministic rules settle most seams for free, and only the
     genuinely ambiguous ones are batched into a single text-only model call. A seam
-    the reader has decided by hand is never revisited.
+    the reader has decided by hand is never revisited, and neither is one the model
+    has already decided — re-asking those meant every press spent its call on the same
+    first few dozen seams, and the ones after them never reached the model at all.
+
+    Only pages inside one box are paired. A box's first photo starts a chapter, so it
+    joins nothing, and a legacy box, built from one pile, is left as it was built.
+
+    A seam carried over from a version-1 build ("migrated") is left alone too. It is
+    how that chapter's text was built and translated; re-deciding it would rewrite an
+    untouched chapter on the next build and ask for it to be translated again.
     """
     project = require_images_project(pid)
     cfg = pj.project_config(load_global_config(), project)
     doc = pages_mod.load_pages(pid)
-    pages = [p for p in doc.get("pages", [])
-             if p.get("status") != pages_mod.STATUS_SKIPPED]
+    by_id = {p["id"]: p for p in doc.get("pages", [])}
+    texts = {page_id: page.get("text") or "" for page_id, page in by_id.items()}
+    locked = {b["id"] for b in doc.get("batches", []) if b.get("legacy")}
+    seams = pages_mod.seam_neighbours(doc)
 
     decided: dict[str, dict] = {}
     unsure: list[tuple[str, str, str]] = []
-    for prev, cur in zip(pages, pages[1:]):
-        if cur.get("join_prev_source") == "user":
-            continue  # the reader's own decision stands
-        join = propose_join(prev.get("text") or "", cur.get("text") or "", prev, cur)
-        decided[cur["id"]] = {"join_prev": join.kind, "join_glue": join.glue,
-                              "join_prev_source": "auto", "join_reason": join.reason}
+    for page_id, prev_id in seams.items():
+        page = by_id[page_id]
+        if (prev_id is None or page.get("batch") in locked
+                or page.get("join_prev_source") in ("user", "model", "migrated")):
+            continue
+        if not (pages_mod.page_has_text(by_id[prev_id]) and pages_mod.page_has_text(page)):
+            continue  # nothing to read on one side; the seam waits for its text
+        join = propose_join(texts[prev_id], texts[page_id], by_id[prev_id], page)
+        decided[page_id] = {"join_prev": join.kind, "join_glue": join.glue,
+                            "join_prev_source": "auto", "join_reason": join.reason}
         if join.needs_model:
-            unsure.append((cur["id"], prev.get("text") or "", cur.get("text") or ""))
+            unsure.append((page_id, texts[prev_id], texts[page_id]))
 
     usage, cost, asked = {}, 0.0, 0
     if body.use_model and unsure:
@@ -1641,155 +1777,262 @@ async def stitch_pages(pid: str, body: StitchRequest) -> dict:
                                 "join_prev_source": "model",
                                 "join_reason": decision.note or "decided by reading both pages"}
 
+    # The model call takes a while, and the reader can move, retype or decide pages
+    # meanwhile. A decision only lands on a seam that is still the one it was made for:
+    # the same two pages, the same two texts, and not since decided by hand. Written
+    # anyway, it would describe a page break that no longer exists.
+    written: list[dict] = []
     with pages_mod.mutate_pages(pid) as live:
+        now = pages_mod.seam_neighbours(live)
+        live_by_id = {p["id"]: p for p in live.get("pages", [])}
         for page_id, fields in decided.items():
-            rec = pages_mod.find_page(live, page_id)
-            if rec is not None:
-                rec.update(fields)
+            rec, prev_id = live_by_id.get(page_id), seams[page_id]
+            if (rec is None or now.get(page_id) != prev_id
+                    or rec.get("join_prev_source") == "user"
+                    or (rec.get("text") or "") != texts[page_id]
+                    or (live_by_id[prev_id].get("text") or "") != texts[prev_id]):
+                continue
+            rec.update(fields)
+            rec["join_prev_id"] = prev_id
+            written.append(fields)
         totals = live.setdefault("totals", {})
         totals["cost_usd"] = round(float(totals.get("cost_usd") or 0.0) + cost, 6)
 
-    gaps = sum(1 for f in decided.values() if f["join_prev"] == "gap")
-    return {"ok": True, "seams": len(decided), "asked_model": asked,
-            "gaps": gaps, "cost_usd": cost, "usage": usage,
-            "pages": pages_mod.summary(pages_mod.load_pages(pid))}
+    gaps = sum(1 for f in written if f["join_prev"] == "gap")
+    return {"ok": True, "seams": len(written), "asked_model": asked,
+            "gaps": gaps, "remaining": len(unsure) - asked, "cost_usd": cost,
+            "usage": usage, "pages": pages_mod.summary(live)}
 
 
 class BuildChapters(BaseModel):
-    mode: str = "batch"           # batch | heading | separator | single
-    separator: str = "---"
+    model_config = ConfigDict(extra="forbid")
     include: str = "approved"     # approved | all
     append: bool = True
     force: bool = False
+    # A dry run: the answer a build would give, with nothing written.
+    preview: bool = False
+    # Each chapter box is one chapter, so there is nothing to choose. Still accepted
+    # as "batch"/"boxes", the only ones that meant that; a pile mode is refused.
+    mode: str | None = None
 
 
-def _refresh_built_chapters(existing: list[Chapter], doc: dict, page_map: dict,
-                            *, include: str) -> list[int]:
-    """Rebuild already-built chapters whose pages have been corrected since.
+# A chapter whose English exists, whatever its checks said: what the Chapters tab and
+# the Build dialog show as translated.
+_HAS_ENGLISH = (state_mod.STATUS_TRANSLATED, state_mod.STATUS_VALIDATED,
+                state_mod.STATUS_NEEDS_REVIEW)
 
-    ``existing`` is mutated in place; returns the indices that actually changed.
 
-    Only a batch build attributes pages to a specific chapter. A whole-novel split
-    records ``"*"`` because it genuinely cannot say which chapter a page landed in, so
-    those are left alone rather than guessed at.
+def _box_as_shown(waiting: dict, shown: dict[str, int | None]) -> str:
+    """A waiting box named as the Pages tab names it now, and, when starting over will
+    renumber it, as what it will become. Named only by its new number, it pointed at
+    whichever box shows that number now — a built chapter with nothing wrong with it."""
+    now, then = shown.get(waiting["batch"]), waiting["number"]
+    if now == then:
+        return f"Chapter {then}"
+    if now is None:
+        return f"The chapters built before chapter boxes (would become chapter {then})"
+    return f"Chapter {now} (would become chapter {then})"
+
+
+def _english_filed(cfg: Config, state: State):
+    """Whether any English is filed under a chapter number: by its status, or by a
+    translation on disk whatever the status says now. A re-translate that was stopped or
+    that failed leaves the old English in place, marked pending or failed, and the reader
+    still shows it beside whatever Korean that number holds."""
+    on_disk: set[int] = set()
+    for folder in (cfg.paths.output_dir, cfg.paths.audit_dir):
+        try:
+            names = [f.stem.split("-", 1)[-1] for f in folder.glob("chapter-*.md")]
+        except OSError:
+            continue
+        on_disk |= {int(tail) for tail in names if tail.isdigit()}
+    return lambda index: (index in on_disk
+                          or (state.get(index) or {}).get("status") in _HAS_ENGLISH)
+
+
+def _plan_build(pid: str, cfg: Config, doc: dict, body: BuildChapters
+                ) -> tuple[ocr_build.BoxBuild, list[str]]:
+    """Work out what a build does, and what it has to say about it.
+
+    One path for a real build and a preview, so the dialog shows exactly what pressing
+    Build will do. A real build raises where it has to refuse; a preview reports the
+    same thing and carries on, since showing why is its whole job.
     """
-    usable = {p.get("id") for p in ocr_build.usable_pages(doc, include=include)}
-    by_id = {p.get("id"): p for p in doc.get("pages", [])}
-    by_index = {c.index: c for c in existing}
-    changed: list[int] = []
-    for key, ids in (page_map or {}).items():
-        if not str(key).isdigit():
-            continue                      # "*" — a whole-novel split
-        target = by_index.get(int(key))
-        if target is None:
-            continue
-        run = [by_id[i] for i in ids if i in by_id and i in usable]
-        if not run:
-            # Every page behind this chapter has been deleted or un-approved. Emptying
-            # it here would lose its text without renumbering anything; dropping a
-            # chapter is what a full rebuild is for, so leave this one alone.
-            continue
-        text, _warnings = ocr_build.assemble_pages(run)
-        rebuilt = ocr_build.make_chapter(int(key), target.title, text)
-        if rebuilt is None or rebuilt.paragraphs == target.paragraphs:
-            continue
-        target.paragraphs = rebuilt.paragraphs
-        changed.append(int(key))
-    return sorted(changed)
+    existing = pj.load_text_chapters(pid)
+    recorded = (doc.get("build") or {}).get("chapters") or 0
+    # source.json is unreadable, or an earlier build stopped halfway. Adding to it now
+    # would put a chapter under the wrong number.
+    cannot_add = recorded != len(existing)
+    if body.append and cannot_add:
+        raise HTTPException(
+            409, f"The chapter list holds {len(existing)} chapter(s), but the chapter "
+                 f"boxes were last built into {recorded}. Use Start over to rebuild the "
+                 f"chapters from the boxes.")
+    state = State.load(cfg.paths.state_file)
+    has_english = _english_filed(cfg, state)
+    # Counted up to the chapters the boxes were built into as well. An unreadable
+    # source.json reads as no chapters, which is exactly when an append is refused and
+    # sends the reader to Start over — and counted from it alone, starting over then
+    # renumbered translated chapters without asking.
+    built = max(len(existing), pages_mod.chapter_count(doc))
+    # Taken before the build: starting over drops the empty boxes and numbers the rest
+    # again, so the number a box is about to get can be another box's on the Pages tab.
+    shown = pages_mod.box_numbers(doc)
+    was_chapter = {box["id"]: box.get("chapter") for box in doc["batches"]}
+
+    res = ocr_build.build_boxes(doc, existing, include=body.include, append=body.append)
+    warnings = list(res.warnings)
+
+    # Whether the English filed under chapter k was made from the Korean it holds now.
+    # Starting over adds every chapter again, and most keep their number and text, so
+    # their English is still their own.
+    def made_from(k: int) -> bool:
+        stored = (state.get(k) or {}).get("source_hash")
+        return (k <= len(res.chapters) and bool(stored)
+                and stored == res.chapters[k - 1].metrics.content_hash)
+
+    # The translated chapters a start over would leave beside other Korean: a number that
+    # now holds another chapter's text, or one no box builds any more. Any English counts,
+    # not only validated English: a chapter its check flagged, one not checked yet, or one
+    # whose re-translate was stopped was renumbered all the same. A chapter that keeps its
+    # number and its Korean isn't: counted, retiring an emptied last chapter warned of
+    # renumbering every chapter before it, and invited the reader to pay for them again.
+    finished = [] if body.append else [
+        i for i in range(1, built + 1) if has_english(i) and not made_from(i)]
+
+    if not body.append:
+        # Starting over with a box that isn't ready would stop there and quietly drop
+        # every chapter after it — a shorter novel, re-padded chapter files, and
+        # exports missing their ends.
+        not_ready = [w for w in res.waiting if w["blocked_by"] is None]
+        if not_ready and not body.preview:
+            raise HTTPException(
+                400, "Starting over rebuilds every chapter, so every box has to be ready "
+                     "first. " + " ".join(f"{_box_as_shown(w, shown)}: {w['reasons'][0]}"
+                                          for w in not_ready))
+        if finished and not body.force:
+            # Says what to press in the confirm it is shown in, which has nothing called
+            # "append". Never Build: starting over is often how a reader retires an
+            # emptied chapter, when Build has nothing to add and points back here, and
+            # the two messages sent them back and forth.
+            way_on = ("The chapter list no longer matches the boxes, so it can't be "
+                      "added to: Start over anyway is the way to rebuild it."
+                      if cannot_add else
+                      "Cancel to keep their numbers, or Start over anyway to redo them.")
+            refusal = (f"Rebuilding would renumber {len(finished)} chapter(s) you've "
+                       f"already translated. {way_on}")
+            if not body.preview:
+                raise HTTPException(400, refusal)
+            warnings.append(refusal)
+
+    if not body.preview and not (res.added or res.refreshed or res.updated):
+        if res.waiting:
+            first = res.waiting[0]
+            raise HTTPException(400, f"No chapter is ready to build yet. Chapter "
+                                     f"{first['number']}: {first['reasons'][0]}")
+        if not doc.get("pages"):
+            raise HTTPException(400, "There are no photos to build yet. Add each "
+                                     "chapter's photos first.")
+        raise HTTPException(400, "Every chapter is already up to date.")
+
+    # A chapter added again over English that isn't its own: from the same box, it is this
+    # chapter with its text changed since; from another box, a new chapter on a number
+    # whose English is another chapter's — Start over anyway leaves the translations of
+    # the chapters it moved or dropped where they were. Said nowhere, the new chapter's
+    # Korean sat beside another chapter's English.
+    box_of = {box["chapter"]: box["id"] for box in doc["batches"] if box.get("chapter")}
+    unmade = [k for k in res.added if has_english(k) and not made_from(k)]
+    same_box = [k for k in unmade if was_chapter.get(box_of.get(k)) == k]
+    new_here = [k for k in unmade if k not in same_box]
+
+    # Only a chapter that has English to go stale is worth a warning. Said of every
+    # refreshed chapter, it kept the dialog open after adding a photo to a chapter
+    # nobody had translated, to claim a translation that doesn't exist.
+    stale = [k for k in res.refreshed if has_english(k)] + same_box
+    if stale:
+        which = ", ".join(str(i) for i in stale)
+        warnings.append(
+            f"Chapter {which} updated from pages you corrected. Their English was "
+            f"translated from the old text, so re-translate them when you're ready."
+            if len(stale) == 1 else
+            f"Chapters {which} were updated from pages you corrected. Their English "
+            f"was translated from the old text, so re-translate them when you're ready."
+        )
+    for k in new_here:
+        warnings.append(
+            f"Chapter {k} is new, but the English of an earlier chapter {k} is still filed "
+            f"under its number. Translate chapter {k} before reading it.")
+    return res, warnings
+
+
+def _build_answer(res: ocr_build.BoxBuild, warnings: list[str], *, preview: bool) -> dict:
+    return {"ok": True, "preview": preview, "chapters": len(res.chapters),
+            "added": res.added, "refreshed": res.refreshed, "updated": res.updated,
+            "waiting": res.waiting, "warnings": warnings,
+            "unworked_seams": res.unworked_seams}
 
 
 @app.post("/api/projects/{pid}/pages/build")
 def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
-    """Turn the transcribed pages into chapters (source.json).
+    """Turn the chapter boxes into chapters (source.json): each box is one chapter, in
+    box order.
 
     After this the novel is ordinary: translate, validate, read and export all work
     unchanged. Appending is the default so photographing chapter 13 never renumbers
-    chapters 1-12 or orphans their finished translations.
+    chapters 1-12 or orphans their finished translations, and a built chapter whose
+    photos changed since is rebuilt in place.
     """
     project = require_images_project(pid)
-    cfg = pj.project_config(load_global_config(), project)
-    doc = pages_mod.load_pages(pid)
-
-    existing = pj.load_text_chapters(pid)
-    state = State.load(cfg.paths.state_file)
-    refreshed: list[int] = []
-    if body.append:
-        prev_build = doc.get("build") or {}
-        built_ids = set(prev_build.get("used_page_ids") or [])
-        # Corrections to pages that are ALREADY in a chapter have to reach source.json
-        # too. The filter below exists so a second build does not duplicate chapters,
-        # but it also meant an edit to a built page was simply dropped: fix an OCR
-        # mistake, press Build, and the answer was "No pages are ready to build" while
-        # the chapter kept the wrong Korean forever, with no way to correct it short of
-        # a full rebuild that renumbers and re-bills the novel.
-        refreshed = _refresh_built_chapters(
-            existing, doc, prev_build.get("page_map") or {}, include=body.include)
-        if built_ids:
-            doc = {**doc, "pages": [p for p in doc.get("pages", [])
-                                    if p.get("id") not in built_ids]}
-        start_index = len(existing) + 1
-    else:
-        finished = [i for i in range(1, len(existing) + 1)
-                    if (state.get(i) or {}).get("status") in state_mod.DONE_STATUSES]
-        if finished and not body.force:
-            raise HTTPException(
-                400, f"Rebuilding would renumber {len(finished)} chapter(s) you've "
-                     f"already translated. Add new pages as an append instead, or "
-                     f"confirm the rebuild to redo them.")
-        start_index = 1
-
-    try:
-        chapters, warnings, page_map = ocr_build.build_chapters(
-            doc, mode=body.mode, separator=body.separator,
-            include=body.include, start_index=start_index)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-
-    if not chapters and not refreshed:
+    if body.mode not in (None, "", "batch", "boxes"):
         raise HTTPException(
-            400, "No pages are ready to build. Read the pages first, then accept the "
-                 "ones that look right.")
+            400, "Each chapter box builds one chapter now, so there are no build modes "
+                 "to choose from. Reload the page.")
+    if body.include not in ("approved", "all"):
+        raise HTTPException(400, "include must be 'approved' or 'all'.")
+    cfg = pj.project_config(load_global_config(), project)
 
-    combined = (existing[:start_index - 1] + chapters) if body.append else chapters
-    for i, chapter in enumerate(combined, start=1):
-        chapter.index = i
+    if body.preview:
+        res, warnings = _plan_build(pid, cfg, pages_mod.load_pages(pid), body)
+        return _build_answer(res, warnings, preview=True)
 
-    pj.cache_source(pid, combined)
-    project["chapter_count"] = len(combined)
+    # The whole build holds the manifest lock: read, work out, write source.json,
+    # record. Built from a copy read without it, an upload, a move or an OCR result
+    # landing meanwhile was recorded as built without ever reaching a chapter, and two
+    # builds at once could both append the same chapter.
+    with pages_mod.mutate_pages(pid) as doc:
+        res, warnings = _plan_build(pid, cfg, doc, body)
+        pj.cache_source(pid, res.chapters)
+        # A stale cache would translate the PREVIOUS build's chapters.
+        _chapter_cache.pop(pid, None)
+        legacy = {b["id"] for b in doc["batches"] if b.get("legacy")}
+        doc["build"] = {
+            "mode": "boxes", "at": pages_mod.now_iso(),
+            "chapters": len(res.chapters), "warnings": warnings,
+            # The only record of which photos each chapter came from: the reader's
+            # Photo view shows them, in this order.
+            "page_map": res.page_map,
+            # The boxes say what is built now. Kept because an older copy of the app
+            # reads it to tell built pages from new ones.
+            "used_page_ids": sorted({i for ids in res.page_map.values() for i in ids}
+                                    | {p["id"] for p in doc["pages"] if p["batch"] in legacy}),
+        }
+
+    # After the lock, which also orders the saves: an error writing project.json can
+    # no longer leave source.json written and the manifest not. Outside it, two builds'
+    # tails can finish in either order, so this records the chapter list as it is now
+    # rather than as this build left it — the earlier build finishing last used to write
+    # its smaller count, and pad the chapter files to its narrower width. project.json
+    # is read again for the same reason: the copy from before the lock would undo a
+    # rename made during the build. A build that got here wrote at least one chapter,
+    # so none read back means the read failed, and this build's count stands.
+    total = len(pj.load_text_chapters(pid)) or len(res.chapters)
+    project = pj.get_project(pid) or project
+    project["chapter_count"] = total
     pj._atomic_write_json(pj.PROJECTS_DIR / pid / "project.json", project)
-    # A stale cache would translate the PREVIOUS build's chapters.
-    _chapter_cache.pop(pid, None)
-    _normalize_chapter_padding(pid, len(combined))
+    _normalize_chapter_padding(pid, total)
     _invalidate_consistency(pid)
-
-    used = [p.get("id") for p in ocr_build.usable_pages(doc, include=body.include)]
-    with pages_mod.mutate_pages(pid) as live:
-        # An append only BUILT the new chapters, so build_chapters returns a page_map
-        # keyed by those indices alone. Storing it wholesale dropped every earlier
-        # chapter's entry — and this is the only record of which photos a chapter came
-        # from, so the reader's Photo/Text toggle and its source images silently
-        # disappeared from every chapter built before the append. used_page_ids on the
-        # next line was already merged; page_map was not.
-        prev = (live.get("build") or {}) if body.append else {}
-        prior = set(prev.get("used_page_ids") or [])
-        live["build"] = {"mode": body.mode, "at": pages_mod.now_iso(),
-                         "chapters": len(combined), "warnings": warnings,
-                         "page_map": {**(prev.get("page_map") or {}), **page_map},
-                         "used_page_ids": sorted(prior | set(used))}
-
-    if refreshed:
-        which = ", ".join(str(i) for i in refreshed)
-        warnings.append(
-            f"Chapter {which} updated from pages you corrected. Their English was "
-            f"translated from the old text, so re-translate them when you're ready."
-            if len(refreshed) == 1 else
-            f"Chapters {which} were updated from pages you corrected. Their English "
-            f"was translated from the old text, so re-translate them when you're ready."
-        )
-
-    return {"ok": True, "chapters": len(combined), "added": len(chapters),
-            "refreshed": refreshed,
-            "warnings": warnings, "project": project_summary(project)}
+    return {**_build_answer(res, warnings, preview=False),
+            "project": project_summary(project)}
 
 
 @app.get("/api/projects/{pid}/pages/{page_id}")
@@ -1837,28 +2080,40 @@ def update_page(pid: str, page_id: str, body: PageUpdate) -> dict:
         rec = pages_mod.find_page(doc, page_id)
         if rec is None:
             raise HTTPException(404, "That page isn't in this novel.")
+        before = pages_mod.seam_inputs(rec)
         if body.text is not None:
             rec["text"] = body.text
             rec["chars"] = len(body.text)
             rec["hangul_fraction"] = round(hangul_fraction(body.text), 3)
             # A hand-edited page is the reader's word, so it stops being "needs check"
-            # unless they explicitly said otherwise in the same request.
-            if body.status is None:
+            # unless they explicitly said otherwise in the same request. A skipped page
+            # stays skipped: tidying a cover's text put the cover into the next build of
+            # its chapter, and clearing it held the chapter back, telling the reader to
+            # do the Skip they had already done.
+            if body.status is None and rec.get("status") != pages_mod.STATUS_SKIPPED:
                 rec["status"] = pages_mod.STATUS_EDITED
+        if body.heading is not None:
+            rec["heading"] = body.heading.strip() or None
+        if pages_mod.seam_inputs(rec) != before:
+            pages_mod.reopen_seams(doc, rec)
         if body.status is not None:
             rec["status"] = body.status
         if body.join_prev is not None:
             rec["join_prev"] = body.join_prev
             rec["join_prev_source"] = "user"  # never overwritten by a later re-run
             rec["join_reason"] = "set by you"
+            # Decided against the photo before it NOW, so moving either of them later
+            # clears the decision instead of leaving it on a page break it wasn't
+            # made for.
+            rec["join_prev_id"] = pages_mod.seam_neighbours(doc).get(page_id)
         if body.join_glue is not None:
             rec["join_glue"] = body.join_glue
-        if body.heading is not None:
-            rec["heading"] = body.heading.strip() or None
         if body.hint is not None:
             rec["hint"] = body.hint[:500]
-        updated = dict(rec)
-    return updated
+        # A skip or un-skip moves a seam, and a join set on a chapter's first photo has
+        # nothing to join; settle both now, so the answer is what was saved.
+        pages_mod.normalize(doc)
+    return {**rec, "rev": doc["rev"]}
 
 
 def _checked_status(value: str | None) -> str | None:
@@ -2183,8 +2438,9 @@ def chapter_detail(pid: str, index: int) -> dict:
         "next": next_ref,
         # For a scanned novel, the photos this chapter was built from — the truest
         # source there is, and what makes a translation traceable back to the page.
-        # Only batch builds attribute pages to a specific chapter; a whole-novel
-        # split genuinely can't, so it returns nothing rather than guessing.
+        # Each chapter box records its photos as it builds; chapters built from one
+        # pile before chapter boxes existed genuinely can't say which photo went
+        # where, so they return nothing rather than guessing.
         "page_ids": _chapter_page_ids(project, index),
     }
 
@@ -2192,8 +2448,13 @@ def chapter_detail(pid: str, index: int) -> dict:
 def _chapter_page_ids(project: dict, index: int) -> list[str]:
     if project.get("source_type") != "images":
         return []
-    build = pages_mod.load_pages(project["id"]).get("build") or {}
-    return list((build.get("page_map") or {}).get(str(index)) or [])
+    doc = pages_mod.load_pages(project["id"])
+    present = {page["id"] for page in doc["pages"]}
+    # The build record still lists a photo deleted since; it would only show as a
+    # broken image.
+    return [page_id for page_id in
+            ((doc.get("build") or {}).get("page_map") or {}).get(str(index)) or []
+            if page_id in present]
 
 
 @app.get("/api/projects/{pid}/chapters/{index}/previous")
@@ -4889,7 +5150,10 @@ def _apply_page_result(pid: str, page_id: str, fields: dict) -> dict:
         rec = pages_mod.find_page(doc, page_id)
         if rec is None:
             return {}
+        before = pages_mod.seam_inputs(rec)
         rec.update(fields)
+        if pages_mod.seam_inputs(rec) != before:
+            pages_mod.reopen_seams(doc, rec)
         totals = doc.setdefault("totals", {})
         totals["cost_usd"] = round(float(totals.get("cost_usd") or 0.0) + cost, 6)
         for key, value in (usage or {}).items():
