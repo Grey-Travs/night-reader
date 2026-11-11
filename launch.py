@@ -8,10 +8,15 @@ project's virtual-env Python:
     .venv/bin/python launch.py               (macOS/Linux)
 
 Or just double-click start.bat on Windows.
+
+``--background`` is how Windows starts it at sign-in (Settings → This computer): no
+browser tab, no console, everything it would print written to logs/launch.log, and a
+quiet exit if it is already running.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -66,9 +71,10 @@ def _build_is_stale() -> bool:
     if not built:
         return True
     sources = [WEB / "index.html", WEB / "package.json", WEB / "vite.config.js"]
-    src_dir = WEB / "src"
-    if src_dir.is_dir():
-        sources.extend(src_dir.rglob("*"))
+    # public/ too: it holds the phone app's service worker, copied into dist/ as it is.
+    for folder in (WEB / "src", WEB / "public"):
+        if folder.is_dir():
+            sources.extend(folder.rglob("*"))
     return _newest_mtime(sources) > built
 
 
@@ -155,7 +161,61 @@ def app_is_running() -> bool:
     return _port_in_use(HOST, PORT)
 
 
+def _to_log() -> None:
+    """In the background there is no console — pythonw has none at all — so what would
+    be printed goes to logs/launch.log instead, where a problem can still be found."""
+    folder = ROOT / "logs"
+    folder.mkdir(exist_ok=True)
+    stream = open(folder / "launch.log", "a", encoding="utf-8", buffering=1)  # noqa: SIM115
+    stream.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} started in the background ---\n")
+    sys.stdout = sys.stderr = stream
+
+
+def _has_console() -> bool:
+    import ctypes
+
+    return bool(ctypes.windll.kernel32.GetConsoleWindow())
+
+
+def hide_child_windows() -> None:
+    """Stop every program the app starts from opening a console window of its own.
+
+    pythonw, which is how Windows starts the app at sign-in, has no console, and Windows
+    gives each console program started by a parent without one a window of its own. The
+    claude.exe behind every translation is one, so a window popped up per call. The app's
+    own calls already pass CREATE_NO_WINDOW (server/remote.py, server/pdf_pages.py); the
+    Claude SDK has no option for it, so it is made the default here, for every child.
+
+    Only when there is no console: under start.bat a child shares the visible window,
+    which is where, say, the interface build's output belongs.
+    """
+    if sys.platform != "win32" or _has_console():
+        return
+    init = subprocess.Popen.__init__
+    if getattr(init, "hides_window", False):
+        return
+    keep = subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS
+
+    def __init__(self, *args, creationflags=0, **kwargs):
+        # Either of those asks for something else, and Windows ignores CREATE_NO_WINDOW
+        # beside them anyway (relaunch() uses DETACHED_PROCESS).
+        if not creationflags & keep:
+            creationflags |= subprocess.CREATE_NO_WINDOW
+        init(self, *args, creationflags=creationflags, **kwargs)
+
+    __init__.hides_window = True
+    subprocess.Popen.__init__ = __init__
+
+
 def main() -> None:
+    # Every relative path in config.toml (client_secret.json, token.json, chapters, ...)
+    # is read against the working folder. Started at sign-in from the Run key, that folder
+    # is System32, not this one — so Google "couldn't find" a client secret sitting right
+    # here, and Reconnect failed every time.
+    os.chdir(ROOT)
+    background = "--background" in sys.argv
+    if background:
+        _to_log()
     # Dependencies present? (A clear nudge beats a raw ImportError traceback.)
     try:
         import uvicorn  # noqa: F401
@@ -166,10 +226,14 @@ def main() -> None:
 
     # Already running? Don't crash with "address already in use" — just open it.
     if app_is_running():
+        if background:
+            print("Already running, so nothing to start.")
+            return
         print(f"\n  The app is already running at {URL} — opening it in your browser.\n")
         webbrowser.open(URL)
         return
 
+    hide_child_windows()
     force_build = "--rebuild" in sys.argv
     ensure_config()
     if not build_frontend(force=force_build):
@@ -192,13 +256,68 @@ def main() -> None:
             print("  No reachable address was found yet - connect Tailscale, or")
             print("  check Settings on this computer for the link.")
         print("  That link carries the access key; anything without it is refused.")
-    print("\n  Leave this window open while you use the app. Close it to quit.\n")
+    print("\n  Leave this window open while you use the app. Close it, or use Quit on")
+    print("  the Night Reader icon by the clock, to quit.\n")
 
-    threading.Thread(target=open_browser_later, daemon=True).start()
+    if not background:
+        threading.Thread(target=open_browser_later, daemon=True).start()
 
+    serve(host)
+
+
+def relaunch() -> None:
+    """Start a fresh copy in the background, the way Windows starts it at sign-in. Only
+    called once this one has let go of the port, or the new copy would see it taken and
+    quietly bow out."""
+    from server import autostart
+
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(autostart.command(ROOT), cwd=str(ROOT), creationflags=flags,  # noqa: S603
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True)
+
+
+def serve(host: str) -> None:
+    """Run the server until it is stopped, with the icon by the clock up meanwhile.
+
+    The same as ``uvicorn.run``, but holding the server object, so the icon's Quit and
+    Restart can stop it cleanly rather than the process being killed.
+    """
     import uvicorn
 
-    uvicorn.run("server.app:app", host=host, port=PORT, log_level="warning")
+    from server import tray
+
+    server = uvicorn.Server(uvicorn.Config(
+        "server.app:app", host=host, port=PORT, log_level="warning",
+        # An open browser tab holds a live progress stream, which would otherwise keep
+        # Quit waiting for as long as the tab stays open.
+        timeout_graceful_shutdown=5))
+    leaving: dict[str, bool] = {}
+
+    def stop(restart: bool) -> None:
+        leaving["restart"] = restart
+        server.should_exit = True
+
+    icon = tray.Tray(URL, stop)
+    if not icon.start() and tray.supported():
+        print("  (No icon by the clock: run setup again to add it.)\n")
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        icon.stop()
+    if leaving:
+        if leaving["restart"]:
+            relaunch()
+        # Exit for certain. A job's worker thread would otherwise keep this copy alive
+        # with nothing serving, which is exactly the invisible process the icon is for.
+        sys.stdout.flush()
+        os._exit(0)
+    if not server.started:
+        sys.exit(3)  # uvicorn's own code for "could not start"
 
 
 if __name__ == "__main__":

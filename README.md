@@ -21,6 +21,11 @@ chapter by chapter and saves clean output.
   check each one against its photo, and the app works out where a sentence runs
   across a page break so it doesn't become a false paragraph break. It even flags a
   page that looks like it was never photographed.
+- **Photograph a chapter on your phone.** Tap *Capture a chapter* and turn the pages;
+  the photos go straight to your computer, which reads, builds and translates the
+  chapter by itself. A blurry or cut-off photo is flagged while you can still retake
+  it, and the phone is told when the chapter is done. Photos shared from the gallery,
+  scanner-app PDFs and a Telegram bot of your own go the same way.
 - **Fix one paragraph.** Rewrite or re-translate a single paragraph without touching
   the rest of the chapter. Every version is kept, so you compare and pick.
 - **Faithful translation.** Whole-chapter calls preserve voice and honorifics;
@@ -112,6 +117,26 @@ cd web && npm install && cd ..
 > overflow). When the limit is hit, it pauses; come back later and continue — nothing
 > is re-done or re-charged.
 
+### From your phone
+
+1. Install [Tailscale](https://tailscale.com/) on the computer and on the phone, signed
+   in to the same account.
+2. In the app, **Settings → Use from your phone**: switch it on, then **Show QR code**
+   and scan it with the phone. The camera needs the `https` link; the same card shows
+   the one command that sets it up.
+3. In Chrome on the phone: ⋮ → **Add to Home screen**, then open Night Reader from the
+   new icon and tap **Capture a chapter**.
+
+Also in Settings:
+
+- **Use from your phone → notifications:** an [ntfy](https://ntfy.sh/) address with a
+  topic only you know, so the phone hears when a chapter is translated or a page needs
+  you.
+- **This computer:** start with Windows, and stay awake while there is work to do.
+  While it runs, Night Reader has an icon by the clock: click it to open the app, or
+  right-click for Restart and Quit.
+- **Telegram:** a bot of your own, to send pages from a Telegram chat.
+
 ---
 
 ## Command-line (optional)
@@ -139,7 +164,9 @@ all tunables (model, effort, validation thresholds, chunking, honorific rules).
 ## Privacy & cost
 
 Everything runs locally. Your documents are sent only to Claude (for translation) and
-read from Google Docs (your own account). There is no server you don't control. Cost is
+read from Google Docs (your own account). There is no server you don't control, unless
+you switch one on: notifications go through the ntfy service you choose, and pages sent
+to a Telegram bot pass through Telegram's servers and stay there. Cost is
 your existing Claude subscription — the app shows a *plan-usage equivalent* figure for
 visibility, but you are not billed per translation.
 

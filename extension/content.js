@@ -1130,16 +1130,19 @@ function describeDialog() {
  * first run picked "Chapter 61", which had been live on the site for ages, and would have
  * created a second copy of it.
  *
- * Cell 1 runs the chapter's name and its coin badge together as "Chapter 61 55", so the
- * price is read from the row's coins input and only then trimmed off the end of the name.
- * Splitting off a trailing number unconditionally would turn "Side Stories 1" into
+ * The name cell runs the chapter's name and its coin badge together as "Chapter 61 55", so
+ * the price is read from the row's coins input and only then trimmed off the end of the
+ * name. Splitting off a trailing number unconditionally would turn "Side Stories 1" into
  * "Side Stories" priced at 1.
  */
 function scrapeChapterList(adapter) {
   const cl = adapter.chapter_list || {}
+  const nameAt = columnIndex(cl.name_header)
+  const stateAt = columnIndex(cl.state_header)
+  const cell = (row, at, css) => (at === null ? null : row.cells?.[at]) || row.querySelector(css)
   const rows = [...document.querySelectorAll(cl.row_css || 'tbody tr')].filter(visible)
-  return rows.map((row) => {
-    const nameCell = row.querySelector(cl.name_css || 'td:nth-child(1)')
+  const read = rows.map((row) => {
+    const nameCell = cell(row, nameAt, cl.name_css || 'td:nth-child(2)')
     let title = nameCell ? label(nameCell) : ''
     const coinsInput = row.querySelector(cl.coins_input_css || 'input[placeholder="Coins"]')
     const coins = coinsInput ? Number(coinsInput.value) || 0 : 0
@@ -1147,9 +1150,35 @@ function scrapeChapterList(adapter) {
       const suffix = new RegExp(`\\s*${coins}\\s*$`)
       if (suffix.test(title)) title = title.replace(suffix, '')
     }
-    const stateCell = row.querySelector(cl.state_css || 'td:nth-child(3)')
+    const stateCell = cell(row, stateAt, cl.state_css || 'td:nth-child(4)')
     return { title: title.trim(), coins, state: stateCell ? label(stateCell) : '' }
-  }).filter((r) => r.title)
+  })
+  const named = read.filter((r) => r.title)
+  // Rows with several cells and not one readable name is the table changing shape, not a
+  // novel with nothing posted -- an empty novel shows a single "No items." cell. Said out
+  // loud, because the quiet version (an empty list) is what the October 2026 column shift
+  // produced, and it stopped every run with a message about opening the chapter list.
+  if (!named.length && rows.some((row) => (row.cells?.length || 0) > 1)) {
+    throw Object.assign(new Error('meiko\'s chapter table has changed shape: it has rows, '
+      + 'but no chapter names could be read from them. [chapter_list] in '
+      + 'adapters/meiko.toml needs updating.'), { layout: true })
+  }
+  return named
+}
+
+/**
+ * Which cell holds a column, found by the text of its header, or null.
+ *
+ * Position alone broke once already: in October 2026 the site put an empty cell in front of
+ * every row, and every nth-child selector then read the column to the left of the one it
+ * meant. A header's text survives a column being added; its position does not.
+ */
+function columnIndex(text) {
+  const want = String(text || '').trim().toLowerCase()
+  if (!want) return null
+  const at = [...document.querySelectorAll('thead th')]
+    .findIndex((th) => label(th).toLowerCase() === want)
+  return at < 0 ? null : at
 }
 
 // --- clicking and waiting, for the diagnostics -----------------------------
@@ -1538,8 +1567,12 @@ function ask(kind, payload) {
 // An expired session reads as an ordinary refusal, which would send someone hunting for a
 // bug in the payload. The token is learned from the page's own traffic, so a refresh gets a
 // new one.
+//
+// "Token not vaild", misspelled, is what the site actually answers once its token runs out
+// (with HTTP 200 and status 400 in the body), and none of the other words catch it.
 function isAuthFailure(message) {
-  return /\b(401|403|unauthor|forbidden|expired|invalid token)\b/i.test(message || '')
+  return /\b(401|403|unauthor|forbidden|expired|invalid token|token not va(?:il|li)d)\b/i
+    .test(message || '')
 }
 
 // --- runs Night Reader asked for -------------------------------------------
@@ -1735,6 +1768,7 @@ function watchLocation() {
  */
 async function checkForWork() {
   if (busy || !ctx.found || !ctx.resolved) return
+  if (await renewIfExpired()) return
   try {
     const rows = scrapeChapterList(await adapterOnce())
     pushSiteList(rows)
@@ -1753,8 +1787,65 @@ async function checkForWork() {
     await postBatch({ run })
   } catch (e) {
     // Includes the app being down, which is ordinary: it is a desktop app the user closes.
-    setWatch(isAuthFailure(e.message) ? 'site session expired' : 'app unreachable')
+    setWatch(e.layout ? 'chapter table unreadable — see the adapter'
+      : isAuthFailure(e.message) ? 'site session expired' : 'app unreachable')
   }
+}
+
+/** Seconds left on the site token netlog.js has learned, or null if it cannot tell. */
+function tokenSecondsLeft() {
+  return new Promise((resolve) => {
+    const id = `nr-${++apiSeq}`
+    const onReply = (e) => {
+      if (e.source !== window || e.data?.source !== 'nr-token-left-reply' || e.data.id !== id) return
+      window.removeEventListener('message', onReply)
+      resolve(Number.isFinite(e.data.seconds) ? e.data.seconds : null)
+    }
+    window.addEventListener('message', onReply)
+    window.postMessage({ source: 'nr-token-left', id }, '*')
+    setTimeout(() => {
+      window.removeEventListener('message', onReply)
+      resolve(null)
+    }, 2000)
+  })
+}
+
+// When this tab last reloaded itself for a fresh token. sessionStorage, so it survives the
+// reload it is there to rate-limit.
+const RENEW_KEY = 'nr.renewedAt'
+const RENEW_AT_MOST_EVERY_MS = 10 * 60 * 1000
+
+/**
+ * Reload the tab if the site's token has run out. True when this tick should do no more.
+ *
+ * Measured October 2026: the site reads its token at page load and never renews it. Once it
+ * expires, an hour or less later, the site's own chapter list goes blank and every call this
+ * extension makes answers "Token not vaild" -- so a tab left open on a novel could never
+ * take the run the app queued for it. A reload is the only thing that renews the token, and
+ * only once it has actually expired: with time still on it, the site's sign-in library
+ * hands the same one straight back. Hence "expired", not "nearly".
+ *
+ * Never mid-run (checkForWork is idle-only), never over a focused field or an open dialog,
+ * and at most once every ten minutes, so a sign-out that a reload cannot fix shows as a
+ * message rather than a tab reloading forever.
+ */
+async function renewIfExpired() {
+  const left = await tokenSecondsLeft()
+  if (left === null || left > 30) return false
+  const active = document.activeElement
+  const typing = active && (active.isContentEditable
+    || /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName))
+  const dialogOpen = [...document.querySelectorAll('[role="dialog"], dialog[open]')].some(visible)
+  let last = 0
+  try { last = Number(sessionStorage.getItem(RENEW_KEY)) || 0 } catch { /* treat as never */ }
+  if (typing || dialogOpen || Date.now() - last < RENEW_AT_MOST_EVERY_MS) {
+    setWatch('site session expired — refresh this tab')
+    return true
+  }
+  try { sessionStorage.setItem(RENEW_KEY, String(Date.now())) } catch { /* still reload */ }
+  setWatch('renewing the site session…', true)
+  location.reload()
+  return true
 }
 
 function watchForRuns() {
@@ -1880,6 +1971,13 @@ async function postBatch({ count, state, upTo, run = null }) {
     // chapter is created, so a tab that navigated mid-run would carry on making chapters
     // under whatever novel it had moved to - on a live site, under the wrong series.
     const pinned = uidsFromUrl()
+    // An expired token blanks the site's own chapter list, which would otherwise surface
+    // below as "no chapter list on this page" and send someone looking in the wrong place.
+    const left = await tokenSecondsLeft()
+    if (left !== null && left <= 30) {
+      throw new Error('the site session has expired (its sign-in token ran out). Refresh '
+        + 'this tab and run it again.')
+    }
 
     const [adapter, plan] = await Promise.all([
       adapterOnce(),

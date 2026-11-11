@@ -10,9 +10,10 @@ Kept out of :mod:`translation_bot.translator` deliberately: that module's
 ``_BLOCKED_TOOLS`` is a safety invariant, and mixing an image-reading path into the
 translation domain invites someone to widen it later.
 
-Three calls live here:
+Four calls live here:
 - :func:`transcribe_page`   one photo  -> Korean text + how it joins to its neighbours
 - :func:`verify_page`       one photo  -> discrepancies against an existing transcription
+- :func:`quick_look_page`   one photo  -> whether it can be read at all (a cheap model)
 - :func:`stitch_boundaries` many seams -> how each pair of pages joins (text-only, batched)
 """
 
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .prompts import (
+    OCR_QUICK_LOOK_PROMPT,
     OCR_STITCH_PROMPT,
     OCR_VERIFY_PROMPT,
     PAGE_META_DELIMITER,
@@ -39,6 +41,8 @@ _OCR_MAX_TURNS = 6
 _VALID_CONFIDENCE = ("high", "medium", "low")
 _VALID_JOINS = ("sentence", "paragraph", "chapter", "gap")
 _VALID_ISSUE_KINDS = ("missing", "extra", "wrong", "leak")
+_VALID_LOOK_PROBLEMS = ("blurry", "dark", "glare", "cut_off", "covered", "two_pages",
+                        "not_a_page")
 
 # How much of each page to show the stitcher. Enough to judge a seam, small enough
 # that ~25 boundaries stay a couple of KB.
@@ -90,8 +94,20 @@ class VerifyIssue:
 
 @dataclass
 class VerifyResult:
-    verdict: str = "ok"  # ok | discrepancies
+    verdict: str = "ok"  # ok | discrepancies | unclear (the reply had no answer in it)
     issues: list[VerifyIssue] = field(default_factory=list)
+    usage: dict = field(default_factory=dict)
+    cost_usd: float = 0.0
+
+
+@dataclass
+class QuickLook:
+    """Whether a photo can be read at all: a glance, taken while the phone is still
+    pointed at the page, so a bad photo is taken again before the book is closed."""
+
+    verdict: str = "unknown"  # ok | retake | unknown (the reply had no answer in it)
+    problems: list[str] = field(default_factory=list)
+    note: str = ""
     usage: dict = field(default_factory=dict)
     cost_usd: float = 0.0
 
@@ -193,7 +209,10 @@ def parse_verify_response(raw: str, transcription: str) -> VerifyResult:
     """Turn a raw proof-reading reply into a :class:`VerifyResult`."""
     rows = _json_slice(raw, "[", "]")
     if not isinstance(rows, list):
-        return VerifyResult(verdict="ok")
+        # No list at all is not a clean page: the check didn't answer. Calling that "ok"
+        # approved pages nobody had looked at, and once chapters build by themselves an
+        # approval is what sends a page into the novel.
+        return VerifyResult(verdict="unclear")
 
     issues: list[VerifyIssue] = []
     for row in rows:
@@ -215,6 +234,29 @@ def parse_verify_response(raw: str, transcription: str) -> VerifyResult:
                                   page_says=str(row.get("page_says") or ""),
                                   suggest=suggest))
     return VerifyResult(verdict="discrepancies" if issues else "ok", issues=issues)
+
+
+def parse_quick_look(raw: str) -> QuickLook:
+    """Turn a raw quick-look reply into a :class:`QuickLook`.
+
+    A reply with no answer in it is ``unknown``, never a flag: telling someone to take a
+    good photo again costs them more than the full read that follows anyway.
+    """
+    found = _json_slice(raw, "{", "}")
+    if not isinstance(found, dict):
+        return QuickLook()
+    verdict = str(found.get("verdict", "")).strip().lower()
+    if verdict not in ("ok", "retake"):
+        return QuickLook()
+    if verdict == "ok":
+        return QuickLook(verdict="ok")
+    problems = []
+    for item in found.get("problems") or []:
+        name = str(item).strip().lower()
+        if name in _VALID_LOOK_PROBLEMS and name not in problems:
+            problems.append(name)
+    note = " ".join(str(found.get("note") or "").split())[:80]
+    return QuickLook(verdict="retake", problems=problems, note=note)
 
 
 def parse_stitch_response(raw: str, count: int) -> list[JoinDecision]:
@@ -291,6 +333,21 @@ def verify_page(tr: Translator, image_path: Path, text: str,
     result.usage = usage
     result.cost_usd = cost
     return result
+
+
+def quick_look_page(tr: Translator, image_path: Path) -> QuickLook:
+    """Glance at a photo: can every word on it be read? Meant for a small, fast model,
+    while the phone is still pointed at the page."""
+    image_path = Path(image_path).resolve()
+    user_text = (
+        f"Absolute path of the page photo: {image_path}\n\n"
+        "Open it, then answer with the JSON object described above."
+    )
+    raw, usage, cost = _read_image_call(tr, image_path, OCR_QUICK_LOOK_PROMPT, user_text)
+    look = parse_quick_look(raw)
+    look.usage = usage
+    look.cost_usd = cost
+    return look
 
 
 def format_seams(pairs: list[tuple[str, str]], *, seam_chars: int = _SEAM_CHARS) -> str:

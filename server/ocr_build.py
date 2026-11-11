@@ -18,6 +18,7 @@ unchanged.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from translation_bot.docs_extract import Chapter
@@ -131,7 +132,9 @@ class BoxBuild:
 
 
 def build_boxes(doc: dict, existing: list[Chapter], *, include: str = "approved",
-                append: bool = True) -> BoxBuild:
+                append: bool = True,
+                hold: Callable[[dict, list[dict], int], str | None] | None = None
+                ) -> BoxBuild:
     """Work out the chapters from a normalized manifest's boxes.
 
     Pure: no I/O. It writes what it decides into ``doc`` — the seams it fills, each
@@ -145,6 +148,12 @@ def build_boxes(doc: dict, existing: list[Chapter], *, include: str = "approved"
        part of another chapter's text that this build can't rewrite.
 
     ``append=False`` starts over: every box is numbered again from 1.
+
+    ``hold(box, pages, number)`` is the caller's reason to leave a box alone — the
+    automatic build's, for a chapter a person should look at first. It comes first among
+    the box's reasons, since it is why this build won't touch the box at all; a held box
+    stops the boxes after it, as one that isn't ready does. Never asked of a box still
+    being photographed, which nothing builds anyway. With no ``hold`` nothing changes.
     """
     # Taken before starting over clears the chapters: a box that was built can't be
     # deleted, so it must not be told to delete itself, as an unbuilt box is.
@@ -160,8 +169,11 @@ def build_boxes(doc: dict, existing: list[Chapter], *, include: str = "approved"
         # An empty box would stop the build at itself and drop every chapter after it,
         # so starting over removes empty boxes — built ones too, since every chapter is
         # being rebuilt anyway. That is also the only way to retire a built chapter.
+        # Not a box still being photographed, though: its photos are on their way, and
+        # removing it would send them to a box that is gone.
         groups = dict((box["id"], pages) for box, pages in pages_mod.box_pages(doc))
-        doc["batches"] = [box for box in doc["batches"] if groups[box["id"]]]
+        doc["batches"] = [box for box in doc["batches"]
+                          if groups[box["id"]] or pages_mod.is_capturing(box)]
         for box in doc["batches"]:
             box["chapter"] = None
             box["built_sig"] = None
@@ -175,12 +187,19 @@ def build_boxes(doc: dict, existing: list[Chapter], *, include: str = "approved"
     def live(box: dict) -> list[dict]:
         return pages_mod.live_pages(groups[box["id"]])
 
-    def wait(box: dict, number: int, reasons: list[str], blocked_by: int | None = None):
+    def wait(box: dict, number: int, reasons: list[str], blocked_by: int | None = None,
+             held: bool = False):
         result.waiting.append({
             "batch": box["id"], "number": number,
             "title": pages_mod.box_title(box, live(box), number),
             "built": bool(box.get("chapter")), "reasons": reasons, "blocked_by": blocked_by,
+            "held": held,
         })
+
+    def held_by(box: dict, number: int) -> str | None:
+        if hold is None or pages_mod.is_capturing(box):
+            return None
+        return hold(box, groups[box["id"]], number)
 
     def owners() -> dict[str, int]:
         found: dict[str, int] = {}
@@ -229,9 +248,12 @@ def build_boxes(doc: dict, existing: list[Chapter], *, include: str = "approved"
         k = box.get("chapter")
         if not k or pages_mod.box_signature(box, groups[box["id"]]) == box.get("built_sig"):
             continue
+        held = held_by(box, k)
         if k > len(chapters):
             wait(box, k, ["This chapter is missing from the built chapter list. Use "
                           "Start over to rebuild the chapters."])
+        elif held:
+            wait(box, k, [held] + [b["message"] for b in blockers[box["id"]]], held=True)
         elif blockers[box["id"]]:
             wait(box, k, [b["message"] for b in blockers[box["id"]]])
         else:
@@ -268,14 +290,15 @@ def build_boxes(doc: dict, existing: list[Chapter], *, include: str = "approved"
         if pages_mod.is_built(box):
             continue
         number = len(chapters) + 1 + sum(1 for w in result.waiting if not w["built"])
-        reasons = [b["message"] for b in blockers[box["id"]]]
+        held = held_by(box, number)
+        reasons = ([held] if held else []) + [b["message"] for b in blockers[box["id"]]]
         if not reasons:
             reason = still_elsewhere(box, owned, set())
             reasons = [reason] if reason else []
         if reasons:
             if stop is None:
                 stop = number
-            wait(box, number, reasons)
+            wait(box, number, reasons, held=bool(held))
         elif stop is not None:
             wait(box, number, [f"Comes after chapter {stop}, which isn't ready yet."],
                  blocked_by=stop)

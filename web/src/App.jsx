@@ -23,7 +23,11 @@ const LibraryPage = lazy(() => import('./pages/LibraryPage'))
 const SeriesPage = lazy(() => import('./pages/SeriesPage'))
 const SeriesDetailPage = lazy(() => import('./pages/SeriesDetailPage'))
 const PostingPage = lazy(() => import('./pages/PostingPage'))
-const PhonePage = lazy(() => import('./pages/PhonePage'))
+const PhoneApp = lazy(() => import('./pages/PhoneApp'))
+const PhoneHome = lazy(() => import('./pages/PhoneHome'))
+const PhoneCapturePage = lazy(() => import('./pages/PhoneCapturePage'))
+const PhoneCheckPage = lazy(() => import('./pages/PhoneCheckPage'))
+const PhoneSharePage = lazy(() => import('./pages/PhoneSharePage'))
 const ImportPage = lazy(() => import('./pages/ImportPage'))
 const ActivityPage = lazy(() => import('./pages/ActivityPage'))
 const ArchivePage = lazy(() => import('./pages/ArchivePage'))
@@ -74,7 +78,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status])
 
-  if (status === undefined) return <FullPageLoading />
+  // The phone screens never wait on the status check: with the computer asleep it hangs
+  // until the connection times out, and the camera and saved photos must work meanwhile.
+  if (status === undefined && !isPhoneRoute) return <FullPageLoading />
 
   const ready = isReady(status)
 
@@ -94,8 +100,17 @@ export default function App() {
       <Suspense fallback={<FullPageLoading />}>
         <Routes>
           {/* Outside AppShell on purpose: no sidebar, no top bar, nothing of the desktop
-              site. This is what the phone link and the home-screen icon open. */}
-          <Route path="phone" element={<PhonePage />} />
+              site. This is what the phone link and the home-screen icon open. Anything
+              unknown under it goes back to its hub: the catch-all below would leave the
+              installed app's scope for the desktop site. */}
+          <Route path="phone" element={<PhoneApp />}>
+            <Route index element={<PhoneHome />} />
+            <Route path="capture" element={<PhoneCapturePage />} />
+            <Route path="check" element={<PhoneCheckPage />} />
+            <Route path="check/:pid/:pageId" element={<PhoneCheckPage />} />
+            <Route path="share" element={<PhoneSharePage />} />
+            <Route path="*" element={<Navigate to="/phone" replace />} />
+          </Route>
           <Route element={<AppShell status={status} setStatus={setStatus} onSetup={() => setForceSetup(true)} />}>
             <Route index element={<LibraryPage />} />
             <Route path="series" element={<SeriesPage />} />

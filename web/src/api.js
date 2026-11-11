@@ -22,8 +22,10 @@ async function req(path, opts) {
   return r.status === 204 ? null : r.json()
 }
 const get = (p) => req(p)
-const post = (p, body) =>
-  req(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
+// `signal` lets the phone's outbox give up on a request the connection has swallowed.
+const post = (p, body, { signal } = {}) =>
+  req(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}), signal })
+const slimmed = (p, slim) => (slim ? `${p}${p.includes('?') ? '&' : '?'}slim=1` : p)
 const put = (p, body) =>
   req(p, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
 const del = (p) => req(p, { method: 'DELETE' })
@@ -37,6 +39,9 @@ export const api = {
   googleLogin: (write = false) => post(`/api/google/login${write ? '?write=true' : ''}`),
   settings: () => get('/api/settings'),
   updateSettings: (body) => post('/api/settings', body),
+  // Settings → This computer: starting with Windows, and staying awake while working.
+  computer: () => get('/api/computer'),
+  updateComputer: (body) => post('/api/computer', body),
 
   listProjects: () => get('/api/projects'),
   createProject: (url, name) => post('/api/projects', { url, name }),
@@ -58,12 +63,37 @@ export const api = {
   pages: (pid) => get(`/api/projects/${pid}/pages`),
   page: (pid, pageId) => get(`/api/projects/${pid}/pages/${pageId}`),
   pageImageUrl: (pid, pageId) => `/api/projects/${pid}/pages/${pageId}/image`,
-  uploadPage: (pid, file, { batch = '', label = '', name = '' } = {}) => {
+  uploadPage: (pid, file, { batch = '', label = '', name = '', slim = false, signal } = {}) => {
     const q = new URLSearchParams({ batch, label, name: name || file.name || '' })
+    if (slim) q.set('slim', '1')
     return req(`/api/projects/${pid}/pages?${q}`, {
       method: 'POST',
       headers: { 'Content-Type': file.type || 'application/octet-stream' },
       body: file,
+      signal,
+    })
+  },
+  // A scanner PDF: its pages go in, in order, at the end of box `batch` (or of a new box,
+  // finished at once when `hands_free`). The answer lists the new pages as `added_ids`.
+  uploadPdf: (pid, file, { batch = '', name = '', hands_free = false, origin = '', slim = false, signal } = {}) => {
+    const q = new URLSearchParams({ batch, name: name || file.name || '' })
+    if (hands_free) q.set('hands_free', '1')
+    if (origin) q.set('origin', origin)
+    if (slim) q.set('slim', '1')
+    return req(`/api/projects/${pid}/pages/pdf?${q}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/pdf' }, body: file, signal,
+    })
+  },
+  // Retake in place: the new photo becomes a new page where the old one was, and the old
+  // page goes. The answer's `replaced` names it.
+  replacePage: (pid, pageId, file, { name = '', slim = false, signal } = {}) => {
+    const q = new URLSearchParams({ name: name || file.name || '' })
+    if (slim) q.set('slim', '1')
+    return req(`/api/projects/${pid}/pages/${pageId}/replace?${q}`, {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+      signal,
     })
   },
   savePage: (pid, pageId, body) => post(`/api/projects/${pid}/pages/${pageId}`, body),
@@ -73,17 +103,32 @@ export const api = {
   // `after` places the new box (default: last); `ids` are moved into it, in that order,
   // in the same request — so "Split chapter here" can't leave an empty box behind.
   // Keys left undefined are dropped by JSON.stringify, and the server refuses unknown ones.
-  createPageBatch: (pid, { label, after, ids } = {}) =>
-    post(`/api/projects/${pid}/pages/batches`, { label, after, ids }),
+  // `origin` and `hands_free` come from the phone, a share or Telegram, never from here:
+  // a hands-free box builds and translates by itself once its photos are all in.
+  // `slim` leaves the whole rail out of the answer, for the phone on mobile data.
+  createPageBatch: (pid, { label, after, ids, origin, hands_free } = {}, { slim = false, signal } = {}) =>
+    post(slimmed(`/api/projects/${pid}/pages/batches`, slim), { label, after, ids, origin, hands_free }, { signal }),
+  // Stop pauses what the phone sent; this lets it carry on by itself again.
+  resumeHandsFree: (pid) => post(`/api/projects/${pid}/hands-free/resume`),
+  // Where the chapters sent from the phone stand. `box` marks that one as on screen.
+  phoneProgress: ({ pid = '', box = '' } = {}) => {
+    const q = new URLSearchParams()
+    if (pid) q.set('pid', pid)
+    if (box) q.set('box', box)
+    return get(`/api/phone/progress${q.toString() ? `?${q}` : ''}`)
+  },
+  // A hands-free chapter's photos are all in, so it may build. Safe to send twice.
+  markCaptured: (pid, batchId, { expect_number } = {}, { slim = false, signal } = {}) =>
+    post(slimmed(`/api/projects/${pid}/pages/batches/${batchId}/captured`, slim), { expect_number }, { signal }),
   // The full box order. Built chapters keep their places; the server refuses otherwise.
   reorderPageBatches: (pid, ids) => post(`/api/projects/${pid}/pages/batches/order`, { ids }),
   renamePageBatch: (pid, batchId, label) =>
     post(`/api/projects/${pid}/pages/batches/${batchId}`, { label }),
   // `expect_page_ids` is the photo list the confirm showed. A photo that arrived after
   // it makes the server refuse, so "Delete 8 photos?" can never delete 9.
-  deletePageBatch: (pid, batchId, { expect_page_ids } = {}) =>
-    post(`/api/projects/${pid}/pages/batches/${batchId}/delete`, { expect_page_ids }),
-  deletePages: (pid, ids) => post(`/api/projects/${pid}/pages/delete`, { ids }),
+  deletePageBatch: (pid, batchId, { expect_page_ids } = {}, { slim = false, signal } = {}) =>
+    post(slimmed(`/api/projects/${pid}/pages/batches/${batchId}/delete`, slim), { expect_page_ids }, { signal }),
+  deletePages: (pid, ids, { signal } = {}) => post(`/api/projects/${pid}/pages/delete`, { ids }, { signal }),
   // readPages / verifyPages QUEUE work on the novel's worker (like resolveChapter),
   // so they stream to the live console and honour Stop and the rate-limit resume.
   readPages: (pid, ids) => post(`/api/projects/${pid}/pages/ocr`, { ids: ids || [] }),
@@ -243,4 +288,13 @@ export const api = {
   remote: () => get('/api/remote'),
   updateRemote: (body) => post('/api/remote', body),
   testRemoteNotification: () => post('/api/remote/test-notification'),
+
+  // The Telegram bot: another way to send pages in. Its token is sent once and never
+  // comes back; pairing, unpairing and removing it work only on the computer itself.
+  telegram: () => get('/api/telegram'),
+  updateTelegram: (body) => post('/api/telegram', body),
+  pairTelegram: () => post('/api/telegram/pair'),
+  unpairTelegram: () => post('/api/telegram/unpair'),
+  forgetTelegram: () => post('/api/telegram/forget'),
+  testTelegram: () => post('/api/telegram/test'),
 }

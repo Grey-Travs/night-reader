@@ -8,7 +8,7 @@ import ChapterBoxes from '../components/ChapterBoxes'
 import PagePhotoView from '../components/PagePhotoView'
 import BuildChaptersDialog from '../components/BuildChaptersDialog'
 import {
-  BUSY, NEW_BOX, REFUSED, addingInto, applyBoxOrder, applyMove, boxName, checkDrop, groupBoxes,
+  BUSY, HEIC_ADVICE, NEW_BOX, REFUSED, addingInto, applyBoxOrder, applyMove, boxName, checkDrop, groupBoxes,
   hasText, isBuilt, leftNothing, locate, neighbourId, planBoxMove, planPhotoMove, planSplit,
   removeBox, sortFilesForUpload, stillAdding, stoppedMessage, toRead, uploadReport,
 } from '../pageBoxes'
@@ -544,7 +544,9 @@ export default function PagesPage() {
     const mine = uploadsNow().jobs.filter((job) => job.pid === pid)
     if (mine.some((job) => !now.some((b) => b.id === job.batch))) return null
     const last = now.at(-1)
-    if (!last || isBuilt(last) || last.pages.length) return null
+    // A hands-free box with no photos yet is a phone chapter about to arrive, not a box
+    // waiting for this drop.
+    if (!last || isBuilt(last) || last.pages.length || last.hands_free) return null
     return mine.some((job) => job.batch === last.id) ? null : last
   }
 
@@ -604,11 +606,7 @@ export default function PagesPage() {
     if (refused.length) {
       notice(`Nothing was added — ${refused.length === 1 ? 'this photo' : 'these'} can’t go in:\n`
         + refused.map((r) => `· ${r.name} — ${REFUSED[r.reason]}`).join('\n')
-        + (refused.some((r) => r.reason === 'heic')
-          ? '\n\nPhones save these to take less space. On an Android phone, open the camera’s '
-            + 'settings and turn off “High efficiency pictures” (on a Samsung it’s under '
-            + 'Advanced picture options). On an iPhone: Settings → Camera → Formats → Most '
-            + 'Compatible. Then take or export the photos again as JPEG.' : ''), pid)
+        + (refused.some((r) => r.reason === 'heic') ? `\n\n${HEIC_ADVICE}` : ''), pid)
       return
     }
     if (!files.length) {
@@ -841,6 +839,13 @@ export default function PagesPage() {
     optimistic: (r) => ({ ...r, batches: r.batches.map((b) => (b.id === id ? { ...b, label } : b)) }),
   })
 
+  // A phone chapter whose Done never came holds back every chapter after it. Finishing
+  // it here lets it build, as Done would have.
+  const finishBox = (box) => write(
+    async () => (await api.markCaptured(pid, box.id)).pages,
+    { context: `finishing ${boxName(box)}` },
+  )
+
   async function deleteBox(box) {
     // The photos the confirm names are the ones the server is told to expect, so one
     // that arrives while the dialog is open makes it refuse instead of going with them.
@@ -890,8 +895,29 @@ export default function PagesPage() {
   const unbuilt = boxes.filter((b) => !b.orphan && !isBuilt(b)).length
   const builtCount = rail?.chapter_count || 0
 
+  // Stop pauses the chapters sent from the phone too, until Resume — here or on the phone.
+  const resumeHandsFree = async () => {
+    try {
+      await api.resumeHandsFree(pid)
+    } catch (e) {
+      showError(e, { context: 'letting the phone’s chapters carry on' })
+      return
+    }
+    loadRail({ quiet: true })
+  }
+
   const banners = (
     <>
+      {rail?.hands_free_paused_at && (
+        <div className="mb-3 flex items-start gap-3 rounded-card px-3 py-2 text-sm pill-review" role="status">
+          <p className="flex-1">
+            Hands-free is paused: chapters sent from the phone wait here until you resume.
+          </p>
+          <button className="btn btn-quiet shrink-0 px-2 py-0.5 text-xs" onClick={resumeHandsFree}>
+            Resume
+          </button>
+        </div>
+      )}
       <UploadStatus
         jobs={myUploads} boxes={boxes}
         onRetry={retryUpload} onCancel={cancelUpload}
@@ -1018,7 +1044,7 @@ export default function PagesPage() {
           onToggle={(id, open) => setExpanded((e) => ({ ...e, [id]: open }))}
           onOpenPhoto={openPhoto} onAddPhotos={pickPhotos} onDropFiles={enqueueUpload}
           onMove={moveTo} onNewBoxFrom={newBoxFrom} onAddBox={addBox}
-          onMoveBox={moveBox} onRenameBox={renameBox} onDeleteBox={deleteBox}
+          onMoveBox={moveBox} onRenameBox={renameBox} onDeleteBox={deleteBox} onFinishBox={finishBox}
           onReadBox={readBox} onSetSeam={setSeam}
           onOpenChapter={(index) => navigate(`/novel/${pid}/chapter/${index}`)}
         />

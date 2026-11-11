@@ -47,7 +47,7 @@ export default function ProjectLayout() {
   // grow that array without bound while rerendering every line.
   const [live, setLive] = useState(null)
   const [totals, setTotals] = useState(null)
-  const [paused, setPaused] = useState(null) // { message, resets_at, pending } | null
+  const [paused, setPaused] = useState(null) // { message, resets_at, pending, resumable } | null
   // Server-side wait: the worker is riding out a rate limit and resumes by itself.
   const [waiting, setWaiting] = useState(null) // { resume_at, resets_at, message, since } | null
   const [queue, setQueue] = useState({ current: null, kind: 'translate', pending: [] })
@@ -134,7 +134,8 @@ export default function ProjectLayout() {
   function restorePause() {
     const p = getPausedJob(pid)
     if (!p) return
-    setPaused({ message: p.message || "Your plan's limit was reached.", resets_at: p.resets_at, pending: p.pending || [] })
+    setPaused({ message: p.message || "Your plan's limit was reached.", resets_at: p.resets_at,
+                pending: p.pending || [], resumable: p.resumable || [] })
     scheduleResume(p.resets_at)
   }
 
@@ -162,13 +163,41 @@ export default function ProjectLayout() {
     if (waiting && jobIdRef.current) {
       try { await api.resumeNow(pid); return } catch { /* fall through to re-enqueue */ }
     }
-    const pend = (paused?.pending && paused.pending.length ? paused.pending : getPausedJob(pid)?.pending) || []
+    const items = stoppedWork()
     clearResumeTimer()
     clearPausedJob(pid)
     setPaused(null)
-    if (pend.length) enqueue(pend, true, { foldBacklog: false })
+    if (items.length) {
+      await submitTask(() => sendResumable(items),
+        { context: 'resuming the queue', onRetry: () => submitTask(() => sendResumable(items)) })
+    }
   }
   resumeJobRef.current = resumeJob
+
+  // What a stopped job still had queued, as the server listed it. Only chapter work is
+  // ever in it: the whole pending list used to be re-queued as forced translations, so a
+  // page number came back as "re-translate chapter N" and finished chapters were
+  // translated again. A pause saved by an older version has no such list, so it resumes
+  // nothing rather than guess.
+  function stoppedWork() {
+    return (paused?.resumable?.length ? paused.resumable : getPausedJob(pid)?.resumable) || []
+  }
+
+  // Queue that work again exactly as it was queued: plain translations with and without
+  // force in a call each, and each repair on its own. One worker per novel, so every call
+  // lands in the same job and the last answer has its whole queue.
+  async function sendResumable(items) {
+    let last = null
+    for (const force of [false, true]) {
+      const indices = items.filter((t) => t.kind === 'translate' && !!t.force === force).map((t) => t.index)
+      if (indices.length) last = await api.translate(pid, { indices, force })
+    }
+    for (const t of items) {
+      if (t.kind === 'resolve') last = await api.resolveChapter(pid, t.index)
+      else if (t.kind === 'pronouns') last = await api.fixPronouns(pid, t.index)
+    }
+    return last || {}
+  }
 
   function attachStream(jobId) {
     const es = new EventSource(api.streamUrl(pid, jobId))
@@ -243,17 +272,19 @@ export default function ProjectLayout() {
         setLive(null)
         setLog((l) => [...l, { kind: 'warn', text: `Rate limit reached — waiting for Claude to refresh (resumes ~${when})` }])
         notify('Waiting for Claude to refresh', 'Translation will resume automatically.')
-        setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: e.pending || [] })
+        setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: e.pending || [],
+                            resumable: e.resumable || [] })
       } else if (e.type === 'resumed') {
         setLog((l) => [...l, { kind: 'info', text: 'Claude refreshed — resuming…' }])
         clearPausedJob(pid)
       } else if (e.type === 'paused') {
         const pend = e.pending || []
-        setPaused({ message: e.message, resets_at: e.resets_at, pending: pend })
+        const resumable = e.resumable || []
+        setPaused({ message: e.message, resets_at: e.resets_at, pending: pend, resumable })
         setLive(null)
         setLog((l) => [...l, { kind: 'warn', text: `Paused: ${e.message}` }])
         notify('Translation paused', e.message)
-        setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: pend })
+        setPausedJob(pid, { message: e.message, resets_at: e.resets_at, pending: pend, resumable })
         scheduleResume(e.resets_at)
         finish(es)
       } else if (e.type === 'done') {
@@ -321,17 +352,15 @@ export default function ProjectLayout() {
 
   async function enqueue(indices, force = false, { foldBacklog = true } = {}) {
     const wasIdle = !esRef.current
-    const backlog = wasIdle && foldBacklog
-      ? ((paused?.pending?.length ? paused.pending : getPausedJob(pid)?.pending) || [])
-      : []
+    const backlog = wasIdle && foldBacklog ? stoppedWork() : []
     const res = await submitTask(
       () => api.translate(pid, { ...(indices ? { indices } : {}), force }),
       { context: 'starting a translation', onRetry: () => enqueue(indices, force) },
     )
     if (res && backlog.length) {
       try {
-        const more = await api.translate(pid, { indices: backlog, force: true })
-        setQueue({ current: more.current ?? null, kind: more.kind || 'translate', pending: more.pending || [] })
+        const more = await sendResumable(backlog)
+        if (more.job_id) setQueue({ current: more.current ?? null, kind: more.kind || 'translate', pending: more.pending || [] })
       } catch { /* the main request already started; a failed backlog fold isn't fatal */ }
     }
   }

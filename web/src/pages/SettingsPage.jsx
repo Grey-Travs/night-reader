@@ -3,6 +3,8 @@ import { useOutletContext } from 'react-router-dom'
 import { api } from '../api'
 import { Dot } from '../components/ui'
 import RemoteAccess from '../components/RemoteAccess'
+import TelegramBot from '../components/TelegramBot'
+import ThisComputer from '../components/ThisComputer'
 
 const MODELS = [
   { id: 'claude-opus-5', label: 'Opus — best quality (recommended)' },
@@ -90,6 +92,21 @@ export default function SettingsPage() {
               </span>
             </label>
 
+            <label className="flex items-start gap-3">
+              <input
+                type="checkbox" className="mt-1" checked={s.quick_look !== false}
+                onChange={(e) => save({ quick_look: e.target.checked })}
+              />
+              <span>
+                <span className="text-sm font-medium">Quick look at each photo while you shoot</span>
+                <span className="mt-0.5 block text-xs text-hint">
+                  A fast model glances at each page photo the phone app takes, so one that
+                  can’t be read is flagged while the book is still open at that page. Uses a
+                  little of your Claude plan.
+                </span>
+              </span>
+            </label>
+
             <div className="text-xs text-hint">
               Validation thresholds and other tunables live in <code className="rounded px-1 font-mono" style={{ background: 'var(--b-muted-bg)' }}>config.toml</code>.
             </div>
@@ -123,6 +140,8 @@ export default function SettingsPage() {
       </section>
 
       <RemoteAccess />
+      <TelegramBot />
+      <ThisComputer />
     </div>
   )
 }

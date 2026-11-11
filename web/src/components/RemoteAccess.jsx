@@ -1,6 +1,40 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { useToast } from '../toast'
+import QrCode from './QrCode'
+
+// The phone link as a QR code, so a new phone scans it instead of having it typed or sent
+// to it. Shown only when asked, and only for two minutes: the key is in the link, and a
+// code left on screen is a code anyone in the room can photograph.
+const QR_SHOWN_MS = 2 * 60 * 1000
+
+function PhoneQr({ link }) {
+  const [shown, setShown] = useState(false)
+  useEffect(() => {
+    if (!shown) return undefined
+    const hide = setTimeout(() => setShown(false), QR_SHOWN_MS)
+    return () => clearTimeout(hide)
+  }, [shown])
+  if (!shown) {
+    return (
+      <button className="btn btn-ghost px-3 py-1.5 text-xs" onClick={() => setShown(true)}>
+        Show QR code
+      </button>
+    )
+  }
+  return (
+    <div className="space-y-2">
+      <QrCode text={link} label="QR code of the phone link" />
+      <p className="text-xs text-hint">
+        Scan it with the phone’s camera to open the link in Chrome. It carries the access
+        key, so it hides itself after two minutes.
+      </p>
+      <button className="btn btn-ghost px-3 py-1.5 text-xs" onClick={() => setShown(false)}>
+        Hide QR code
+      </button>
+    </div>
+  )
+}
 
 // Turning the phone link into an icon on the home screen.
 //
@@ -38,7 +72,9 @@ function HomeScreen({ serve, local, onCopy }) {
           <p className="text-xs text-hint">
             Ready. Open this on the phone, then use Chrome’s menu → <b>Install app</b>. It
             gets its own icon and opens with no address bar. The key is in the link, so
-            the installed app keeps working after the browser forgets the cookie.
+            the installed app keeps working after the browser forgets the cookie. To put
+            it in the share sheet after an update, install it again — but only when its
+            hub says nothing is waiting to send.
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <code className="min-w-0 flex-1 truncate rounded px-2 py-1.5 font-mono text-xs"
@@ -48,6 +84,7 @@ function HomeScreen({ serve, local, onCopy }) {
               Copy
             </button>
           </div>
+          <PhoneQr link={httpsPhone} />
         </>
       ) : (
         <>

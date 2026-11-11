@@ -19,7 +19,9 @@ import { usePostingConsole } from '../usePostingConsole'
 // The arithmetic is shared with the desktop console through usePostingConsole. That is the
 // point: the pricing guard that stops a run posting at zero coins is the same code here as
 // there, so the phone cannot be the lenient one.
-export default function PhonePage() {
+// `lead` goes above the posting console: the hub puts the chapters sent from the phone
+// there. Rendered as given, so this page stays usable without a router.
+export default function PhonePage({ lead = null }) {
   const toast = useToast()
   const c = usePostingConsole()
 
@@ -37,6 +39,7 @@ export default function PhonePage() {
       </header>
 
       <main className="phone-body">
+        {lead}
         {c.error && (
           <div className="rounded-card px-3 py-2 text-sm pill-review">
             {c.error.message || String(c.error)}

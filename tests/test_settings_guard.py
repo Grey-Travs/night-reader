@@ -60,11 +60,18 @@ def test_a_free_chapter_saved_free_reports_nothing():
     assert _wrong([(record, {"state": "public", "coins": 0})]) == [[]]
 
 
-def test_the_failure_from_the_run_that_prompted_this():
-    # Verbatim from the report: the plan asked for free, and the site came back holding a
-    # coin. Exactly one thing is wrong, and the run is right to stop on it.
+def test_a_free_chapter_holding_the_sites_placeholder_coin_reports_nothing():
+    # Measured October 2026: the site answers a save of coins 0 / paid false with coins 1 /
+    # paid 0, on every free chapter. Calling that wrong stopped every free post at step 3.
+    # The side story that once went up free when it should have cost 55 is still caught,
+    # by the next test, because it is measured against the price it SHOULD have had.
     record = {"type": "notes", "state": "public", "paid": 0, "coins": 1}
-    assert _wrong([(record, {"state": "public", "coins": 0})]) == [["coins is 1"]]
+    assert _wrong([(record, {"state": "public", "coins": 0})]) == [[]]
+
+
+def test_a_free_chapter_that_came_back_paid_is_still_caught():
+    record = {"type": "notes", "state": "public", "paid": 1, "coins": 1}
+    assert _wrong([(record, {"state": "public", "coins": 0})]) == [["paid is 1"]]
 
 
 def test_the_same_chapter_measured_against_the_price_it_should_have_had():

@@ -200,9 +200,15 @@ def test_unknown_issue_kind_is_normalized():
     assert parse_verify_response(raw, KO).issues[0].kind == "wrong"
 
 
-def test_unparseable_verify_reply_is_treated_as_ok():
-    """A broken proof-read must not invent problems with the page."""
-    assert parse_verify_response("I could not read the image.", KO).verdict == "ok"
+def test_unparseable_verify_reply_is_unclear():
+    """A broken proof-read must neither invent problems nor approve the page."""
+    result = parse_verify_response("I could not read the image.", KO)
+    assert result.verdict == "unclear"
+    assert result.issues == []
+
+
+def test_an_empty_list_is_a_clean_page():
+    assert parse_verify_response("[]", KO).verdict == "ok"
 
 
 # ---- stitching ---------------------------------------------------------------

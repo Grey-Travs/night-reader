@@ -11,11 +11,13 @@ Run from the project root:  uvicorn server.app:app --port 8000
 from __future__ import annotations
 
 import asyncio
+import copy
 import csv
 import io
 import json
 import os
 import re
+import shutil
 import socket
 import threading
 import time
@@ -25,8 +27,8 @@ import uuid
 import zipfile
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable
-from contextlib import contextmanager
-from dataclasses import asdict
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
+from starlette.datastructures import Headers
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from translation_bot import ocr
@@ -92,18 +95,25 @@ from translation_bot.translator import (
 )
 from translation_bot.validate import validate_translation
 
+from . import autostart
 from . import console
 from . import docexport as doc_export
 from . import errors
 from .locks import file_lock
 from . import ocr_build
 from . import glossary_merge
+from . import hands_free
 from . import importing
+from . import intake
+from . import keep_awake
 from . import pages as pages_mod
+from . import pdf_pages
 from . import posting
+from . import quick_look
 from . import remote
 from . import projects as pj
 from . import series as series_mod
+from . import telegram_bot
 from . import variants as variants_mod
 from .bulk import MAX_ROWS, MAX_UNTYPED, prepare_bulk_rows, split_flat
 from translation_bot.textsplit import SEP_RE
@@ -116,7 +126,91 @@ DIST_DIR = PROJECT_ROOT / "web" / "dist"
 # serves on 8000; an override exists for anyone running uvicorn by hand.
 PORT = int(os.environ.get("NR_PORT") or 8000)
 
-app = FastAPI(title="Korean Web-Novel Translation Bot")
+# The loop the app is serving on, for threads that need to hand work back to it. They
+# can't use anyio's from_thread helpers, which only work from threads anyio started.
+# None whenever the app isn't serving, and anything that would use it then does nothing.
+_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    global _LOOP
+    _LOOP = asyncio.get_running_loop()
+    # No job survives a restart, so a page the last run left queued or mid-read is
+    # waiting for work that will never come. Hand those back before serving anything.
+    await run_in_threadpool(_release_stranded_pages)
+    # Then carry on with what the phone sent, without holding up the first request.
+    background = [asyncio.ensure_future(_resume_hands_free()),
+                  asyncio.ensure_future(_hands_free_watchdog()),
+                  asyncio.ensure_future(_hosts_watch())]
+    keeper = keep_awake.KeepAwake(_work_pending, kernel32=keep_awake.windows_kernel32())
+    keeper.start()
+    # The Telegram bot, when one is set up. It asks Telegram for messages on threads of
+    # its own, so nothing here waits on it.
+    await run_in_threadpool(telegram_bot.start)
+    try:
+        yield
+    finally:
+        for task in background:
+            task.cancel()
+        _drop_all_hands_free_timers()
+        keeper.stop()
+        telegram_bot.stop()
+        _LOOP = None
+
+
+app = FastAPI(title="Korean Web-Novel Translation Bot", lifespan=_lifespan)
+
+
+# The names this app answers to, for the Host check. The tailnet name is only known once
+# Tailscale is connected, and read once at startup, an app started before it — which
+# starting with Windows makes likely — refused the phone until it was restarted. So the
+# list catches up: a name not on it makes the check look again, at most every 30 seconds
+# and off the event loop (it runs the tailscale command), and it is looked at every few
+# minutes regardless.
+_HOSTS_RECHECK_S = 30.0
+_HOSTS_EVERY_S = 300.0
+_hosts: dict = {"list": remote.allowed_hosts(), "looked": time.monotonic()}
+
+
+def _host_allowed(host: str, allowed: list[str]) -> bool:
+    return any(host == p or (p.startswith("*") and host.endswith(p[1:])) for p in allowed)
+
+
+async def _refresh_hosts() -> None:
+    _hosts["looked"] = time.monotonic()
+    _hosts["list"] = list(await run_in_threadpool(remote.allowed_hosts))
+
+
+async def _hosts_watch() -> None:
+    while True:
+        await asyncio.sleep(_HOSTS_EVERY_S)
+        try:
+            await _refresh_hosts()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the list it had still stands
+            pass
+
+
+class _LiveHosts(TrustedHostMiddleware):
+    """TrustedHostMiddleware whose list is _hosts, kept up to date as above. Still a
+    whitelist, never "*": it is what stands between a DNS-rebinding page and a library
+    that trusts loopback."""
+
+    def __init__(self, app):
+        super().__init__(app, allowed_hosts=_hosts["list"])
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            host = Headers(scope=scope).get("host", "").split(":")[0]
+            if (host and not _host_allowed(host, _hosts["list"])
+                    and time.monotonic() - _hosts["looked"] > _HOSTS_RECHECK_S):
+                await _refresh_hosts()
+            self.allowed_hosts = _hosts["list"]
+            self.allow_any = False
+        await super().__call__(scope, receive, send)
+
 # This API acts on local data and has no accounts, so loopback binding IS its
 # authentication. TrustedHost rejects foreign Host headers (DNS-rebinding defense); CORS
 # is limited to the local dev origins (in production, frontend + API are same-origin).
@@ -126,7 +220,7 @@ app = FastAPI(title="Korean Web-Novel Translation Bot")
 # removes them again when it is switched off. The Host check stays a whitelist either way;
 # it is never opened to "*", because it is the only thing standing between a DNS-rebinding
 # page and a library that trusts loopback. See server/remote.py.
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=remote.allowed_hosts())
+app.add_middleware(_LiveHosts)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -286,6 +380,73 @@ def set_remote(request: Request, body: RemoteSettings) -> dict:
     return _remote_state(request)
 
 
+class TelegramSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    token: str | None = None
+    notify: bool | None = None
+
+
+def _is_local(request: Request) -> bool:
+    return remote.is_loopback(request.client.host if request.client else None)
+
+
+@app.get("/api/telegram")
+async def get_telegram(request: Request) -> dict:
+    return await run_in_threadpool(telegram_bot.status, _is_local(request))
+
+
+@app.post("/api/telegram")
+async def set_telegram(request: Request, body: TelegramSettings) -> dict:
+    """The bot's token, and whether notices go to the chat too. The token is the key to
+    the bot, so it is set only on the computer itself and never handed back."""
+    local = _is_local(request)
+    if body.token is not None:
+        if not local:
+            raise HTTPException(403, "The bot's token can only be changed on the computer itself.")
+        try:
+            await run_in_threadpool(telegram_bot.save_token, body.token.strip())
+        except telegram_bot.Refused as exc:
+            raise HTTPException(exc.status, exc.message)
+    if body.notify is not None:
+        await run_in_threadpool(telegram_bot.set_notify, body.notify)
+    return await run_in_threadpool(telegram_bot.status, local)
+
+
+async def _telegram_change(request: Request, change) -> dict:
+    # Who may send pages in is decided at the computer, never from a phone link.
+    if not _is_local(request):
+        raise HTTPException(403, "This can only be done on the computer itself.")
+    try:
+        await run_in_threadpool(change)
+    except telegram_bot.Refused as exc:
+        raise HTTPException(exc.status, exc.message)
+    return await run_in_threadpool(telegram_bot.status, True)
+
+
+@app.post("/api/telegram/pair")
+async def pair_telegram(request: Request) -> dict:
+    return await _telegram_change(request, telegram_bot.pair)
+
+
+@app.post("/api/telegram/unpair")
+async def unpair_telegram(request: Request) -> dict:
+    return await _telegram_change(request, telegram_bot.unpair)
+
+
+@app.post("/api/telegram/forget")
+async def forget_telegram(request: Request) -> dict:
+    return await _telegram_change(request, telegram_bot.forget)
+
+
+@app.post("/api/telegram/test")
+async def test_telegram() -> dict:
+    try:
+        await run_in_threadpool(telegram_bot.send_test)
+    except telegram_bot.Refused as exc:
+        raise HTTPException(exc.status, exc.message)
+    return {"sent": True}
+
+
 @app.get("/manifest.webmanifest")
 def web_app_manifest(request: Request) -> Response:
     """What turns the phone link into an icon on the home screen.
@@ -304,18 +465,43 @@ def web_app_manifest(request: Request) -> Response:
     without that attribute this 403s on the phone and no install is ever offered.
     """
     doc = remote.load()
-    start = "/phone"
     supplied = remote.token_from_request(
         request.headers, request.cookies, request.query_params)
-    if doc["enabled"] and remote.token_matches(supplied, doc["token"]):
-        start = f"/phone?{remote.TOKEN_QUERY}={doc['token']}"
+    keyed = doc["enabled"] and remote.token_matches(supplied, doc["token"])
+
+    def inside(path: str) -> str:
+        """A path in the app, carrying the key exactly when start_url does: a shortcut or
+        a share opened months later must not land on "missing its access key"."""
+        return f"{path}?{remote.TOKEN_QUERY}={doc['token']}" if keyed else path
+
+    icon = [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"}]
     return JSONResponse(
         {
             "id": "/phone",
             "name": "Night Reader",
             "short_name": "Night Reader",
-            "description": "Start a posting run from anywhere.",
-            "start_url": start,
+            "description": ("Photograph a chapter, check the pages Claude wasn't sure of, "
+                            "and start posting runs, from anywhere."),
+            "start_url": inside("/phone"),
+            # Long-press on the icon. Inside the scope, like everything here.
+            "shortcuts": [
+                {"name": "Capture a chapter", "short_name": "Capture",
+                 "url": inside("/phone/capture"), "icons": icon},
+                {"name": "Pages to check", "short_name": "Check",
+                 "url": inside("/phone/check"), "icons": icon},
+            ],
+            # Night Reader in the share sheet, for photos and scanner PDFs from Gallery or
+            # Google Photos. The phone's service worker takes the POST (web/public/
+            # phone-sw.js); the route below catches one it missed. `url` and `text` are
+            # what a Google Drive "Share" sends: a link, not the file.
+            "share_target": {
+                "action": inside("/phone/share"),
+                "method": "POST",
+                "enctype": "multipart/form-data",
+                "params": {"title": "title", "text": "text", "url": "url",
+                           "files": [{"name": SHARE_FIELD,
+                                      "accept": ["image/*", "application/pdf", ".pdf"]}]},
+            },
             # "/phone", not "/". Installing this mints an Android WebAPK, and the
             # intent filter Chrome generates for it carries scheme, host and PATH PREFIX
             # but NO port -- so a scope of "/" would register this app as a handler for
@@ -344,6 +530,49 @@ def web_app_manifest(request: Request) -> Response:
         # must never sit in a shared cache or survive a key rotation.
         headers={"Cache-Control": "no-store"},
     )
+
+
+# The worker that keeps a copy of the phone app on the phone (web/public/phone-sw.js),
+# served by a route of its own: through the page fallback, a missing file would come back
+# as the app's HTML, and the phone's registration would fail with a type error that says
+# nothing useful.
+#
+# An escape hatch, should the worker ever leave the phone stuck on a bad copy: with
+# NR_PHONE_SW=off set, or a file named phone-sw.off beside start.bat, the phone is handed
+# a worker that removes itself and its copies, and reloads the app from the computer.
+_PHONE_SW_RESET = """self.addEventListener('install', () => self.skipWaiting())
+self.addEventListener('activate', (event) => event.waitUntil((async () => {
+  await self.registration.unregister()
+  for (const name of await caches.keys()) if (name.startsWith('nr-phone-')) await caches.delete(name)
+  for (const client of await self.clients.matchAll()) client.navigate(client.url)
+})()))
+"""
+
+
+@app.get("/phone-sw.js")
+def phone_service_worker() -> Response:
+    headers = {"Cache-Control": "no-cache"}
+    if os.environ.get("NR_PHONE_SW") == "off" or (PROJECT_ROOT / "phone-sw.off").exists():
+        return Response(_PHONE_SW_RESET, media_type="text/javascript", headers=headers)
+    path = DIST_DIR / "phone-sw.js"
+    if not path.is_file():
+        raise HTTPException(404, "The phone app's offline copy isn't built yet.")
+    return FileResponse(path, media_type="text/javascript", headers=headers)
+
+
+# The form field a share's files arrive in. web/public/phone-sw.js reads the same name.
+SHARE_FIELD = "photos"
+
+
+@app.post("/phone/share")
+def share_missed(request: Request) -> Response:
+    """A share that reached the computer instead of the phone's service worker: one made
+    before the worker was ready, or after the phone's site data was cleared. The files
+    are not read — they are on the phone still, and sharing again is the way — and the
+    phone is sent somewhere that says so, rather than to a bare 405 with no way back."""
+    key = request.query_params.get(remote.TOKEN_QUERY)
+    where = "/phone/share?missed=1" + (f"&{remote.TOKEN_QUERY}={key}" if key else "")
+    return Response(status_code=303, headers={"Location": where})
 
 
 @app.post("/api/remote/test-notification")
@@ -841,6 +1070,8 @@ class Settings(BaseModel):
     model: str | None = None
     effort: str | None = None
     deep_check: str | None = None
+    quick_look: bool | None = None
+    keep_awake: bool | None = None
 
 
 @app.get("/api/settings")
@@ -853,6 +1084,7 @@ def get_settings() -> dict:
         "chunk_threshold": cfg.translation.chunk_threshold,
         "length_ratio_min": cfg.validation.length_ratio_min,
         "length_ratio_max": cfg.validation.length_ratio_max,
+        "quick_look": cfg.phone.quick_look,
     }
 
 
@@ -881,18 +1113,70 @@ def update_settings(s: Settings) -> dict:
             return t.rstrip() + f'\n\n[{section}]\n{key} = "{value}"\n'
         return t
 
+    def setflag(t: str, key: str, value: bool, section: str) -> str:
+        word = "true" if value else "false"
+        pattern = rf'(?m)^(\s*{re.escape(key)}\s*=\s*)(?:true|false)\b'
+        if re.search(pattern, t):
+            return re.sub(pattern, lambda m: m.group(1) + word, t)
+        sec = rf'(?m)^(\[{re.escape(section)}\]\s*\n)'
+        if re.search(sec, t):
+            return re.sub(sec, lambda m: m.group(1) + f'{key} = {word}\n', t, count=1)
+        return t.rstrip() + f'\n\n[{section}]\n{key} = {word}\n'
+
     if s.model is not None:
         text = setkey(text, "model", s.model, section="anthropic")
     if s.effort is not None:
         text = setkey(text, "effort", s.effort, section="anthropic")
     if s.deep_check is not None:
         text = setkey(text, "deep_check", s.deep_check, section="translation")
+    if s.quick_look is not None:
+        text = setflag(text, "quick_look", s.quick_look, section="phone")
+    if s.keep_awake is not None:
+        text = setflag(text, "keep_awake", s.keep_awake, section="phone")
     # Atomic: a half-written config.toml makes load_global_config raise, and every
     # request after that answers 400 — the app becomes unusable until the file is
     # repaired by hand. This is the one file atomic_write_text exists for that wasn't
     # using it.
     atomic_write_text(CONFIG_PATH, text)
     return {"ok": True}
+
+
+def _computer_state() -> dict:
+    try:
+        keep = load_global_config().phone.keep_awake
+    except HTTPException:
+        keep = True
+    return {"autostart": autostart.state(), "keep_awake": keep}
+
+
+@app.get("/api/computer")
+def computer_settings() -> dict:
+    """Whether this computer is always ready for the phone: started with Windows, and
+    kept awake while there is work."""
+    return _computer_state()
+
+
+class ComputerSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    autostart: bool | None = None
+    keep_awake: bool | None = None
+
+
+@app.post("/api/computer")
+def update_computer_settings(body: ComputerSettings, request: Request) -> dict:
+    # Only from the computer itself: how it starts and sleeps is not for the phone link.
+    if not remote.is_loopback(request.client.host if request.client else None):
+        raise HTTPException(403, "These can only be changed on the computer itself.")
+    if body.autostart is not None:
+        if not autostart.supported():
+            raise HTTPException(400, "Starting with the computer is only set up on Windows.")
+        try:
+            autostart.set_on(body.autostart)
+        except OSError as exc:
+            raise HTTPException(500, f"Windows refused the change: {exc}")
+    if body.keep_awake is not None:
+        update_settings(Settings(keep_awake=body.keep_awake))
+    return _computer_state()
 
 
 @app.post("/api/init")
@@ -1325,6 +1609,7 @@ def scans_overview() -> dict:
         if project.get("source_type") != "images" or project.get("archived"):
             continue
         doc = pages_mod.load_pages(project["id"])
+        numbers = [n for n in pages_mod.box_numbers(doc).values() if n]
         novels.append({
             "id": project["id"],
             "name": project.get("name", "Untitled novel"),
@@ -1332,6 +1617,9 @@ def scans_overview() -> dict:
             "built": bool(doc.get("build")),
             "chapter_count": project.get("chapter_count", 0),
             "cost_usd": (doc.get("totals") or {}).get("cost_usd", 0.0),
+            # The number a chapter photographed now would get: what the phone shows as
+            # "Capture Chapter N" before its box exists.
+            "next_number": max(numbers + [pages_mod.chapter_count(doc)]) + 1,
         })
     novels.sort(key=lambda n: (-(n["counts"]["needs-check"] + n["counts"]["new"]), n["name"]))
     return {"novels": novels}
@@ -1390,20 +1678,26 @@ def _require_box_id(batch_id: str) -> None:
         raise HTTPException(404, pages_mod.BOX_GONE)
 
 
-def _rail(doc: dict) -> dict:
+def _rail(doc: dict, slim: bool = False) -> dict:
     """What a change to the pages answers with: the rail exactly as it was saved.
 
     Taken from the doc after mutate_pages has exited, so ``rev`` is the one this change
     was saved under. The client keeps whichever answer is newest, which is what stops
     a slow answer to an earlier change putting the old order back on screen.
+
+    ``slim`` leaves the rail out. The phone sends photos one at a time over mobile data
+    and never shows the rail, and a whole novel's summary on every photo is most of
+    what it would download.
     """
+    if slim:
+        return {"rev": doc["rev"]}
     return {"rev": doc["rev"], "pages": pages_mod.summary(doc)}
 
 
-def _box_answer(doc: dict, box_id: str) -> dict:
-    rail = _rail(doc)
-    return {"batch": next(row for row in rail["pages"]["batches"] if row["id"] == box_id),
-            **rail}
+def _box_answer(doc: dict, box_id: str, slim: bool = False) -> dict:
+    rail = _rail(doc, slim)
+    rows = pages_mod.box_rows(doc) if slim else rail["pages"]["batches"]
+    return {"batch": next(row for row in rows if row["id"] == box_id), **rail}
 
 
 def _unlink_page_files(pid: str, removed: list[dict]) -> None:
@@ -1415,9 +1709,60 @@ def _unlink_page_files(pid: str, removed: list[dict]) -> None:
             pass  # the manifest entry is gone; a stray file is harmless
 
 
+# When a photo last arrived, by any way in: the phone may be about to send more, so the
+# computer stays awake a while after (see _work_pending).
+_last_photo_at = 0.0
+_PHOTO_AWAKE_S = 30 * 60
+
+
+def _work_pending() -> bool:
+    """Whether the computer should stay awake: a job running or waiting out the plan's
+    limit, a hands-free retry timed for later, or a photo in the last half hour."""
+    try:
+        if not load_global_config().phone.keep_awake:
+            return False
+    except Exception:  # noqa: BLE001 — no readable config: nothing to keep awake for
+        return False
+    if any(not job.done for job in list(_jobs.values())) or _retry_timers:
+        return True
+    return time.time() - _last_photo_at < _PHOTO_AWAKE_S
+
+
+def jobs_running() -> int:
+    """How many jobs are still working: what Quit on the icon by the clock would cut
+    short (server/tray.py)."""
+    return sum(1 for job in list(_jobs.values()) if not job.done)
+
+
+def _photo_arrived() -> None:
+    global _last_photo_at
+    _last_photo_at = time.time()
+
+
+def _quick_look(pid: str, doc: dict, page: dict) -> None:
+    """A photo the phone app just took gets a fast first look (server/quick_look.py)."""
+    if quick_look.from_the_phone(pages_mod.find_box(doc, page.get("batch"))):
+        quick_look.request(pid, page["id"], page.get("sha256") or "")
+
+
+async def _image_body(request: Request) -> bytes:
+    """The raw request body, refused once it grows past the image size cap, so an
+    oversized upload is turned away before it is all in memory."""
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > pages_mod.MAX_IMAGE_BYTES:
+            raise HTTPException(
+                413, f"That image is bigger than "
+                     f"{pages_mod.MAX_IMAGE_BYTES // (1024 * 1024)} MB.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @app.post("/api/projects/{pid}/pages")
 async def upload_page(pid: str, request: Request, batch: str = "",
-                      label: str = "", name: str = "") -> dict:
+                      label: str = "", name: str = "", slim: bool = False) -> dict:
     """Add one page image, sent as the raw request body, at the end of chapter box
     ``batch`` — or of a new box at the end of the novel when ``batch`` is empty.
 
@@ -1429,59 +1774,120 @@ async def upload_page(pid: str, request: Request, batch: str = "",
     A box this novel doesn't have is refused, never quietly replaced by a new one: the
     client sends the rest of a drop to the box it started in, so a box deleted
     mid-drop used to split that one chapter into two.
+
+    The bytes decide what the photo is, and the rest is server/intake.py, which every way
+    a photo comes in shares. It runs on a worker thread: it waits on the manifest lock,
+    and waiting on that here stalled every other request.
     """
     require_images_project(pid)
-
-    # Read incrementally so an oversized upload is refused before it is all resident.
-    chunks: list[bytes] = []
-    size = 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > pages_mod.MAX_IMAGE_BYTES:
-            raise HTTPException(
-                413, f"That image is bigger than "
-                     f"{pages_mod.MAX_IMAGE_BYTES // (1024 * 1024)} MB.")
-        chunks.append(chunk)
-    data = b"".join(chunks)
-    if not data:
-        raise HTTPException(400, "No image was uploaded.")
-
-    # The BYTES decide what this is — the Content-Type header is only advisory, and
-    # the client's filename is never trusted for anything but a display label.
-    ext = pages_mod.sniff_image(data[:32])
-    if ext is None:
-        raise HTTPException(400, pages_mod.unsupported_reason(data[:32]))
-    digest = pages_mod.sha256_of(data)
-
-    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
-        existing = pages_mod.find_by_hash(doc, digest)
-        if existing is None:
-            if len(doc.get("pages", [])) >= pages_mod.MAX_PAGES_PER_PROJECT:
-                raise HTTPException(
-                    400, f"This novel already has {pages_mod.MAX_PAGES_PER_PROJECT} pages.")
-            page = pages_mod.add_page(
-                doc, ext=ext, data_len=len(data), digest=digest, name=name,
-                batch=batch or pages_mod.create_box(doc, label)["id"])
-            target = pages_mod.pages_dir(pid) / page["file"]
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-            except OSError as exc:
-                # Raising skips the save, so the manifest never names a file that
-                # isn't there.
-                raise HTTPException(500, f"Couldn't save that image: {exc}")
-
+    data = await _image_body(request)
+    with _box_errors():
+        arrival = await run_in_threadpool(intake.add_photo, pid, data, batch=batch,
+                                          label=label, name=name)
+    doc = arrival.doc
+    if not arrival.duplicate:
+        _photo_arrived()
+        _nudge_hands_free(pid, doc=doc)   # read it now, while it can still be shot again
+        _quick_look(pid, doc, arrival.page)
     numbers = pages_mod.box_numbers(doc)
-    rail = {"total": len(doc["pages"]), **_rail(doc)}
-    if existing is not None:
+    rail = {"total": len(doc["pages"]), **_rail(doc, slim)}
+    if arrival.duplicate:
         # Re-dropping the same folder is a no-op, not a doubled novel. Where the photo
         # already is goes under names of its own, never "batch": a client that takes
         # the drop's box from each answer would send the rest of the drop there.
-        return {"page": dict(existing), "duplicate": True,
+        existing = arrival.page
+        return {"page": existing, "duplicate": True,
                 "existing_batch": existing["batch"],
                 "existing_number": numbers.get(existing["batch"]), **rail}
-    return {"page": dict(page), "duplicate": False, "batch": page["batch"],
-            "number": numbers[page["batch"]], **rail}
+    page = arrival.page
+    # `reopened`: the photo went into a finished phone chapter, which waits for Done
+    # again. The desktop finishes it again once its drop is all in.
+    return {"page": page, "duplicate": False, "batch": page["batch"],
+            "number": numbers[page["batch"]], "reopened": arrival.reopened, **rail}
+
+
+MAX_PDF_BYTES = 150 * 1024 * 1024
+MAX_PDF_PAGES = 150
+
+
+@app.post("/api/projects/{pid}/pages/pdf")
+async def upload_pdf(pid: str, request: Request, batch: str = "", hands_free: bool = False,
+                     origin: str = "", name: str = "", slim: bool = False) -> dict:
+    """A scanner app's PDF, sent as the raw request body: its pages go in, in order, at
+    the end of box ``batch`` — or of a new box — in one save (server/pdf_pages.py splits
+    it). With no ``batch`` and ``hands_free``, the new box is finished at once: one PDF is
+    one chapter. A page already in the novel is left out, so the same PDF twice adds
+    nothing the second time.
+
+    The image endpoint still refuses PDFs: a PDF is many pages, and needs this one.
+    """
+    require_images_project(pid)
+    incoming = pj.PROJECTS_DIR / pid / ".incoming"
+    stem = uuid.uuid4().hex
+    pdf, out = incoming / f"{stem}.pdf", incoming / stem
+    try:
+        incoming.mkdir(parents=True, exist_ok=True)
+        size = 0
+        head = b""
+        with open(pdf, "wb") as fh:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_PDF_BYTES:
+                    raise HTTPException(
+                        413, f"That PDF is bigger than {MAX_PDF_BYTES // (1024 * 1024)} MB. "
+                             f"Send it in parts.")
+                if len(head) < 5:
+                    head += chunk[:5]
+                fh.write(chunk)
+        if not head.startswith(b"%PDF"):
+            raise HTTPException(400, "That isn't a PDF.")
+        out.mkdir()
+        try:
+            files = await run_in_threadpool(pdf_pages.split_in_child, pdf, out, MAX_PDF_PAGES)
+        except pdf_pages.PdfError as exc:
+            raise HTTPException(exc.status, exc.message)
+        base = Path(name or "scan").stem[:60] or "scan"
+        items = [(f"{base}-{i:03d}{path.suffix}", path.read_bytes())
+                 for i, path in enumerate(files, start=1)]
+        with _box_errors():
+            bundle = await run_in_threadpool(
+                intake.add_photos, pid, items, batch=batch, origin=origin or None,
+                hands_free=hands_free, captured=hands_free and not batch)
+    finally:
+        pdf.unlink(missing_ok=True)
+        shutil.rmtree(out, ignore_errors=True)
+    doc = bundle.doc
+    if bundle.added:
+        _photo_arrived()
+        _nudge_hands_free(pid, doc=doc)
+    numbers = pages_mod.box_numbers(doc)
+    return {"added_ids": [p["id"] for p in bundle.added], "duplicates": len(bundle.duplicates),
+            "batch": bundle.batch, "number": numbers.get(bundle.batch) if bundle.batch else None,
+            "reopened": bundle.reopened, "total": len(doc.get("pages", [])), **_rail(doc, slim)}
+
+
+@app.post("/api/projects/{pid}/pages/{page_id}/replace")
+async def replace_page(pid: str, page_id: str, request: Request, name: str = "",
+                       slim: bool = False) -> dict:
+    """Retake in place: a new photo, sent as the raw request body, for page ``page_id``.
+
+    It becomes a new page in the old one's place, and the old page goes (see
+    intake.replace_page). The answer's ``replaced`` names the page that went; sending
+    the same photo again answers with the page as it is, ``replaced`` null.
+    """
+    require_images_project(pid)
+    data = await _image_body(request)
+    with _box_errors():
+        arrival = await run_in_threadpool(intake.replace_page, pid, page_id, data, name=name)
+    doc = arrival.doc
+    if arrival.replaced:
+        _photo_arrived()
+        _nudge_hands_free(pid, doc=doc)
+        _quick_look(pid, doc, arrival.page)
+    numbers = pages_mod.box_numbers(doc)
+    return {"page": arrival.page, "replaced": arrival.replaced,
+            "batch": arrival.page["batch"], "number": numbers.get(arrival.page["batch"]),
+            "total": len(doc["pages"]), **_rail(doc, slim)}
 
 
 @app.get("/api/projects/{pid}/pages")
@@ -1520,6 +1926,7 @@ def move_pages(pid: str, body: MovePages) -> dict:
     require_images_project(pid)
     with _box_errors(), pages_mod.mutate_pages(pid) as doc:
         changed = pages_mod.move_pages(doc, body.ids, body.batch, body.before)
+    _nudge_hands_free(pid, _SETTLE_STRUCTURE, doc)
     return {"ok": True, "changed": changed, **_rail(doc)}
 
 
@@ -1528,16 +1935,26 @@ class NewBox(BaseModel):
     label: str = ""
     after: str | None = None
     ids: list[str] = Field(default_factory=list)
+    # Set by the phone, a share or Telegram, never by the desktop: a hands-free box
+    # builds and translates by itself once its photos are all in.
+    origin: str | None = None
+    hands_free: bool = False
 
 
 @app.post("/api/projects/{pid}/pages/batches")
-def create_page_batch(pid: str, body: NewBox) -> dict:
+def create_page_batch(pid: str, body: NewBox, slim: bool = False) -> dict:
     """Add a chapter box — at the end, or straight after the box ``after`` — and move
-    the photos ``ids`` into it, all in one step (see pages.create_box)."""
+    the photos ``ids`` into it, all in one step (see pages.create_box).
+
+    With an ``origin`` this novel already has, it answers with that box and ``created``
+    false, so a phone resending after a lost answer never makes a second chapter."""
     require_images_project(pid)
     with _box_errors(), pages_mod.mutate_pages(pid) as doc:
-        box = pages_mod.create_box(doc, body.label, after=body.after, ids=body.ids)
-    return _box_answer(doc, box["id"])
+        had = pages_mod.find_box_by_origin(doc, body.origin or "")
+        box = pages_mod.create_box(doc, body.label, after=body.after, ids=body.ids,
+                                   origin=body.origin or None, hands_free=body.hands_free)
+    _nudge_hands_free(pid, _SETTLE_STRUCTURE, doc)
+    return {"created": had is None, **_box_answer(doc, box["id"], slim)}
 
 
 class BoxOrder(BaseModel):
@@ -1552,6 +1969,7 @@ def order_page_batches(pid: str, body: BoxOrder) -> dict:
     require_images_project(pid)
     with _box_errors(), pages_mod.mutate_pages(pid) as doc:
         pages_mod.reorder_boxes(doc, body.ids)
+    _nudge_hands_free(pid, _SETTLE_STRUCTURE, doc)
     return {"ok": True, **_rail(doc)}
 
 
@@ -1567,6 +1985,7 @@ def rename_page_batch(pid: str, batch_id: str, body: BoxRename) -> dict:
     _require_box_id(batch_id)
     with _box_errors(), pages_mod.mutate_pages(pid) as doc:
         pages_mod.rename_box(doc, batch_id, body.label)
+    _nudge_hands_free(pid, _SETTLE_STRUCTURE, doc)
     return _box_answer(doc, batch_id)
 
 
@@ -1577,7 +1996,8 @@ class DeleteBox(BaseModel):
 
 
 @app.post("/api/projects/{pid}/pages/batches/{batch_id}/delete")
-def delete_page_batch(pid: str, batch_id: str, body: DeleteBox | None = None) -> dict:
+def delete_page_batch(pid: str, batch_id: str, body: DeleteBox | None = None,
+                      slim: bool = False) -> dict:
     """Delete an unbuilt chapter box and its photos."""
     require_images_project(pid)
     _require_box_id(batch_id)
@@ -1585,7 +2005,26 @@ def delete_page_batch(pid: str, batch_id: str, body: DeleteBox | None = None) ->
     with _box_errors(), pages_mod.mutate_pages(pid) as doc:
         removed = pages_mod.delete_box(doc, batch_id, expect)
     _unlink_page_files(pid, removed)
-    return {"ok": True, "removed": len(removed), **_rail(doc)}
+    _nudge_hands_free(pid, _SETTLE_STRUCTURE, doc)
+    return {"ok": True, "removed": len(removed), **_rail(doc, slim)}
+
+
+class Captured(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # The chapter number the sender showed while shooting (see pages.set_captured).
+    expect_number: int | None = None
+
+
+@app.post("/api/projects/{pid}/pages/batches/{batch_id}/captured")
+def finish_page_batch(pid: str, batch_id: str, body: Captured | None = None,
+                      slim: bool = False) -> dict:
+    """A hands-free chapter's photos are all in, so it may build. Safe to send twice."""
+    require_images_project(pid)
+    _require_box_id(batch_id)
+    with _box_errors(), pages_mod.mutate_pages(pid) as doc:
+        pages_mod.set_captured(doc, batch_id, body.expect_number if body else None)
+    _nudge_hands_free(pid, doc=doc)
+    return _box_answer(doc, batch_id, slim)
 
 
 class PageWork(BaseModel):
@@ -1653,6 +2092,23 @@ def _release_queued_pages(pid: str, seqs: set[int] | None = None) -> int:
                 rec["status"] = resting[rec["id"]]
                 rec.pop("prior_status", None)
     return len(stranded)
+
+
+def _release_stranded_pages() -> int:
+    """Hand back every page the last run left queued or mid-read, in every novel.
+
+    Run once at startup. One unreadable novel is logged and skipped rather than
+    stopping the app from starting.
+    """
+    released = 0
+    for project in pj.list_projects():
+        if project.get("source_type") != "images" or not project.get("id"):
+            continue
+        try:
+            released += _release_queued_pages(project["id"])
+        except Exception as exc:  # noqa: BLE001 — startup must not fail on one novel
+            errors.log_error(errors.explain(exc), where=f"startup/{project['id']}")
+    return released
 
 
 def _queue_page_work(pid: str, body: PageWork, kind: str) -> dict:
@@ -1799,6 +2255,7 @@ async def stitch_pages(pid: str, body: StitchRequest) -> dict:
         totals["cost_usd"] = round(float(totals.get("cost_usd") or 0.0) + cost, 6)
 
     gaps = sum(1 for f in written if f["join_prev"] == "gap")
+    _nudge_hands_free(pid, doc=live)
     return {"ok": True, "seams": len(written), "asked_model": asked,
             "gaps": gaps, "remaining": len(unsure) - asked, "cost_usd": cost,
             "usage": usage, "pages": pages_mod.summary(live)}
@@ -1850,8 +2307,8 @@ def _english_filed(cfg: Config, state: State):
                           or (state.get(index) or {}).get("status") in _HAS_ENGLISH)
 
 
-def _plan_build(pid: str, cfg: Config, doc: dict, body: BuildChapters
-                ) -> tuple[ocr_build.BoxBuild, list[str]]:
+def _plan_build(pid: str, cfg: Config, doc: dict, body: BuildChapters, *,
+                hold=None) -> tuple[ocr_build.BoxBuild, list[str]]:
     """Work out what a build does, and what it has to say about it.
 
     One path for a real build and a preview, so the dialog shows exactly what pressing
@@ -1880,7 +2337,8 @@ def _plan_build(pid: str, cfg: Config, doc: dict, body: BuildChapters
     shown = pages_mod.box_numbers(doc)
     was_chapter = {box["id"]: box.get("chapter") for box in doc["batches"]}
 
-    res = ocr_build.build_boxes(doc, existing, include=body.include, append=body.append)
+    res = ocr_build.build_boxes(doc, existing, include=body.include, append=body.append,
+                                hold=hold)
     warnings = list(res.warnings)
 
     # Whether the English filed under chapter k was made from the Korean it holds now.
@@ -1995,12 +2453,23 @@ def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
         res, warnings = _plan_build(pid, cfg, pages_mod.load_pages(pid), body)
         return _build_answer(res, warnings, preview=True)
 
+    res, warnings, project = _run_build(pid, cfg, project, body)
+    # A phone chapter built here by hand is translated by itself, as it would have been.
+    _nudge_hands_free(pid)
+    return {**_build_answer(res, warnings, preview=False),
+            "project": project_summary(project)}
+
+
+def _run_build(pid: str, cfg: Config, project: dict, body: BuildChapters, *, hold=None
+               ) -> tuple[ocr_build.BoxBuild, list[str], dict]:
+    """Build the boxes into chapters and record it: the desktop's Build, and the
+    automatic one, which passes hands-free's ``hold``. Raises where a build refuses."""
     # The whole build holds the manifest lock: read, work out, write source.json,
     # record. Built from a copy read without it, an upload, a move or an OCR result
     # landing meanwhile was recorded as built without ever reaching a chapter, and two
     # builds at once could both append the same chapter.
     with pages_mod.mutate_pages(pid) as doc:
-        res, warnings = _plan_build(pid, cfg, doc, body)
+        res, warnings = _plan_build(pid, cfg, doc, body, hold=hold)
         pj.cache_source(pid, res.chapters)
         # A stale cache would translate the PREVIOUS build's chapters.
         _chapter_cache.pop(pid, None)
@@ -2031,8 +2500,7 @@ def build_pages_into_chapters(pid: str, body: BuildChapters) -> dict:
     pj._atomic_write_json(pj.PROJECTS_DIR / pid / "project.json", project)
     _normalize_chapter_padding(pid, total)
     _invalidate_consistency(pid)
-    return {**_build_answer(res, warnings, preview=False),
-            "project": project_summary(project)}
+    return res, warnings, project
 
 
 @app.get("/api/projects/{pid}/pages/{page_id}")
@@ -2113,6 +2581,9 @@ def update_page(pid: str, page_id: str, body: PageUpdate) -> dict:
         # A skip or un-skip moves a seam, and a join set on a chapter's first photo has
         # nothing to join; settle both now, so the answer is what was saved.
         pages_mod.normalize(doc)
+    # A correction arrives as several autosaves, and a typed page counts as approved, so
+    # a chapter waits a while after the last one rather than building half-corrected.
+    _nudge_hands_free(pid, _SETTLE_TEXT if body.text is not None else _SETTLE_STATUS, doc)
     return {**rec, "rev": doc["rev"]}
 
 
@@ -4845,18 +5316,36 @@ class Job:
         # as intermittent 500s that blanked the dashboard. Every touch of `pending` goes
         # through the helpers below.
         self._pending_lock = threading.Lock()
+        # Hands-free: whether a look put work on this job, the chapters it queued to
+        # translate (checked again before each starts, and told about when it ends), and
+        # whether the phone was told this job is waiting for the plan.
+        self.hands_free = False
+        self.hands_free_chapters: set[int] = set()
+        self.told_waiting = False
+        self.novel = ""
 
     # ---- queue access (always under _pending_lock) ----
-    def enqueue(self, items: list[tuple[int, bool, str]]) -> list[int]:
-        """Append (index, force, kind) triples, skipping ones already queued/in-flight."""
+    def enqueue(self, items: list[tuple[int, bool, str]], *,
+                ahead_of_chapters: bool = False) -> list[int]:
+        """Append (index, force, kind) triples, skipping ones already queued/in-flight.
+
+        ``ahead_of_chapters`` puts them before the first chapter waiting, in order:
+        a photo needs reading while the book is still open, and a translation can wait.
+        """
         added = []
         with self._pending_lock:
+            at = next((i for i, (_idx, _f, kind) in enumerate(self.pending)
+                       if kind not in PAGE_TASK_KINDS), len(self.pending))
             for idx, force, kind in items:
                 key = _queue_key(idx, kind)
                 if key in self.queued:
                     continue
                 self.queued.add(key)
-                self.pending.append((idx, force, kind))
+                if ahead_of_chapters:
+                    self.pending.insert(at, (idx, force, kind))
+                    at += 1
+                else:
+                    self.pending.append((idx, force, kind))
                 added.append(idx)
         return added
 
@@ -4881,6 +5370,23 @@ class Job:
             self.pending.clear()
             return dropped
 
+    def resumable(self) -> list[dict]:
+        """The queued chapter work a client may queue again once this job has stopped.
+
+        A paused job is over on the server, so the tab's Resume re-queues what was still
+        waiting. That used to be ``pending``, which mixes in page sequence numbers: queued
+        again as chapters, page 5 became "re-translate chapter 5". And every item went back
+        as a forced translation, so a chapter that was already finished — queued without
+        force, and about to be skipped — was translated again. So only chapter items are
+        listed, each keeping its own kind and force. Nor is a chapter hands-free queued:
+        the server tries those again itself, and a Resume in a tab would translate them
+        twice.
+        """
+        return [{"index": i, "kind": kind, "force": force}
+                for i, force, kind in self.snapshot_pending()
+                if kind not in PAGE_TASK_KINDS
+                and not (kind == TASK_TRANSLATE and i in self.hands_free_chapters)]
+
     def queue_state(self) -> dict:
         pending = self.snapshot_pending()
         # Before anything starts, `kind` is the default and would mislabel a queued
@@ -4890,6 +5396,7 @@ class Job:
             pending[0][2] if pending else self.kind)
         return {"current": self.current, "kind": kind,
                 "pending": [i for i, _, _ in pending],
+                "resumable": self.resumable(),
                 "waiting": self.waiting}
 
     def publish(self, ev: dict) -> None:
@@ -4908,6 +5415,11 @@ class Job:
         console.print_event(self.pid, ev)
         for q in list(self.subscribers):
             q.put_nowait(ev)
+        if self.hands_free:
+            try:
+                _hands_free_heard(self, ev)
+            except Exception as exc:  # noqa: BLE001 — telling the phone never breaks a job
+                errors.log_error(errors.explain(exc), where=f"hands-free/{self.pid}")
 
     def publish_live(self, ev: dict) -> None:
         """Fan out a high-frequency streaming event WITHOUT recording it in history.
@@ -5103,7 +5615,9 @@ def _run_page_task(kind: str, pid: str, page: dict, cfg: Config,
                 "issues": [vars(i) for i in result.issues],
                 "cost_usd": result.cost_usd,
             },
-            "status": (pages_mod.STATUS_NEEDS_CHECK if result.verdict == "discrepancies"
+            # "unclear" means the check gave no answer, which approves nothing.
+            "status": (pages_mod.STATUS_NEEDS_CHECK
+                       if result.verdict in ("discrepancies", "unclear")
                        else pages_mod.STATUS_OK),
             "_usage": result.usage,
             "_cost": result.cost_usd,
@@ -5234,7 +5748,8 @@ async def _run_page_item(job: Job, cfg: Config, idx: int, force: bool, kind: str
             job.done = True
             job.publish({"type": "paused", "index": idx, "message": str(exc),
                          "resets_at": resets_at, "current": None,
-                         "pending": [i for i, _, _ in job.snapshot_pending()]})
+                         "pending": [i for i, _, _ in job.snapshot_pending()],
+                         "resumable": job.resumable()})
             return strikes, "return"
         job.waiting = {"resume_at": resume_at, "resets_at": resets_at,
                        "message": str(exc), "since": time.time()}
@@ -5286,6 +5801,12 @@ async def _run_worker(job: Job, cfg: Config) -> None:
     while not job.cancelled:
         item = job.take_next()
         if item is None:
+            # Hands-free: the queue ran dry, so look for what the work just done made
+            # possible. Anything found goes on this job, and the queue is checked again
+            # with no await before the job ends, so nothing queued meanwhile is dropped.
+            await _look_now(job.pid)
+            if job.pending and not job.cancelled:
+                continue
             break
         idx, force, kind = item
         job.current = idx
@@ -5299,6 +5820,8 @@ async def _run_worker(job: Job, cfg: Config) -> None:
                 return
             if outcome == "break":
                 break
+            # A page just read can finish a chapter, or need a double-check.
+            await _look_now(job.pid)
             continue
         # Refreshed on EVERY item, not only for repairs. `total` decides the pad width
         # of the file this chapter is written to, and a Refresh button press, a newly
@@ -5315,6 +5838,20 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         if ch is None:
             job.queued.discard(_queue_key(idx, kind))
             job.current = None
+            continue
+        # A phone chapter queued to translate is checked again now: a photo that arrived
+        # since opened its box again or changed it, and translated now it would be half a
+        # chapter, or yesterday's text. The next look queues it again once it's rebuilt.
+        if (kind == TASK_TRANSLATE and idx in job.hands_free_chapters
+                and not await run_in_threadpool(_still_translatable, job.pid, idx)):
+            job.hands_free_chapters.discard(idx)
+            job.queued.discard(_queue_key(idx, kind))
+            job.current = None
+            job.publish({"type": "chapter", "index": idx, "kind": kind,
+                         "status": (state.get(idx) or {}).get("status", state_mod.STATUS_PENDING),
+                         "title": ch.title, "refused": True,
+                         "error": "its photos changed after it was queued, so it waits to "
+                                  "be built again"})
             continue
         # Whether this chapter was ALREADY validated on disk before this attempt. Used
         # both to skip non-forced re-runs and to protect a good translation from being
@@ -5392,7 +5929,8 @@ async def _run_worker(job: Job, cfg: Config) -> None:
                 job.done = True
                 job.publish({"type": "paused", "index": idx, "message": str(exc),
                              "resets_at": resets_at,
-                             "current": None, "pending": remaining})
+                             "current": None, "pending": remaining,
+                             "resumable": job.resumable()})
                 return
             job.waiting = {"resume_at": resume_at, "resets_at": resets_at,
                            "message": str(exc), "since": time.time()}
@@ -5564,7 +6102,8 @@ async def start_translation(pid: str, req: TranslateRequest) -> dict:
     return _enqueue_task(pid, cfg, items)
 
 
-def _enqueue_task(pid: str, cfg: Config, items: list[tuple[int, bool, str]]) -> dict:
+def _enqueue_task(pid: str, cfg: Config, items: list[tuple[int, bool, str]], *,
+                  ahead: bool = False) -> dict:
     """Queue work on this novel's single worker, starting one if none is running.
 
     MUST be called from an ``async def`` endpoint: starting a worker schedules an
@@ -5578,13 +6117,13 @@ def _enqueue_task(pid: str, cfg: Config, items: list[tuple[int, bool, str]]) -> 
     existing_id = _active_job_by_project.get(pid)
     if existing_id and existing_id in _jobs and not _jobs[existing_id].done:
         job = _jobs[existing_id]
-        added = job.enqueue(items)
+        added = job.enqueue(items, ahead_of_chapters=ahead)
         if added:
             job.publish({"type": "queued", "added": added})
         return {"job_id": job.id, "queued": added, "already_running": True, **job.queue_state()}
 
     job = Job(uuid.uuid4().hex, pid)
-    added = job.enqueue(items)
+    added = job.enqueue(items, ahead_of_chapters=ahead)
     _spawn_worker(pid, cfg, job)
     return {"job_id": job.id, "queued": added, **job.queue_state()}
 
@@ -5605,6 +6144,9 @@ def cancel_queue(pid: str, req: CancelRequest = CancelRequest()) -> dict:
     A stopped chapter is never marked failed and never overwrites good output.
     """
     require_project(pid)
+    # Stop also stops what the phone sent from carrying on by itself, until Resume —
+    # here or on the phone. Set even with nothing running: Stop means stop.
+    _pause_hands_free(pid)
     jid = _active_job_by_project.get(pid)
     if jid and jid in _jobs and not _jobs[jid].done:
         job = _jobs[jid]
@@ -5637,6 +6179,552 @@ def resume_translation(pid: str) -> dict:
         _jobs[jid].wake.set()
         return {"ok": True, "resumed": True, **_jobs[jid].queue_state()}
     return {"ok": True, "resumed": False}
+
+
+# ---- hands-free: the chapters the phone sends build and translate by themselves -------
+#
+# Nothing here does anything for a novel with no hands-free box. What to read, what holds
+# a chapter and what to say is server/hands_free.py; this is the plumbing. A "look" works
+# out what can happen next and queues it on the novel's one worker, so it streams to the
+# same console and obeys the same Stop. Anything that changes a hands-free novel nudges a
+# look; the worker looks after each page and when its queue runs dry; and a watchdog
+# catches a nudge that was missed, so nudges only decide how soon things happen.
+
+_SETTLE_TEXT = 120.0       # after a text edit: a correction arrives as several autosaves
+_SETTLE_STATUS = 2.0       # after a status change: Looks good, Skip
+_SETTLE_STRUCTURE = 5.0    # after a move, a split, a rename or a delete
+_WATCH_SECONDS = 30.0      # the phone is watching a chapter this long after it last asked
+_WATCH_RECHECK = 45.0      # a problem left to the badges is pushed once nobody is watching
+_WAIT_TOLD_EVERY = 12 * 3600.0   # "waiting for your plan", at most this often per novel
+_RESUME_RECENT = 24 * 3600.0     # at startup, only novels with photos this recent carry on
+_WATCHDOG_EVERY = 600.0          # a missed nudge is caught within this long
+
+_looks: dict[str, asyncio.Future] = {}
+_look_again: set[str] = set()
+_settle_timers: dict[str, tuple[float, asyncio.TimerHandle]] = {}
+_retry_timers: dict[str, asyncio.TimerHandle] = {}
+_watching: dict[str, dict[str, float]] = {}      # pid -> box -> when the phone last asked
+_limit_told: dict[str, float] = {}
+_gave_up: dict[str, dict] = {}
+
+
+@dataclass
+class _Look:
+    cfg: Config
+    novel: str
+    work: list[tuple[str, str, str, dict]]   # page id, the status planned on, kind, marks
+    translate: list[int]
+    notices: list[tuple[str, str]]
+    recheck: bool
+
+
+def _live_job(pid: str) -> "Job | None":
+    job = _jobs.get(_active_job_by_project.get(pid) or "")
+    return job if job is not None and not job.done else None
+
+
+def _nudge_hands_free(pid: str, settle: float = 0.0, doc: dict | None = None) -> None:
+    """Ask for a look at this novel, now or ``settle`` seconds after the last change.
+
+    Safe from any thread, and never blocks: it only schedules. Does nothing when the app
+    isn't serving, or when ``doc`` shows the novel has no hands-free box. Never call it
+    while holding the manifest lock — a look takes that lock.
+    """
+    if doc is not None and not hands_free.any_boxes(doc):
+        return
+    loop = _LOOP
+    if loop is None or loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(_schedule_look, pid, settle)
+    except RuntimeError:
+        pass  # the loop is closing
+
+
+def _schedule_look(pid: str, settle: float) -> None:
+    """On the loop. A settle delay holds the build back, never the reading: while one
+    is pending, looks still queue reads and translations but build nothing. A later
+    deadline wins, so a quick status change can't cut short the wait after a text edit."""
+    if settle <= 0:
+        _start_look(pid)
+        return
+    loop = asyncio.get_running_loop()
+    due = loop.time() + settle
+    pending = _settle_timers.get(pid)
+    if pending is not None:
+        if pending[0] >= due:
+            return
+        pending[1].cancel()
+    _settle_timers[pid] = (due, loop.call_later(settle, _settled, pid))
+
+
+def _settled(pid: str) -> None:
+    _settle_timers.pop(pid, None)
+    _start_look(pid)
+
+
+def _start_look(pid: str) -> None:
+    task = asyncio.ensure_future(_look_now(pid))
+    _running_tasks.add(task)
+    task.add_done_callback(_running_tasks.discard)
+
+
+def _drop_hands_free_timers(pid: str) -> None:
+    pending = _settle_timers.pop(pid, None)
+    if pending is not None:
+        pending[1].cancel()
+    retry = _retry_timers.pop(pid, None)
+    if retry is not None:
+        retry.cancel()
+    _gave_up.pop(pid, None)
+
+
+def _drop_all_hands_free_timers() -> None:
+    for pid in list(_settle_timers) + list(_retry_timers):
+        _drop_hands_free_timers(pid)
+
+
+async def _look_now(pid: str) -> tuple[int, int]:
+    """One look at this novel: or, if one is already running, wait for it — it looks
+    once more, so what changed meanwhile is seen. Returns (pages, chapters) queued."""
+    running = _looks.get(pid)
+    if running is not None and not running.done():
+        _look_again.add(pid)
+        try:
+            return await asyncio.shield(running)
+        except Exception:  # noqa: BLE001 — logged by the look itself
+            return 0, 0
+    task = asyncio.ensure_future(_look_loop(pid))
+    _looks[pid] = task
+    task.add_done_callback(lambda t: _looks.pop(pid, None) if _looks.get(pid) is t else None)
+    try:
+        return await asyncio.shield(task)
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
+async def _look_loop(pid: str) -> tuple[int, int]:
+    pages_queued = chapters_queued = 0
+    while True:
+        _look_again.discard(pid)
+        try:
+            more_pages, more_chapters = await _look_once(pid)
+        except Exception as exc:  # noqa: BLE001 — one bad look must not stop the next
+            errors.log_error(errors.explain(exc), where=f"hands-free/{pid}")
+            more_pages = more_chapters = 0
+        pages_queued += more_pages
+        chapters_queued += more_chapters
+        if pid not in _look_again:
+            return pages_queued, chapters_queued
+
+
+async def _look_once(pid: str) -> tuple[int, int]:
+    job = _live_job(pid)
+    busy: set[int] = set()
+    if job is not None:
+        if job.current is not None and job.kind == TASK_TRANSLATE:
+            busy.add(job.current)
+        busy |= {i for i, _f, kind in job.snapshot_pending() if kind == TASK_TRANSLATE}
+    now = time.time()
+    watched = {box for box, at in (_watching.get(pid) or {}).items()
+               if now - at < _WATCH_SECONDS}
+    look = await run_in_threadpool(_hands_free_plan, pid, build_allowed=pid not in _settle_timers,
+                                   busy=busy, watched=watched)
+    if look is None:
+        return 0, 0
+    # Claimed under the lock, after checking Stop again: the plan took a while, and a
+    # page the reader approved meanwhile must not be double-checked back to "to check".
+    claimed, stopped = await run_in_threadpool(_claim_hands_free_pages, pid, look.work)
+    if stopped:
+        return 0, 0
+    pages_queued = chapters_queued = 0
+    if claimed:
+        try:
+            result = _enqueue_task(pid, look.cfg, [(seq, True, kind) for seq, kind in claimed],
+                                   ahead=True)
+        except Exception:
+            await run_in_threadpool(_release_queued_pages, pid, {seq for seq, _k in claimed})
+            raise
+        took = {int(i) for i in result.get("queued") or []}
+        missed = {seq for seq, _k in claimed if seq not in took}
+        if missed:
+            await run_in_threadpool(_release_queued_pages, pid, missed)
+        pages_queued = len(took)
+        _adopt_job(result, look.novel)
+    if look.translate:
+        result = _enqueue_task(pid, look.cfg, [(k, False, TASK_TRANSLATE) for k in look.translate])
+        added = [int(i) for i in result.get("queued") or []]
+        job = _adopt_job(result, look.novel)
+        if job is not None:
+            job.hands_free_chapters.update(added)
+        chapters_queued = len(added)
+    for title, body in look.notices:
+        remote.notify(title, body)
+    if look.recheck:
+        _nudge_hands_free(pid, _WATCH_RECHECK)
+    if pages_queued or chapters_queued:
+        _gave_up.pop(pid, None)
+    return pages_queued, chapters_queued
+
+
+def _adopt_job(result: dict, novel: str) -> "Job | None":
+    job = _jobs.get(result.get("job_id") or "")
+    if job is not None:
+        job.hands_free = True
+        job.novel = novel
+    return job
+
+
+def _hands_free_plan(pid: str, *, build_allowed: bool, busy: set[int],
+                     watched: set[str]) -> _Look | None:
+    """Work out what can happen next for this novel's hands-free chapters. Blocking:
+    always run in the thread pool. Builds what is ready (unless a settle delay is
+    pending), and records what the phone is about to be told."""
+    project = pj.get_project(pid)
+    if not project or project.get("source_type") != "images":
+        return None
+    doc = pages_mod.load_pages(pid)
+    if not hands_free.any_boxes(doc) or hands_free.paused(doc):
+        return None
+    cfg = pj.project_config(load_global_config(), project)
+    novel = project.get("name") or "Your novel"
+    state = State.load(cfg.paths.state_file)
+    has_english = _english_filed(cfg, state)
+
+    def hold(box: dict, pages: list[dict], number: int) -> str | None:
+        return hands_free.auto_hold(box, pages, number, has_english=has_english,
+                                    translating=busy)
+
+    refused = ""
+    if build_allowed and hands_free.worth_building(doc):
+        try:
+            _run_build(pid, cfg, project, BuildChapters(), hold=hold)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                refused = str(exc.detail)
+        doc = pages_mod.load_pages(pid)
+        state = State.load(cfg.paths.state_file)
+        has_english = _english_filed(cfg, state)
+    # Where every box stands now, with the same holds. A preview writes nothing.
+    try:
+        preview, _warnings = _plan_build(pid, cfg, copy.deepcopy(doc),
+                                         BuildChapters(preview=True), hold=hold)
+        waiting = preview.waiting
+    except HTTPException as exc:
+        waiting = []
+        refused = refused or str(exc.detail)
+
+    def image_exists(page: dict) -> bool:
+        return pages_mod.resolve_page_file(pid, page["id"], doc) is not None
+
+    work = hands_free.page_work(doc, image_exists=image_exists)
+    items = ([(p["id"], pages_mod.STATUS_NEW, TASK_OCR, {}) for p in work.reads]
+             + [(p["id"], pages_mod.STATUS_FAILED, TASK_OCR, {"auto_retried": True})
+                for p in work.retries]
+             + [(p["id"], p.get("status") or "", TASK_OCR_VERIFY, {}) for p in work.verifies])
+    chapters = {c.index: c for c in get_chapters(pid, cfg)}
+    translate = [k for k in hands_free.to_translate(
+        doc, chapters=chapters, is_korean=lambda c: classify(c, cfg) == "korean",
+        has_english=has_english, state_of=lambda k: (state.get(k) or {}).get("status"))
+        if k not in busy]
+
+    held = hands_free.needs_reader(doc, waiting, image_exists=image_exists, refused=refused)
+    fresh = hands_free.untold(doc, held)
+    # A problem in a chapter the phone is showing right now is on its badges already.
+    # It is pushed if it is still there once nobody is watching.
+    later = [h for h in fresh if h.box in watched]
+    now = [h for h in fresh if h.box not in watched]
+    notices = []
+    if now:
+        with pages_mod.mutate_pages(pid) as live:
+            hands_free.mark_told(live, now)
+        notices.append(hands_free.notice_needs_you(novel, now))
+    return _Look(cfg=cfg, novel=novel, work=items, translate=translate, notices=notices,
+                 recheck=bool(later))
+
+
+def _claim_hands_free_pages(pid: str, work: list[tuple[str, str, str, dict]]
+                            ) -> tuple[list[tuple[int, str]], bool]:
+    """Mark the planned pages queued, each only if it still has the status it was
+    planned on and is still in a hands-free box. Returns what was claimed, and whether
+    Stop was pressed meanwhile."""
+    if hands_free.paused(pages_mod.load_pages(pid)):
+        return [], True
+    if not work:
+        return [], False
+    claimed: list[tuple[int, str]] = []
+    with pages_mod.mutate_pages(pid) as doc:
+        if hands_free.paused(doc):
+            return [], True
+        for page_id, status, kind, marks in work:
+            rec = pages_mod.find_page(doc, page_id)
+            box = pages_mod.find_box(doc, rec.get("batch")) if rec is not None else None
+            if (rec is None or box is None or not pages_mod.is_hands_free(box)
+                    or (rec.get("status") or pages_mod.STATUS_NEW) != status):
+                continue
+            rec["prior_status"] = status
+            rec["status"] = pages_mod.STATUS_QUEUED
+            rec.update(marks)
+            claimed.append((int(rec["seq"]), kind))
+    return claimed, False
+
+
+def _still_translatable(pid: str, k: int) -> bool:
+    return hands_free.still_translatable(pages_mod.load_pages(pid), k)
+
+
+def _hands_free_heard(job: "Job", ev: dict) -> None:
+    """What a hands-free job's events mean for the phone. On the loop, from publish."""
+    kind = ev.get("type")
+    if kind == "chapter":
+        idx = ev.get("index")
+        if (ev.get("kind") != TASK_TRANSLATE or idx not in job.hands_free_chapters
+                or ev.get("aborted") or ev.get("skipped") or ev.get("refused")):
+            return
+        job.hands_free_chapters.discard(idx)
+        if ev.get("status") == "failed":
+            remote.notify(*hands_free.notice_failed(job.novel, idx, ev.get("error") or ""))
+        else:
+            flagged = (len(ev.get("failures") or [])
+                       if ev.get("status") == state_mod.STATUS_NEEDS_REVIEW else 0)
+            remote.notify(*hands_free.notice_translated(job.novel, idx, ev.get("title") or "",
+                                                        flagged))
+    elif kind == "waiting":
+        now = time.time()
+        if job.told_waiting or now - _limit_told.get(job.pid, 0.0) < _WAIT_TOLD_EVERY:
+            return
+        job.told_waiting = True
+        _limit_told[job.pid] = now
+        at = ev.get("resume_at")
+        remote.notify(*hands_free.notice_waiting(
+            job.novel, time.strftime("%H:%M", time.localtime(at)) if at else ""))
+    elif kind == "paused":
+        retry_at = _schedule_hands_free_retry(job.pid, ev.get("resets_at"))
+        remote.notify(*hands_free.notice_gave_up(
+            job.novel, time.strftime("%H:%M", time.localtime(retry_at)) if retry_at else ""))
+
+
+def _schedule_hands_free_retry(pid: str, resets_at: float | None) -> float | None:
+    """After the plan's limit made a job give up, try once more when it should have
+    reset, or in six hours. On the loop."""
+    loop = _LOOP
+    if loop is None:
+        return None
+    now = time.time()
+    if resets_at and now < resets_at <= now + 7 * 86400:
+        delay = resets_at + _RATE_LIMIT_BUFFER - now
+    else:
+        delay = 6 * 3600.0
+    old = _retry_timers.pop(pid, None)
+    if old is not None:
+        old.cancel()
+    _retry_timers[pid] = loop.call_later(delay, _retry_hands_free, pid)
+    _gave_up[pid] = {"retry_at": now + delay}
+    return now + delay
+
+
+def _retry_hands_free(pid: str) -> None:
+    _retry_timers.pop(pid, None)
+    _start_look(pid)
+
+
+def _pause_hands_free(pid: str) -> bool:
+    """Stop: what the phone sent stops carrying on by itself until Resume. Kept in
+    pages.json, so a restart doesn't undo it. Any thread."""
+    if not hands_free.any_boxes(pages_mod.load_pages(pid)):
+        return False
+    with pages_mod.mutate_pages(pid) as doc:
+        if not doc.get("hands_free_paused_at"):
+            doc["hands_free_paused_at"] = pages_mod.now_iso()
+    loop = _LOOP
+    if loop is not None and not loop.is_closed():
+        try:
+            loop.call_soon_threadsafe(_drop_hands_free_timers, pid)
+        except RuntimeError:
+            pass
+    return True
+
+
+def _unpause_hands_free(pid: str) -> None:
+    if not pages_mod.load_pages(pid).get("hands_free_paused_at"):
+        return
+    with pages_mod.mutate_pages(pid) as doc:
+        doc.pop("hands_free_paused_at", None)
+
+
+@app.post("/api/projects/{pid}/hands-free/resume")
+async def resume_hands_free(pid: str) -> dict:
+    """Let what the phone sent carry on by itself again: after Stop, or now rather than
+    later after the plan's limit made it give up."""
+    require_images_project(pid)
+    await run_in_threadpool(_unpause_hands_free, pid)
+    _drop_hands_free_timers(pid)
+    pages_queued, chapters_queued = await _look_now(pid)
+    return {"ok": True, "queued_pages": pages_queued, "queued_chapters": chapters_queued}
+
+
+def _hands_free_novels(recent: float | None = None) -> list[str]:
+    """Novels with hands-free work that isn't stopped; with ``recent``, only those whose
+    photos changed within that many seconds."""
+    out = []
+    now = time.time()
+    for project in pj.list_projects():
+        pid = project.get("id")
+        if project.get("source_type") != "images" or not pid:
+            continue
+        if recent is not None:
+            try:
+                if now - pages_mod.pages_file(pid).stat().st_mtime > recent:
+                    continue
+            except OSError:
+                continue
+        doc = pages_mod.load_pages(pid)
+        if hands_free.any_boxes(doc) and not hands_free.paused(doc):
+            out.append(pid)
+    return out
+
+
+async def _resume_hands_free() -> None:
+    """At startup: carry on with what the phone sent before the app stopped. Only novels
+    active in the last day, and never one that was stopped, so a restart never starts
+    spending on work nobody is waiting for."""
+    try:
+        pids = await run_in_threadpool(_hands_free_novels, _RESUME_RECENT)
+    except Exception as exc:  # noqa: BLE001
+        errors.log_error(errors.explain(exc), where="hands-free/startup")
+        return
+    for pid in pids:
+        pages_queued, chapters_queued = await _look_now(pid)
+        if pages_queued or chapters_queued:
+            project = pj.get_project(pid) or {}
+            remote.notify(*hands_free.notice_back(project.get("name") or "Your novel",
+                                                  pages_queued, chapters_queued))
+
+
+async def _hands_free_watchdog() -> None:
+    """Every few minutes, look at hands-free novels with nothing running. A request cut
+    off after it saved but before it nudged would otherwise leave a chapter waiting."""
+    while True:
+        await asyncio.sleep(_WATCHDOG_EVERY)
+        try:
+            for pid in await run_in_threadpool(_hands_free_novels):
+                if _live_job(pid) is None and pid not in _settle_timers:
+                    await _look_now(pid)
+            cutoff = time.time() - _WATCH_SECONDS
+            for pid in list(_watching):
+                _watching[pid] = {b: t for b, t in _watching[pid].items() if t > cutoff}
+                if not _watching[pid]:
+                    _watching.pop(pid, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            errors.log_error(errors.explain(exc), where="hands-free/watchdog")
+
+
+def _progress_for(project: dict, box: str | None = None) -> dict | None:
+    """Where each of one novel's hands-free chapters stands, and with ``box`` each photo
+    of that chapter. Blocking."""
+    pid = project["id"]
+    doc = pages_mod.load_pages(pid)
+    if not hands_free.any_boxes(doc):
+        return None
+    cfg = pj.project_config(load_global_config(), project)
+    state = State.load(cfg.paths.state_file)
+    has_english = _english_filed(cfg, state)
+    job = _live_job(pid)
+    translating = ({job.current} if job is not None and job.current is not None
+                   and job.kind == TASK_TRANSLATE else set())
+    queued = ({i for i, _f, kind in job.snapshot_pending() if kind == TASK_TRANSLATE}
+              if job is not None else set())
+
+    def hold(box: dict, pages: list[dict], number: int) -> str | None:
+        return hands_free.auto_hold(box, pages, number, has_english=has_english,
+                                    translating=translating | queued)
+
+    refused = ""
+    try:
+        preview, _warnings = _plan_build(pid, cfg, copy.deepcopy(doc),
+                                         BuildChapters(preview=True), hold=hold)
+        waiting = preview.waiting
+    except HTTPException as exc:
+        waiting, refused = [], str(exc.detail)
+
+    def image_exists(page: dict) -> bool:
+        return pages_mod.resolve_page_file(pid, page["id"], doc) is not None
+
+    held = hands_free.needs_reader(doc, waiting, image_exists=image_exists, refused=refused)
+    rows = hands_free.status_rows(
+        doc, waiting, held, translating=translating, queued=queued,
+        state_of=lambda k: (state.get(k) or {}).get("status"), has_english=has_english)
+    out = {"pid": pid, "name": project.get("name") or "", "stopped": hands_free.paused(doc),
+           "paused_at": doc.get("hands_free_paused_at") or "", "chapters": rows}
+    if box:
+        out["photos"] = hands_free.photo_rows(doc, box, looks_on=cfg.phone.quick_look)
+    return out
+
+
+def _progress(only: str | None, box: str | None = None) -> list[dict]:
+    projects = [pj.get_project(only)] if only else pj.list_projects()
+    out = []
+    for project in projects:
+        if not project or project.get("source_type") != "images" or project.get("archived"):
+            continue
+        try:
+            row = _progress_for(project, box if only else None)
+        except Exception as exc:  # noqa: BLE001 — one unreadable novel hides only itself
+            errors.log_error(errors.explain(exc), where=f"hands-free/progress/{project.get('id')}")
+            continue
+        if row is not None:
+            out.append(row)
+    return out
+
+
+@app.get("/api/phone/progress")
+async def phone_progress(pid: str = "", box: str = "") -> dict:
+    """Where the chapters sent from the phone stand, for every novel or one.
+
+    Asked with ``box`` while the phone shows that chapter, which also holds back the
+    push for a problem in it: the phone's badges are already showing it.
+    """
+    if pid and box:
+        _watching.setdefault(pid, {})[box] = time.time()
+    novels = await run_in_threadpool(_progress, pid or None, box or None)
+    for novel in novels:
+        job = _live_job(novel["pid"])
+        novel["waiting"] = job.waiting if job is not None else None
+        novel["gave_up"] = _gave_up.get(novel["pid"])
+    return {"novels": novels}
+
+
+# The phone's quick looks need the novel's config, and wake hands-free when one lands: a
+# photo the look doubts is double-checked even after a confident read.
+quick_look.configure(
+    config=lambda pid: pj.project_config(load_global_config(), require_project(pid)),
+    looked=lambda pid: _nudge_hands_free(pid))
+
+
+class _TelegramHooks:
+    """What the Telegram bot needs from the app (server/telegram_bot.py), which it can't
+    import. Called on the bot's own thread."""
+
+    hostname = socket.gethostname()
+
+    @staticmethod
+    def novels() -> list[dict]:
+        return scans_overview()["novels"]
+
+    @staticmethod
+    def nudge(pid: str) -> None:
+        _photo_arrived()
+        _nudge_hands_free(pid)
+
+    @staticmethod
+    def progress(pid: str) -> dict | None:
+        rows = _progress(pid)
+        return rows[0] if rows else None
+
+
+telegram_bot.configure(_TelegramHooks())
 
 
 @app.get("/api/queue")

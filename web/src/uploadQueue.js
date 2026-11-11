@@ -154,6 +154,7 @@ async function pump() {
       if (!job.stopped) {
         jobs = jobs.filter((j) => j !== job)
         finished = [...finished, job]
+        if (job.reopened) refinish(job)
       }
       emit()
     }
@@ -185,11 +186,23 @@ async function send(job, gen) {
     } else {
       job.added += 1
       if (res.number != null) job.number = res.number
+      // The photo went into a finished phone chapter, which now waits for Done again.
+      if (res.reopened) job.reopened = true
     }
     for (const answer of answerers) answer(res.pages, job.pid)
     job.next += 1
     emit()
   }
+}
+
+// A drop that went into a finished phone chapter opened it again, since a photo arriving
+// there usually means more are coming. This drop is all in, so the chapter is finished
+// again, as it was. One that stopped part way leaves it open, to be finished by hand.
+async function refinish(job) {
+  try {
+    const res = await api.markCaptured(job.pid, job.batch)
+    for (const answer of answerers) answer(res.pages, job.pid)
+  } catch { /* the chapter shows Finish, which does the same */ }
 }
 
 /**

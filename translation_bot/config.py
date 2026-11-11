@@ -79,12 +79,22 @@ class ValidationConfig(BaseModel):
     dialogue_tolerance: int = 3
 
 
+class PhoneConfig(BaseModel):
+    # A fast first look at each photo taken in the phone app, by a small model, so a
+    # photo that can't be read is flagged while the book is still open at that page.
+    quick_look: bool = True
+    quick_look_model: str = "claude-haiku-4-5-20251001"
+    # Ask Windows not to sleep while there is work for the phone (server/keep_awake.py).
+    keep_awake: bool = True
+
+
 class Config(BaseModel):
     anthropic: AnthropicConfig = Field(default_factory=AnthropicConfig)
     google: GoogleConfig = Field(default_factory=GoogleConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     translation: TranslationConfig = Field(default_factory=TranslationConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    phone: PhoneConfig = Field(default_factory=PhoneConfig)
 
     @classmethod
     def load(cls, path: str | Path = "config.toml") -> "Config":

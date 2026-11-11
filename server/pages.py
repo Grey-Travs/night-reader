@@ -77,9 +77,15 @@ _ID_RE = re.compile(r"^[a-f0-9]{8}$")
 _UNSAFE_LABEL_RE = re.compile(r"[^\w .\-()\[\]]", re.UNICODE)
 
 BOX_GONE = "That chapter box isn't in this novel any more."
+# A hands-free box's origin names where its photos come from ("phone:<token>",
+# "tg:<token>"), so a retried create finds the box it already made.
+_ORIGIN_RE = re.compile(r"^[A-Za-z0-9:_-]{1,64}$")
+CAPTURING = ("This chapter is still being photographed. When every page is in, tap Done "
+             "on the phone or press Finish.")
 _BOX_LOCKED = ("Those photos were built into chapters before chapter boxes existed, so "
                "they can't be moved or added to. Start over rebuilds the novel from "
                "chapter boxes.")
+BOX_LOCKED = _BOX_LOCKED
 
 
 class BoxError(Exception):
@@ -359,6 +365,24 @@ def find_box(doc: dict, box_id: str) -> dict | None:
     return None
 
 
+def is_hands_free(box: dict) -> bool:
+    """Made by the phone, a share, a phone PDF or Telegram, and built and translated
+    without anyone pressing a button. The desktop never makes one."""
+    return box.get("hands_free") is True
+
+
+def is_capturing(box: dict) -> bool:
+    """A hands-free box whose photos may still be arriving. It never builds, whoever
+    asks: the guarantee that half a chapter is never built."""
+    return is_hands_free(box) and not box.get("captured_at")
+
+
+def find_box_by_origin(doc: dict, origin: str) -> dict | None:
+    if not origin:
+        return None
+    return next((box for box in doc.get("batches", []) if box.get("origin") == origin), None)
+
+
 def is_built(box: dict) -> bool:
     """A numbered chapter, or a legacy pile. Either way its chapters exist in
     source.json under fixed numbers, so the box keeps its place: nothing moves it, and
@@ -489,14 +513,20 @@ def box_blockers(box: dict, pages: list[dict], *, include: str = "approved") -> 
     refusal sent them to delete the box.
     """
     built = is_built(box)
+    # First, and whatever ``include`` says: a box still being photographed is missing
+    # pages nobody has seen yet. Its other problems are still listed, so a bad photo is
+    # known about while the chapter can still be shot again.
+    out = [_blocker("capturing", [], CAPTURING)] if is_capturing(box) else []
     if not pages:
+        if out:
+            return out
         return [_blocker("empty", [], (
             "This chapter has no photos left. Built chapters keep their place, so add "
             "its photos back, or use Start over." if built else
             "No photos yet. Add this chapter's photos, or delete the box."))]
     live = live_pages(pages)
     if not live:
-        return [_blocker("all-skipped", pages, (
+        return out + [_blocker("all-skipped", pages, (
             "Every photo in this chapter is marked Skip. Un-skip the ones that belong "
             "in it. If none do, delete or move the skipped photos, then use Start over, "
             "which removes a chapter with no photos left." if built else
@@ -530,7 +560,6 @@ def box_blockers(box: dict, pages: list[dict], *, include: str = "approved") -> 
          "{who} need checking. Check their text and press Looks good, or include "
          "photos marked to check when you build."),
     )
-    out = []
     for kind, group, one, many in groups:
         if group:
             message = (one if len(group) == 1 else many).format(who=page_names(group, pages))
@@ -549,6 +578,8 @@ def box_state(box: dict, pages: list[dict], blockers: list[dict]) -> str:
             return "built"
         return "changed-waiting" if blockers else "changed"
     kinds = {b["kind"] for b in blockers}
+    if "capturing" in kinds:
+        return "capturing"
     if "empty" in kinds:
         return "empty"
     if "all-skipped" in kinds:
@@ -577,6 +608,13 @@ def box_rows(doc: dict) -> list[dict]:
             covered = legacy_chapters(doc)
             if covered:
                 row["chapters"] = [covered[0], covered[-1]]
+        if is_hands_free(box):
+            # Only on hands-free boxes, the way ``legacy`` is, so every other row is
+            # exactly what it was.
+            row["hands_free"] = True
+            row["origin"] = box.get("origin") or ""
+            row["captured_at"] = box.get("captured_at") or None
+            row["expect_number"] = box.get("expect_number")
         rows.append(row)
     return rows
 
@@ -644,6 +682,26 @@ def reopen_seams(doc: dict, page: dict) -> None:
 
 # ---- keeping the manifest straight -------------------------------------------
 
+def _normalize_hands_free(box: dict) -> None:
+    """Keep a box's hands-free fields only in the shapes they are written in, and none
+    of them on a box that isn't hands-free, so a desktop box is never touched."""
+    if box.get("hands_free") is not True:
+        for key in ("hands_free", "origin", "captured_at", "notified", "expect_number"):
+            box.pop(key, None)
+        return
+    if not (isinstance(box.get("origin"), str) and _ORIGIN_RE.match(box["origin"])):
+        box.pop("origin", None)
+    if not (isinstance(box.get("captured_at"), str) and box["captured_at"]):
+        box.pop("captured_at", None)
+    notified = box.get("notified")
+    if isinstance(notified, list) and any(isinstance(key, str) for key in notified):
+        box["notified"] = list(dict.fromkeys(key for key in notified if isinstance(key, str)))
+    else:
+        box.pop("notified", None)
+    if not _positive_int(box.get("expect_number")):
+        box.pop("expect_number", None)
+
+
 def normalize(doc: dict) -> dict:
     """Restore the manifest's invariants in place, and return it.
 
@@ -693,6 +751,7 @@ def normalize(doc: dict) -> dict:
             box["legacy"] = True
         else:
             box.pop("legacy", None)
+        _normalize_hands_free(box)
         chapter = box.get("chapter")
         if box.get("legacy") or not _positive_int(chapter) or chapter in claimed:
             box["chapter"] = None
@@ -747,6 +806,9 @@ def normalize(doc: dict) -> dict:
 
     doc["pages"] = pages
     doc["batches"] = boxes
+    # Stop on hands-free work, kept until Resume (see server/hands_free.py).
+    if not (isinstance(doc.get("hands_free_paused_at"), str) and doc["hands_free_paused_at"]):
+        doc.pop("hands_free_paused_at", None)
     return doc
 
 
@@ -905,7 +967,8 @@ def _moving(doc: dict, ids: list[str]) -> list[dict]:
 
 
 def create_box(doc: dict, label: str = "", *, after: str | None = None,
-               ids: list[str] | None = None) -> dict:
+               ids: list[str] | None = None, origin: str | None = None,
+               hands_free: bool = False) -> dict:
     """Add a chapter box — at the end, or straight after ``after`` — and move ``ids``
     into it, in that order, and return it.
 
@@ -914,7 +977,21 @@ def create_box(doc: dict, label: str = "", *, after: str | None = None,
     any unbuilt one; anything earlier would put a new chapter between two built ones,
     and it is refused rather than nudged along, which would quietly carry the photos
     away from the chapter they were split off.
+
+    ``hands_free`` boxes come from the phone, a share or Telegram. One made with an
+    ``origin`` this novel already has is the box that create made before, returned as
+    it is: a phone that resends after a dropped answer must not get a second chapter.
+
+    Photos split off a hands-free box make a hands-free box, finished if theirs was —
+    so splitting a phone chapter gives two phone chapters. Not while their box is still
+    being photographed: its later photos would land in the first half, after the split.
     """
+    if origin:
+        if not _ORIGIN_RE.match(origin):
+            raise BoxError(400, "That chapter's origin can't be used.")
+        existing = find_box_by_origin(doc, origin)
+        if existing is not None:
+            return existing
     boxes = doc.setdefault("batches", [])
     at = len(boxes)
     if after:
@@ -929,6 +1006,17 @@ def create_box(doc: dict, label: str = "", *, after: str | None = None,
     moving = _moving(doc, ids or [])
     box = {"id": _fresh_id({b["id"] for b in boxes}), "label": clean_title(label),
            "at": now_iso(), "count": 0, "chapter": None, "built_sig": None}
+    sources = [find_box(doc, page.get("batch")) for page in moving]
+    if any(source is not None and is_capturing(source) for source in sources):
+        raise BoxError(409, "That chapter is still being photographed. Finish it first, "
+                            "then split it.")
+    if hands_free or origin:
+        box["hands_free"] = True
+        if origin:
+            box["origin"] = origin
+    elif sources and all(source is not None and is_hands_free(source) for source in sources):
+        box["hands_free"] = True
+        box["captured_at"] = min(source["captured_at"] for source in sources)
     boxes.insert(at, box)
     if moving:
         move_pages(doc, [page["id"] for page in moving], box["id"])
@@ -947,6 +1035,38 @@ def rename_box(doc: dict, box_id: str, label: str) -> dict:
         raise BoxError(409, _BOX_LOCKED)
     box["label"] = clean_title(label)
     return box
+
+
+def set_captured(doc: dict, box_id: str, expect_number: int | None = None) -> dict:
+    """Mark a hands-free box's photos as all in, so it may build. Calling it again
+    changes nothing, and keeps the first time.
+
+    ``expect_number`` is the chapter number the sender showed while shooting. Hands-free
+    holds the box if it would build under another number; a manual build ignores it.
+
+    A box that isn't hands-free is left as it is: it was never waiting for this.
+    """
+    box = find_box(doc, box_id)
+    if box is None:
+        raise BoxError(404, BOX_GONE)
+    if box.get("legacy"):
+        raise BoxError(409, _BOX_LOCKED)
+    if not is_hands_free(box):
+        return box
+    if not any(page.get("batch") == box_id for page in doc.get("pages", [])):
+        raise BoxError(409, "That chapter has no photos yet, so there is nothing to finish. "
+                            "Add its photos, or delete it.")
+    box.setdefault("captured_at", now_iso())
+    if _positive_int(expect_number):
+        box["expect_number"] = int(expect_number)
+    return box
+
+
+def reopen_box(box: dict) -> None:
+    """A photo has arrived in a finished hands-free box, so more may follow: it waits
+    for Done again rather than building without them."""
+    if is_hands_free(box):
+        box.pop("captured_at", None)
 
 
 def reorder_boxes(doc: dict, ids: list[str]) -> bool:
@@ -1132,4 +1252,6 @@ def summary(doc: dict) -> dict:
         "totals": doc.get("totals", {}),
         "chapter_count": chapter_count(doc),
         "rev": doc.get("rev", 0),
+        **({"hands_free_paused_at": doc["hands_free_paused_at"]}
+           if doc.get("hands_free_paused_at") else {}),
     }

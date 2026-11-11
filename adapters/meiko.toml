@@ -42,18 +42,26 @@ side_title_template = "Side Stories {n}"
 ## ledger, because it also catches anything posted by hand. It is also where the coin price
 ## is read from, so the app can offer the site's own number rather than have it typed.
 ##
-## Confirmed shape, one row per chapter, newest first:
-##   ["Chapter 61 55", "3", "Public"]
-## Cell 1 holds the name AND the coin badge, run together in the text. Cell 4 holds the
+## Confirmed shape (October 2026), one row per chapter, newest first:
+##   ["", "Chapter 247 55", "46", "Public", ""]
+## Cell 2 holds the name AND the coin badge, run together in the text. Cell 5 holds the
 ## coin <input> (or the word "Free"), so the price is read from there and then removed from
-## the end of cell 1 — parsing "Chapter 61 55" by splitting off a trailing number would
+## the end of cell 2 — parsing "Chapter 61 55" by splitting off a trailing number would
 ## turn "Side Stories 1" into "Side Stories" priced at 1.
+##
+## Cell 1 is new: an empty cell the site added along with its "Select All Chapters" box and
+## "Delete (n)" button. It pushed every column one to the right, so the old nth-child(1)
+## read that empty cell and every chapter name came back blank. Columns are therefore found
+## by the text of their HEADER first (`*_header`), which survives a column being added;
+## the `*_css` positions are only the fallback for when a header cannot be found.
 [chapter_list]
 row_css = "tbody tr"
-name_css = "td:nth-child(1)"
-views_css = "td:nth-child(2)"
-state_css = "td:nth-child(3)"
-paid_css = "td:nth-child(4)"
+name_header = "Select All Chapters"
+state_header = "State"
+name_css = "td:nth-child(2)"
+views_css = "td:nth-child(3)"
+state_css = "td:nth-child(4)"
+paid_css = "td:nth-child(5)"
 coins_input_css = 'input[placeholder="Coins"]'
 # Each row carries two Headless UI switches, in this order: State, then Paid. Targeted by
 # role within the row — never by id.

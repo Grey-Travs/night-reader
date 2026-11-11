@@ -6,6 +6,10 @@ token.json
 # created only when that is switched on, which is exactly why it has to be listed before
 # then rather than after.
 remote.json
+# The Telegram bot's token and who is paired with it, and how far its messages have been
+# taken in (see server/telegram_bot.py). The token is the key to the bot.
+telegram.json
+telegram_state.json
 
 # Personal config (holds your settings; copy from config.example.toml)
 config.toml

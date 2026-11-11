@@ -19,10 +19,12 @@ const hasFiles = (e) => dragTypes(e).includes('Files')
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
 const capital = (s) => s.charAt(0).toUpperCase() + s.slice(1)
 
-// What holds a box back, in the server's own order (empty, all-skipped, reading, unread,
-// failed, no-text, to-check). Counted by the server: a box held back only by a page
-// with no text used to read "0 to check" when the pill counted statuses itself.
+// What holds a box back, in the server's own order (capturing, empty, all-skipped,
+// reading, unread, failed, no-text, to-check). Counted by the server: a box held back
+// only by a page with no text used to read "0 to check" when the pill counted statuses
+// itself.
 const BLOCKER_TEXT = {
+  capturing: () => 'still being photographed',
   empty: () => 'no photos left',
   'all-skipped': () => 'all photos skipped',
   reading: (n) => `${n} being read`,
@@ -53,6 +55,7 @@ function builtPill(chapter) {
 
 export function boxPill(box, chapter) {
   switch (box.state) {
+    case 'capturing': return { label: 'Still being photographed', cls: 'pill-queued' }
     case 'empty': return { label: 'No photos yet', cls: 'pill-muted' }
     case 'skipped': return { label: 'All photos skipped', cls: 'pill-muted' }
     case 'reading': return { label: 'Reading…', cls: 'pill-translating animate-pulse' }
@@ -70,7 +73,7 @@ export function boxPill(box, chapter) {
 export default function ChapterBoxes({
   pid, boxes, chapters, expanded, busy, running, uploadingInto,
   onToggle, onOpenPhoto, onAddPhotos, onDropFiles, onMove, onNewBoxFrom, onAddBox,
-  onMoveBox, onRenameBox, onDeleteBox, onReadBox, onSetSeam, onOpenChapter,
+  onMoveBox, onRenameBox, onDeleteBox, onFinishBox, onReadBox, onSetSeam, onOpenChapter,
 }) {
   // The photo being dragged. Cleared on dragend whatever happened to the drag, so a
   // drag let go of outside any box can never move that photo later.
@@ -151,8 +154,8 @@ export default function ChapterBoxes({
           hint={hint} point={point} tiles={tiles} tileDrag={tileDrag} dragId={dragId} endDrag={endDrag}
           onToggle={onToggle} onOpenPhoto={onOpenPhoto} onAddPhotos={onAddPhotos}
           onDropFiles={onDropFiles} onMove={onMove} onMoveBox={onMoveBox}
-          onRenameBox={onRenameBox} onDeleteBox={onDeleteBox} onReadBox={onReadBox}
-          onSetSeam={onSetSeam} onOpenChapter={onOpenChapter}
+          onRenameBox={onRenameBox} onDeleteBox={onDeleteBox} onFinishBox={onFinishBox}
+          onReadBox={onReadBox} onSetSeam={onSetSeam} onOpenChapter={onOpenChapter}
         />
       ))}
 
@@ -201,7 +204,7 @@ const QUIET_STATES = new Set(['empty', 'reading', 'built', 'legacy'])
 function Box({
   pid, box, boxes, chapter, open, busy, running, adding, hint, point, tiles, tileDrag,
   dragId, endDrag, onToggle, onOpenPhoto, onAddPhotos, onDropFiles, onMove, onMoveBox,
-  onRenameBox, onDeleteBox, onReadBox, onSetSeam, onOpenChapter,
+  onRenameBox, onDeleteBox, onFinishBox, onReadBox, onSetSeam, onOpenChapter,
 }) {
   const name = boxName(box)
   const locked = isLocked(box)
@@ -251,12 +254,26 @@ function Box({
         <BoxTitle box={box} name={name} onRename={onRenameBox} />
         <span className={`pill ${pill.cls}`} title={messages.join('\n') || undefined}>{pill.label}</span>
         <span className="text-xs text-hint">{plural(box.pages.length, 'photo')}</span>
+        {box.hands_free && (
+          <span className="text-xs text-hint" title="Sent from the phone. It builds and translates by itself once its photos are all in.">
+            · hands-free
+          </span>
+        )}
         {!locked && unread.length > 0 && (
           <button className="btn btn-quiet px-2 py-1 text-xs" disabled={!!busy || running} onClick={() => onReadBox(box)}>
             Read {unread.length}
           </button>
         )}
         <div className="flex-1" />
+        {/* A phone chapter whose Done never came — the phone lost, a Telegram /done
+            forgotten — would hold back every chapter after it. */}
+        {box.hands_free && !box.captured_at && box.pages.length > 0 && (
+          <button
+            className="btn btn-quiet px-2 py-1 text-xs" aria-label={`Finish ${name}`}
+            disabled={!!adding} title="Every photo of this chapter is in: let it build"
+            onClick={() => onFinishBox(box)}
+          >Finish</button>
+        )}
         {box.chapter != null && (
           <button className="btn btn-quiet px-2 py-1 text-xs" onClick={() => onOpenChapter(box.chapter)}>
             Read chapter {box.chapter} →

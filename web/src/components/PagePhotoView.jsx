@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 import { api } from '../api'
 import { PageBadge, Skeleton } from './ui'
 import {
-  BUSY, SEAMS, boxName, boxTitle, hasText, isBuilt, isLocked, planSplit, seamPrev, stillAdding,
+  BUSY, SEAMS, applyIssue, boxName, boxTitle, hasText, isBuilt, isLocked, planSplit, seamPrev, stillAdding,
 } from '../pageBoxes'
 
 // One photo beside the Korean read out of it. ← → step through its own chapter and
@@ -125,9 +125,9 @@ function PageEditor({ row, page, draft, onDraft, onPersist, busy, running, onRer
   // be read, and one with text back to be checked before it builds.
   const textless = !hasText(draft)
 
-  function applyIssue(issue) {
-    if (!issue.where || !draft.includes(issue.where)) return
-    onDraft(draft.replace(issue.where, issue.suggest))
+  function apply(issue) {
+    const fixed = applyIssue(draft, issue)
+    if (fixed != null) onDraft(fixed)
   }
 
   return (
@@ -147,6 +147,13 @@ function PageEditor({ row, page, draft, onDraft, onPersist, busy, running, onRer
         </ul>
       )}
 
+      {page.verify?.verdict === 'unclear' && (
+        <p className="mb-2 text-xs text-hint">
+          The double-check didn’t give a clear answer, so this page waits for you. Compare
+          the text with the photo, then press Looks good.
+        </p>
+      )}
+
       {issues.length > 0 && (
         <div className="mb-3 space-y-2">
           {issues.map((issue, i) => (
@@ -157,7 +164,7 @@ function PageEditor({ row, page, draft, onDraft, onPersist, busy, running, onRer
                 className="btn btn-quiet mt-1 px-2 py-0.5 text-xs"
                 disabled={reading || !issue.where || !draft.includes(issue.where)}
                 title={issue.where ? 'Replace that text' : "Couldn't locate this exactly — fix it by hand"}
-                onClick={() => applyIssue(issue)}
+                onClick={() => apply(issue)}
               >
                 Apply
               </button>

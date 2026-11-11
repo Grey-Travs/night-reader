@@ -21,6 +21,11 @@
  * four, so this costs nothing there; the read-back the reconcile uses can omit `type`, and
  * treating "absent" as "wrong" would send every resumed chapter down the repair path and
  * re-save chapters that were already perfectly fine.
+ *
+ * For a FREE chapter only `paid` is judged, never `coins`. Since October 2026 the site
+ * answers a save of `coins: 0, paid: false` with `coins: 1, paid: 0` -- measured on a real
+ * save -- so a coin count on a free chapter is a placeholder, not a price. Comparing it
+ * stopped every free chapter at step 3, where 479 had gone through in September.
  */
 function nrSettingsWrong(after, want) {
   const { state, coins } = want || {}
@@ -34,7 +39,7 @@ function nrSettingsWrong(after, want) {
   if (has(record.state) && !same(record.state, state)) {
     wrong.push(`state is "${record.state}"`)
   }
-  if (has(record.coins) && Number(record.coins) !== Number(coins || 0)) {
+  if (Number(coins) > 0 && has(record.coins) && Number(record.coins) !== Number(coins)) {
     wrong.push(`coins is ${record.coins}`)
   }
   if (has(record.paid)) {

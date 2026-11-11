@@ -311,7 +311,9 @@ class Translator:
             setting_sources=[],                    # ignore project .claude/ skills + config
             max_turns=max_turns,                   # 1 for translation; more for aux checks
             model=_agent_model(self.cfg.model),
-            effort=(self.cfg.effort if self.cfg.effort in _VALID_EFFORT else "high"),
+            # Haiku takes no effort setting; asked for one, the call could be refused.
+            effort=(None if "haiku" in (self.cfg.model or "").lower()
+                    else self.cfg.effort if self.cfg.effort in _VALID_EFFORT else "high"),
             thinking={"type": "adaptive"} if (self.cfg.thinking or fable) else {"type": "disabled"},
             cwd=str(cwd) if cwd else None,
             add_dirs=[str(d) for d in (add_dirs or [])],

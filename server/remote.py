@@ -206,13 +206,18 @@ def _tailscale_exe() -> str | None:
     return None
 
 
+# The app runs under pythonw in the background; without this each tailscale call flashes
+# a console window on Windows. 0 elsewhere, where the flag does not exist.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _tailscale_addresses() -> list[str]:
     exe = _tailscale_exe()
     if not exe:
         return []
     try:
         out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True,
-                             timeout=4, check=False)
+                             timeout=4, check=False, creationflags=_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return []
     return [line.strip() for line in (out.stdout or "").splitlines() if line.strip()]
@@ -224,7 +229,7 @@ def _tailscale_json(args: list[str]) -> dict:
         return {}
     try:
         out = subprocess.run([exe, *args], capture_output=True, text=True,
-                             timeout=6, check=False)
+                             timeout=6, check=False, creationflags=_NO_WINDOW)
         loaded = json.loads(out.stdout or "{}")
         return loaded if isinstance(loaded, dict) else {}
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
@@ -413,6 +418,22 @@ def phone_url(port: int = 8000) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Other places a notice goes as well as ntfy — the Telegram bot, when it is paired. Each
+# is called with (title, body) and must not block: it is called on whichever thread is
+# telling, often the event loop.
+_sinks: list = []
+
+
+def add_sink(sink) -> None:
+    if sink not in _sinks:
+        _sinks.append(sink)
+
+
+def remove_sink(sink) -> None:
+    if sink in _sinks:
+        _sinks.remove(sink)
+
+
 def notify(title: str, body: str = "") -> bool:
     """Push a short message to whatever the user has pointed this at.
 
@@ -423,9 +444,14 @@ def notify(title: str, body: str = "") -> bool:
     reports to, and a slow or unreachable push service must not hold up recording that a
     chapter went out. Returns whether it was attempted, not whether it arrived.
     """
+    for sink in list(_sinks):
+        try:
+            sink(title, body)
+        except Exception:  # noqa: BLE001 — one broken channel never stops the others
+            pass
     url = load()["notify_url"]
     if not url:
-        return False
+        return bool(_sinks)
 
     def _send() -> None:
         try:

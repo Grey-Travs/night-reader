@@ -144,6 +144,22 @@ const HEIC_NAME = /\.(heic|heif)$/i
 // What a folder dragged in from Windows or a Mac brings along besides the photos.
 const JUNK_NAME = /^(\.ds_store|thumbs\.db|desktop\.ini)$|^\._/i
 
+/**
+ * A page's text with one of the double-check's fixes applied: its `where` replaced by its
+ * `suggest`. Null when it can't be applied safely — no anchor, or the anchor is no longer
+ * in the text — since a fix guessed into the reader's own words is worse than none.
+ */
+export function applyIssue(text, issue) {
+  if (!issue?.where || !(text || '').includes(issue.where)) return null
+  return text.replace(issue.where, issue.suggest ?? '')
+}
+
+// What to do about a HEIC photo, on any screen that refuses one.
+export const HEIC_ADVICE = 'Phones save these to take less space. On an Android phone, open the camera’s '
+  + 'settings and turn off “High efficiency pictures” (on a Samsung it’s under Advanced picture '
+  + 'options). On an iPhone: Settings → Camera → Formats → Most Compatible. Then take or export '
+  + 'the photos again as JPEG.'
+
 export const REFUSED = {
   heic: 'a HEIC/HEIF photo, which browsers can’t show',
   type: 'not a JPEG, PNG or WebP image',

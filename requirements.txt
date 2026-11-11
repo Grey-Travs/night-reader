@@ -9,3 +9,8 @@ uvicorn[standard]>=0.29
 # Already present transitively via uvicorn/click; declared explicitly because the live
 # translation console uses it to enable ANSI colour in the Windows terminal.
 colorama>=0.4.6
+# Reads scanner-app PDFs into page images (server/pdf_pages.py). Apache-2.0/BSD.
+pypdfium2>=5.13,<6
+# The icon by the clock (server/tray.py). LGPL-3.0 (used unmodified) and MIT-CMU.
+pystray>=0.19.5
+Pillow>=11

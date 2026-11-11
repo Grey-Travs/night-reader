@@ -452,6 +452,46 @@ def test_every_icon_the_manifest_promises_actually_exists(here):
         assert (public / icon["src"].lstrip("/")).exists(), icon["src"]
 
 
+def test_shortcuts_and_shares_open_inside_the_app_with_the_key_when_it_has_one(away, here):
+    token = _enable()
+    doc = away.get(f"/manifest.webmanifest?{remote.TOKEN_QUERY}={token}").json()
+    urls = [s["url"] for s in doc["shortcuts"]] + [doc["share_target"]["action"]]
+    assert urls == [f"/phone/capture?{remote.TOKEN_QUERY}={token}",
+                    f"/phone/check?{remote.TOKEN_QUERY}={token}",
+                    f"/phone/share?{remote.TOKEN_QUERY}={token}"]
+    plain = here.get("/manifest.webmanifest").json()
+    assert plain["share_target"]["action"] == "/phone/share", "no key invented on the computer"
+
+
+def test_the_share_target_takes_photos_and_pdfs_in_the_field_the_worker_reads(here):
+    share = here.get("/manifest.webmanifest").json()["share_target"]
+    assert (share["method"], share["enctype"]) == ("POST", "multipart/form-data")
+    [files] = share["params"]["files"]
+    assert files["accept"] == ["image/*", "application/pdf", ".pdf"]
+    worker = (remote.PROJECT_ROOT / "web" / "public" / "phone-sw.js").read_text(encoding="utf-8")
+    assert f"const SHARE_FIELD = '{files['name']}'" in worker
+    assert files["name"] == A.SHARE_FIELD
+
+
+def test_every_shortcut_icon_exists(here):
+    public = remote.PROJECT_ROOT / "web" / "public"
+    for shortcut in here.get("/manifest.webmanifest").json()["shortcuts"]:
+        for icon in shortcut["icons"]:
+            assert (public / icon["src"].lstrip("/")).exists(), icon["src"]
+
+
+def test_a_share_the_worker_missed_is_sent_on_with_its_key(away):
+    token = _enable()
+    r = away.post(f"/phone/share?{remote.TOKEN_QUERY}={token}", content=b"--boundary--",
+                  headers={"Content-Type": "multipart/form-data; boundary=boundary"},
+                  follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == f"/phone/share?missed=1&{remote.TOKEN_QUERY}={token}"
+    away.cookies.clear()   # the first request planted the key as a cookie
+    assert away.post("/phone/share", follow_redirects=False).status_code == 403, \
+        "a stranger is refused before reaching it"
+
+
 def test_the_scope_does_not_claim_the_whole_hostname(here):
     """Narrow on purpose, and the reason is off-web.
 
@@ -525,6 +565,25 @@ def test_notifying_somewhere_is_attempted_off_the_request(monkeypatch):
 class _NoThread:
     def start(self) -> None:
         pass
+
+
+def test_a_notice_reaches_every_sink_even_with_no_address(monkeypatch):
+    # The Telegram bot gets the same notices as ntfy. One broken channel never stops the
+    # others, and a sink alone still counts as somewhere to send.
+    got = []
+
+    def broken(title, body):
+        raise RuntimeError("gone")
+
+    remote.add_sink(broken)
+    remote.add_sink(lambda title, body: got.append((title, body)))
+    try:
+        monkeypatch.setattr(remote.threading, "Thread", lambda **kw: _NoThread())
+        assert remote.notify("Chapter 3 is translated", "ready") is True
+        assert got == [("Chapter 3 is translated", "ready")]
+    finally:
+        remote._sinks.clear()
+    assert remote.notify("nowhere") is False
 
 
 def test_an_unreadable_settings_file_is_kept_aside(settings):

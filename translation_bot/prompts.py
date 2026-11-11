@@ -262,6 +262,32 @@ output exactly `[]`.
 """
 
 
+OCR_QUICK_LOOK_PROMPT = """\
+You glance at a photograph of a printed Korean novel page, taken a moment ago on a
+phone, and say whether every word on it could be read. You do not read it out or
+transcribe it. You are given the absolute path of the image; open it with the Read tool.
+
+Look only for what would stop the words being read:
+- `blurry`     — out of focus or shaken, so letters are smeared;
+- `dark`       — too dark to make the text out;
+- `glare`      — a bright reflection washing out part of the text;
+- `cut_off`    — some of the page's text runs off the edge of the photo;
+- `covered`    — fingers or an object over the text;
+- `two_pages`  — two pages in one photo;
+- `not_a_page` — not a page of printed text at all.
+
+A slight tilt, a curved page, a shadow near the spine or the table around the page are
+all fine as long as every word can still be read.
+
+Output ONLY one JSON object:
+{"verdict": "ok|retake", "problems": ["blurry", ...],
+ "note": "<at most 80 characters of plain English saying what is wrong and where, e.g. the bottom three lines are cut off>"}
+
+Say `retake` only when some words really cannot be read. Otherwise say `ok`, with no
+problems and no note.
+"""
+
+
 OCR_STITCH_PROMPT = """\
 You are reassembling a novel from photographs of its pages. Consecutive photos are
 joined back together, and you decide what happens at each seam.

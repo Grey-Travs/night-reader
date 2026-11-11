@@ -13,7 +13,7 @@ import App from './App'
 // arrives through its Suspense boundary, and that /phone escapes the two desktop
 // behaviours that would otherwise take a phone somewhere it did not ask to go.
 
-const h = vi.hoisted(() => ({ guideSeen: true }))
+const h = vi.hoisted(() => ({ guideSeen: true, statusHangs: false }))
 
 vi.mock('./prefs', async (actual) => ({
   ...(await actual()),
@@ -29,6 +29,8 @@ vi.mock('./api', () => ({
     get: (_t, prop) => {
       if (prop === 'backupAllUrl') return () => '#'
       if (prop === 'then') return undefined
+      // The computer asleep: the status check never answers.
+      if (prop === 'status' && h.statusHangs) return () => new Promise(() => {})
       return vi.fn().mockResolvedValue({
         config_present: true,
         claude_logged_in: true,
@@ -42,7 +44,7 @@ function at(path) {
   return render(<MemoryRouter initialEntries={[path]}><App /></MemoryRouter>)
 }
 
-beforeEach(() => { h.guideSeen = true })
+beforeEach(() => { h.guideSeen = true; h.statusHangs = false })
 
 describe('routes arrive through their Suspense boundary', () => {
   it('loads the library behind the app shell', async () => {
@@ -64,6 +66,20 @@ describe('/phone escapes the desktop', () => {
     // outside AppShell rather than being styled narrow.
     expect(screen.queryByText('Your library')).toBeNull()
     expect(screen.queryByRole('navigation')).toBeNull()
+  })
+
+  it('draws without waiting for the computer', async () => {
+    // With the computer asleep the status check hangs until the connection times out;
+    // the phone's screens never use it, and the camera must open meanwhile.
+    h.statusHangs = true
+    at('/phone')
+    expect(await screen.findByText('Night Reader')).toBeInTheDocument()
+  })
+
+  it('sends an unknown phone screen back to its hub, never to the desktop', async () => {
+    at('/phone/nope')
+    expect(await screen.findByText('Night Reader')).toBeInTheDocument()
+    expect(screen.queryByText('Your library')).toBeNull()
   })
 
   it('is not hijacked by the first-run guide redirect', async () => {

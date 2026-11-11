@@ -270,6 +270,45 @@ def test_concurrent_readers_never_see_a_torn_queue():
     assert not errors, f"reading the queue while it drained raised: {errors!r}"
 
 
+# ---- hands-free work on the same queue -------------------------------------------
+# Hands-free page work goes ahead of the chapters waiting, in order among itself: a
+# photo needs reading while the book is still open, and a translation can wait. A paused
+# job's resumable list leaves out the chapters hands-free queued: the server tries those
+# again itself, and a Resume in a tab would translate them twice.
+
+def _queue(job):
+    return [(i, kind) for i, _f, kind in job.snapshot_pending()]
+
+
+def test_hands_free_page_work_goes_ahead_of_the_chapters_waiting():
+    job = _job()
+    job.enqueue([(1, False, A.TASK_OCR), (5, False, A.TASK_TRANSLATE),
+                 (6, False, A.TASK_TRANSLATE)])
+    job.enqueue([(2, True, A.TASK_OCR), (3, True, A.TASK_OCR_VERIFY)], ahead_of_chapters=True)
+    assert _queue(job) == [(1, A.TASK_OCR), (2, A.TASK_OCR), (3, A.TASK_OCR_VERIFY),
+                           (5, A.TASK_TRANSLATE), (6, A.TASK_TRANSLATE)]
+
+
+def test_ahead_with_no_chapters_waiting_is_the_end():
+    job = _job()
+    job.enqueue([(1, False, A.TASK_OCR)])
+    job.enqueue([(2, True, A.TASK_OCR)], ahead_of_chapters=True)
+    assert _queue(job) == [(1, A.TASK_OCR), (2, A.TASK_OCR)]
+
+
+def test_ahead_still_dedups():
+    job = _job()
+    assert job.enqueue([(2, True, A.TASK_OCR)]) == [2]
+    assert job.enqueue([(2, True, A.TASK_OCR_VERIFY)], ahead_of_chapters=True) == []
+
+
+def test_resumable_leaves_out_what_hands_free_queued():
+    job = _job()
+    job.enqueue([(4, False, A.TASK_TRANSLATE), (7, False, A.TASK_TRANSLATE)])
+    job.hands_free_chapters.add(7)
+    assert job.resumable() == [{"index": 4, "kind": A.TASK_TRANSLATE, "force": False}]
+
+
 if __name__ == "__main__":
     import pytest
 

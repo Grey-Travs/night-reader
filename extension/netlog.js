@@ -205,6 +205,22 @@
     }
   })
 
+  // How long the token has left, in seconds, or null when there is none or it is not a JWT.
+  //
+  // The site reads its token once, at page load, and never renews it: an hour on, its own
+  // requests answer "Token not vaild" and its chapter list goes blank. Only a reload renews
+  // it, so the content script asks this before it takes a run. Only the expiry crosses
+  // over, never the token.
+  window.addEventListener('message', (e) => {
+    if (e.source !== window || e.data?.source !== 'nr-token-left') return
+    let seconds = null
+    try {
+      const claims = JSON.parse(atob(apiToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')))
+      if (Number.isFinite(claims.exp)) seconds = Math.floor(claims.exp - Date.now() / 1000)
+    } catch { /* no token yet, or not one we can read an expiry from */ }
+    window.postMessage({ source: 'nr-token-left-reply', id: e.data.id, seconds }, '*')
+  })
+
   // --- fetch ---------------------------------------------------------------
   const realFetch = window.fetch
   if (typeof realFetch === 'function') {
