@@ -17,6 +17,7 @@ const STATIC = [
   { label: 'Archive', sub: 'Finished novels', to: '/archive' },
   { label: 'Settings', sub: 'Model · effort · connections', to: '/settings' },
   { label: 'Guide', sub: 'How to use the app', to: '/guide' },
+  { label: 'Stats', sub: 'Tokens · chapters · novels · features', to: '/stats' },
 ]
 
 export default function CommandPalette() {

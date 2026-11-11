@@ -153,6 +153,7 @@ export const api = {
 
   // Upkeep: glossary approvals and consistency across every novel at once.
   allPendingTerms: () => get('/api/glossary/pending'),
+  stats: () => get('/api/stats'),
   consistencySummary: (refresh = false) =>
     get('/api/consistency/summary' + (refresh ? '?refresh=true' : '')),
   reviewGlossaryBulk: (byProject) => post('/api/glossary/review-bulk', { by_project: byProject }),

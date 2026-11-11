@@ -113,6 +113,7 @@ from . import quick_look
 from . import remote
 from . import projects as pj
 from . import series as series_mod
+from . import stats as stats_mod
 from . import telegram_bot
 from . import variants as variants_mod
 from .bulk import MAX_ROWS, MAX_UNTYPED, prepare_bulk_rows, split_flat
@@ -3756,6 +3757,12 @@ def all_pending_terms() -> dict:
                            "pending": pending})
     novels.sort(key=lambda n: n["name"].lower())
     return {"novels": novels, "total": sum(len(n["pending"]) for n in novels)}
+
+
+@app.get("/api/stats")
+def library_stats() -> dict:
+    """Totals across the whole library for the Stats page. Reads files; writes nothing."""
+    return stats_mod.compute()
 
 
 def _summarize_consistency(project: dict, cfg: Config) -> dict:

@@ -36,6 +36,7 @@ const GuidePage = lazy(() => import('./pages/GuidePage'))
 const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 const UpkeepPage = lazy(() => import('./pages/UpkeepPage'))
 const ScansPage = lazy(() => import('./pages/ScansPage'))
+const StatsPage = lazy(() => import('./pages/StatsPage'))
 const ProjectLayout = lazy(() => import('./components/ProjectLayout'))
 const ChaptersPage = lazy(() => import('./pages/ChaptersPage'))
 const PagesPage = lazy(() => import('./pages/PagesPage'))
@@ -124,6 +125,7 @@ export default function App() {
             <Route path="archive" element={<ArchivePage />} />
             <Route path="guide" element={<GuidePage />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="stats" element={<StatsPage />} />
             <Route path="novel/:pid" element={<ProjectLayout />}>
               <Route index element={<ChaptersPage />} />
               <Route path="pages" element={<PagesPage />} />

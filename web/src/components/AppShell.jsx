@@ -24,6 +24,21 @@ const NAV = [
 
 const linkClass = ({ isActive }) => `navlink ${isActive ? 'navlink-active' : ''}`
 
+// The Stats page sits behind a small icon rather than in NAV: it is a personal look at the
+// totals, not a place work happens, so it does not earn a row in the list.
+function StatsLink({ className = '' }) {
+  return (
+    <NavLink
+      to="/stats"
+      title="Stats"
+      aria-label="Stats"
+      className={({ isActive }) => `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-btn text-base transition-colors hover:bg-[var(--b-muted-bg)] ${isActive ? 'bg-[var(--b-muted-bg)]' : ''} ${className}`}
+    >
+      <span aria-hidden>📊</span>
+    </NavLink>
+  )
+}
+
 export default function AppShell({ status, setStatus, onSetup }) {
   // How many glossary suggestions are waiting library-wide. Cheap (one small JSON read
   // per novel) and fetched once per mount, so the sidebar can show there's work to do
@@ -45,9 +60,12 @@ export default function AppShell({ status, setStatus, onSetup }) {
         className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-line px-3 py-5 md:flex"
         style={{ background: 'var(--surface)' }}
       >
-        <div className="px-2 pb-5">
-          <div className="font-reading text-lg font-medium leading-tight">Night Reader</div>
-          <div className="text-xs text-hint">runs on your Claude plan</div>
+        <div className="flex items-start justify-between gap-2 px-2 pb-5">
+          <div className="min-w-0">
+            <div className="font-reading text-lg font-medium leading-tight">Night Reader</div>
+            <div className="text-xs text-hint">runs on your Claude plan</div>
+          </div>
+          <StatsLink className="-mr-1" />
         </div>
         <nav className="flex flex-col gap-1">
           {NAV.map((n) => (
@@ -84,6 +102,7 @@ export default function AppShell({ status, setStatus, onSetup }) {
               </NavLink>
             ))}
           </nav>
+          <StatsLink />
           <ThemeToggle className="shrink-0" />
         </header>
         <main className="min-w-0 flex-1">
