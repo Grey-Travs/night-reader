@@ -87,6 +87,20 @@ def _has_built_interface() -> bool:
     return (DIST / "index.html").is_file()
 
 
+def _child_output():
+    """Our own stdout, for a child process to write into, or None to leave it alone.
+
+    None when there is no real file behind it (pythonw without the log), which is what
+    passing nothing always did.
+    """
+    try:
+        sys.stdout.flush()
+        sys.stdout.fileno()
+        return sys.stdout
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 def build_frontend(force: bool = False) -> bool:
     """Build the interface if needed. Returns whether there is one to serve.
 
@@ -105,9 +119,12 @@ def build_frontend(force: bool = False) -> bool:
         return True
     print("Building the app interface (first run only)…" if first_run
           else "The interface changed — rebuilding it…")
-    # Call vite directly via node — robust across shells.
+    # Call vite directly via node — robust across shells. Its output goes where ours does:
+    # started in the background that is logs/launch.log, where pythonw would otherwise
+    # throw it away and leave "the build failed" with no reason anywhere.
     try:
-        subprocess.run(["node", str(VITE), "build"], cwd=str(WEB), check=True)
+        subprocess.run(["node", str(VITE), "build"], cwd=str(WEB), check=True,
+                       stdout=_child_output(), stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError:
         # A clear nudge beats a raw traceback, and an existing dist/ still runs.
         print("! Building the interface failed."
