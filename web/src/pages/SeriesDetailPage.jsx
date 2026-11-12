@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api } from '../api'
 import { SkeletonRows } from '../components/ui'
+import NewChaptersNote from '../components/NewChaptersNote'
 import SeriesGlossaryMerge from '../components/SeriesGlossaryMerge'
 import SeriesPublishTarget from '../components/SeriesPublishTarget'
 import { useToast } from '../toast'
@@ -235,6 +236,16 @@ export default function SeriesDetailPage() {
 
       {!data ? <SkeletonRows rows={6} /> : (
         <>
+          <NewChaptersNote
+            className="mb-4"
+            added={data.auto_numbered}
+            waiting={data.unnumbered}
+            action={(
+              <button className="text-accent-text hover:underline" disabled={!!busy} onClick={refresh}>
+                {busy === 'refresh' ? 'Re-reading…' : 'Re-read documents'}
+              </button>
+            )}
+          />
           <section className="mb-5 rounded-card border border-line p-3">
             <h2 className="mb-2 text-sm font-medium">Documents, in reading order</h2>
             <ol className="space-y-1">

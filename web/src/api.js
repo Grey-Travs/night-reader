@@ -254,6 +254,7 @@ export const api = {
   // What a posting run would do. Writes nothing and opens no browser — this is the gate
   // in front of the free/paid cutoff, which is painful to change once readers have been
   // through a chapter.
+  postingAvailable: () => get('/api/posting/available'),
   postingPlan: (sid, { targetId, start, end } = {}) => {
     const q = new URLSearchParams({ sid })
     if (targetId) q.set('target_id', targetId)

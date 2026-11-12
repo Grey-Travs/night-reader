@@ -1,5 +1,7 @@
 import { Link } from 'react-router-dom'
 import { SkeletonRows } from '../components/ui'
+import AvailableToPost from '../components/AvailableToPost'
+import NewChaptersNote from '../components/NewChaptersNote'
 import { useToast } from '../toast'
 import { useConfirm } from '../confirm'
 import {
@@ -70,6 +72,8 @@ export default function PostingPage() {
         </div>
       ) : (
         <>
+          <AvailableToPost currentSid={c.sid} onPick={c.setSid} reloadKey={c.plan} />
+
           <div className="mb-4 flex flex-wrap items-center gap-2">
             <select
               className="rounded border border-line bg-transparent px-2 py-1.5 text-sm"
@@ -92,6 +96,16 @@ export default function PostingPage() {
 
           {c.loading && !c.plan ? <SkeletonRows rows={5} /> : !c.plan ? null : (
             <>
+              <NewChaptersNote
+                className="mb-3"
+                added={c.plan.auto_numbered}
+                waiting={c.plan.unnumbered}
+                action={(
+                  <Link to={`/series/${c.sid}`} className="text-accent-text hover:underline">
+                    Open the series and re-read its documents →
+                  </Link>
+                )}
+              />
               <section className="grid gap-3 sm:grid-cols-3">
                 <Tile label="Ready to post" value={c.ready.length} sub={range(c.ready)} />
                 <Tile label="Free" value={c.free.length} sub={range(c.free)} />

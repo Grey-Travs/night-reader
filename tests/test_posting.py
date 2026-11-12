@@ -1746,5 +1746,126 @@ def test_the_studio_list_is_not_a_series_page(client):
         "url": "https://meiko.studio/page/x/"}).json()["found"] is False
 
 
+def test_chapters_added_to_a_document_reach_the_plan_without_a_re_read(client):
+    # What happened for real: tabs were added to the end of a document and translated,
+    # but the stored numbering stopped short, so the plan simply never offered them.
+    pid = _novel(client, "Grows On", [1, 2, 3],
+                 translated=[(i, f"Chapter {i} text. " * 20) for i in (1, 2, 3)])
+    sid = _series(client, "Grows On", [pid])
+    assert [i["global"] for i in _plan(client, sid)["items"]] == [1, 2, 3]
+
+    pdir = pj.PROJECTS_DIR / pid
+    records = [
+        {"title": f"Tab {i}", "paragraphs": [f"ridibooks.com/books/{1000 + i}/view\n\n노벨 제목 {i}화", BODY]}
+        for i in range(1, 6)
+    ]
+    (pdir / "source.json").write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+    cfg = pj.project_config(Config(), pj.get_project(pid))
+    state = State.load(cfg.paths.state_file)
+    for i in (4, 5):
+        (cfg.paths.output_dir / f"chapter-{i:02d}.md").write_text(f"Chapter {i} text. " * 20, encoding="utf-8")
+        state.update(i, status=STATUS_VALIDATED, title=f"Tab {i}", source_hash=f"h{i}")
+    state.save(cfg.paths.state_file)
+    A._chapter_cache.pop(pid, None)
+
+    plan = _plan(client, sid)
+    assert plan["auto_numbered"] == [4, 5] and plan["unnumbered"] == []
+    ready = [i["global"] for i in plan["items"] if not i["blockers"]]
+    assert ready == [1, 2, 3, 4, 5]
+
+
+# ---- the "Available to post" overview -------------------------------------
+#
+# A quick count per series (posting.availability) so the Posting page can list every
+# novel at once: plan_run took 2.5 minutes for the real library. It must never miss a
+# chapter the plan would offer, and it must say how fresh its site reading is.
+
+
+def _text(n):
+    return f"Chapter {n} text. " * 20
+
+
+def _available(client):
+    return {r["sid"]: r for r in client.get("/api/posting/available").json()["series"]}
+
+
+def test_the_overview_counts_what_is_translated_and_not_on_the_site(client):
+    pid = _novel(client, "Overview", [1, 2, 3, 4, 5],
+                 translated=[(i, _text(i)) for i in (1, 2, 3, 4)])
+    sid = _series(client, "Overview", [pid])
+    client.post("/api/posting/site", json={
+        "sid": sid, "target_id": "t1", "titles": ["Chapter 1", "Chapter 2"]})
+    row = _available(client)[sid]
+    assert row["ready"] == 2 and row["ready_numbers"] == [3, 4]
+    assert row["unfinished"] == 1
+    assert row["site"]["max_posted"] == 2 and row["site"]["fresh"] is True
+
+
+def test_the_overview_never_misses_a_chapter_the_plan_would_post(client):
+    pid = _novel(client, "Agree", [1, 2, 3, 4, 5, 6],
+                 translated=[(i, _text(i)) for i in (1, 2, 4, 5, 6)])
+    sid = _series(client, "Agree", [pid])
+    client.post("/api/posting/site", json={"sid": sid, "target_id": "t1", "titles": ["Chapter 1"]})
+    client.post("/api/posting/result", json={
+        "sid": sid, "target_id": "t1", "title": "Chapter 2", "status": "posted"})
+    plan_ready = {i["global"] for i in _plan(client, sid)["items"] if not i["blockers"]}
+    assert plan_ready and plan_ready <= set(_available(client)[sid]["ready_numbers"])
+
+
+def test_a_novel_never_read_from_the_site_says_so(client):
+    pid = _novel(client, "Unread", [1, 2], translated=[(1, _text(1)), (2, _text(2))])
+    sid = _series(client, "Unread", [pid])
+    site = _available(client)[sid]["site"]
+    assert site["fetched_at"] is None and site["fresh"] is False and site["max_posted"] is None
+
+
+def test_an_old_reading_is_not_fresh(client):
+    pid = _novel(client, "Old Reading", [1, 2], translated=[(1, _text(1)), (2, _text(2))])
+    sid = _series(client, "Old Reading", [pid])
+    client.post("/api/posting/site", json={"sid": sid, "target_id": "t1", "titles": ["Chapter 1"]})
+    path = posting.site_path(sid, "t1")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["fetched_at"] = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    assert _available(client)[sid]["site"]["fresh"] is False
+
+
+def test_the_overview_counts_chapters_just_added_to_a_document(client):
+    pid = _novel(client, "Grows Overview", [1, 2], translated=[(1, _text(1)), (2, _text(2))])
+    sid = _series(client, "Grows Overview", [pid])
+    pdir = pj.PROJECTS_DIR / pid
+    records = [{"title": f"Tab {i}", "paragraphs": [
+        f"ridibooks.com/books/{1000 + i}/view\n\n노벨 제목 {i}화", BODY]} for i in (1, 2, 3)]
+    (pdir / "source.json").write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+    project = json.loads((pdir / "project.json").read_text(encoding="utf-8"))
+    project["chapter_count"] = 3  # what the app records whenever it reads the document
+    (pdir / "project.json").write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+    cfg = pj.project_config(Config(), pj.get_project(pid))
+    (cfg.paths.output_dir / "chapter-03.md").write_text(_text(3), encoding="utf-8")
+    state = State.load(cfg.paths.state_file)
+    state.update(3, status=STATUS_VALIDATED, title="Tab 3", source_hash="h3")
+    state.save(cfg.paths.state_file)
+    A._chapter_cache.pop(pid, None)
+    row = _available(client)[sid]
+    assert row["auto_numbered"] == [3] and row["ready_numbers"] == [1, 2, 3]
+
+
+def test_the_busiest_novels_come_first(client, tmp_path):
+    # Named so the alphabet would put them the other way round: only views can pass this.
+    quiet = _series(client, "Aardvark Quiet", [_novel(client, "Aardvark Quiet", [1])])
+    busy = _series(client, "Zebra Busy", [_novel(client, "Zebra Busy", [1])])
+    for sid, uid in ((quiet, "quietuid"), (busy, "busyuid")):
+        client.post(f"/api/series/{sid}", json={"publish_targets": [{
+            "id": "t1", "site": "meiko",
+            "series_url": f"https://meiko.studio/page/x/series/{uid}/",
+            "free_through": 0, "coin_price": 55}]})
+    (tmp_path / "site_series.json").write_text(json.dumps({
+        "fetched_at": "2026-11-12T00:00:00+00:00", "studio_uid": "x", "series": [
+            {"uid": "quietuid", "name": "Quiet", "views": 10},
+            {"uid": "busyuid", "name": "Busy", "views": 5000}]}), encoding="utf-8")
+    order = [r["name"] for r in client.get("/api/posting/available").json()["series"]]
+    assert order.index("Zebra Busy") < order.index("Aardvark Quiet")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

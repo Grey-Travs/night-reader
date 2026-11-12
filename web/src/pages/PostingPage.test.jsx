@@ -26,6 +26,7 @@ vi.mock('../confirm', () => ({ useConfirm: () => async () => true }))
 vi.mock('../api', () => ({
   api: {
     listSeries: vi.fn(),
+    postingAvailable: vi.fn(() => Promise.resolve({ series: [] })),
     postingPlan: vi.fn(),
     postingRun: vi.fn(),
     startPostingRun: vi.fn(),

@@ -580,6 +580,87 @@ def resolve_mapping(series: dict, chapters_by_pid: dict[str, list]) -> dict:
     return doc
 
 
+def number_new_chapters(series: dict, chapters_by_pid: dict[str, list]) -> dict:
+    """Number chapters added to the END of a member document since the numbering was
+    resolved, without touching a single row that already has a number.
+
+    Why this exists: a novel split across documents is numbered once, and from then on
+    the Series and Posting pages go by that stored numbering. Adding tabs 17-35 to the
+    third document translated them, but nothing numbered them, so chapters 217-235 were
+    invisible to posting until someone thought to press "Re-read documents".
+
+    Appending is safe to do unasked only when it is unambiguous, so a member is extended
+    only if ALL of these hold; otherwise its new chapters are reported as ``waiting`` and
+    left for a person to re-read:
+      - the document still holds every chapter that already had a row,
+      - every new chapter sits after the last numbered one (nothing inserted mid-way),
+      - re-reading gives every existing row the same number and kind as before,
+      - no new number is a guess (low confidence) or collides with one already in use.
+
+    Pure: reads the stored mapping, writes nothing. Returns ``{"doc": updated mapping or
+    None, "added": [new global numbers], "waiting": {project_id: count}}``.
+    """
+    stored = load_mapping(series["id"])
+    result = {"doc": None, "added": [], "waiting": {}}
+    if not stored:
+        return result
+    stored_members = stored.get("members") or {}
+    fresh_members = resolve_mapping(series, chapters_by_pid).get("members") or {}
+    taken = {
+        r.get("global")
+        for m in stored_members.values() for r in m.get("rows") or []
+        if isinstance(r.get("global"), int)
+    }
+    members = {pid: dict(m) for pid, m in stored_members.items()}
+    extended = False
+
+    for member in series.get("members") or []:
+        pid = member.get("project_id")
+        chapters = chapters_by_pid.get(pid)
+        if not pid or not chapters:
+            continue
+        old_member = stored_members.get(pid) or {}
+        old_rows = old_member.get("rows") or []
+        old_idx = {r.get("index") for r in old_rows}
+        doc_idx = {c.index for c in chapters}
+        new_idx = sorted(doc_idx - old_idx)
+        if not new_idx:
+            continue
+        fresh_rows = {r.get("index"): r for r in (fresh_members.get(pid) or {}).get("rows") or []}
+        additions = [fresh_rows.get(i) for i in new_idx]
+        numbers = [r.get("global") for r in additions if r and isinstance(r.get("global"), int)]
+        safe = (
+            old_idx <= doc_idx
+            and (not old_idx or min(new_idx) > max(old_idx))
+            and all(
+                (fresh_rows.get(r.get("index")) or {}).get("global") == r.get("global")
+                and (fresh_rows.get(r.get("index")) or {}).get("kind") == r.get("kind")
+                for r in old_rows
+            )
+            and all(r is not None and r.get("confidence") != "low" for r in additions)
+            and len(set(numbers)) == len(numbers)
+            and not (set(numbers) & taken)
+        )
+        if not safe:
+            result["waiting"][pid] = len(new_idx)
+            continue
+        base = old_member or {"offline": False,
+                              "start_chapter": (fresh_members.get(pid) or {}).get("start_chapter")}
+        members[pid] = {**base, "rows": [*old_rows, *additions]}
+        taken.update(numbers)
+        result["added"].extend(numbers)
+        extended = True
+
+    # Saved even when the new tabs took no number (an author's note, a cover tab): their
+    # rows still have to be recorded, or every visit would find them "new" and re-check.
+    if extended:
+        doc = {**stored, "members": members}
+        doc.update(_series_totals(doc))
+        result["doc"] = doc
+    result["added"].sort()
+    return result
+
+
 def _series_totals(doc: dict) -> dict:
     """Gaps and duplicates across the whole series, not just within one document.
 

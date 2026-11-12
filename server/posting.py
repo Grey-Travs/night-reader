@@ -536,6 +536,128 @@ def plan_run(sid: str, target_id: str | None = None, *, start: int | None = None
     }
 
 
+# How old a reading of the site may be before the Posting overview says its count may be
+# out of date. Chapters posted by hand or from another machine since then are unknown here.
+FRESH_READING_SECONDS = 2 * 86400
+
+# Statuses that mean "not translated yet" for the overview's count of chapters still to
+# translate. An English tab or an empty one is never going to be.
+_UNFINISHED_STATUSES = ("pending", "translated", "needs-review", "failed")
+
+
+def _chapter_indexes(directory: Path) -> set[int]:
+    """Which chapter indexes have a translation file, from ONE listing of the folder.
+
+    The same rule as ``existing_chapter_file`` (any pad width, non-recursive, so the
+    backup copies some projects carry are not counted), done once per document instead of
+    once per chapter.
+    """
+    out: set[int] = set()
+    try:
+        for f in directory.glob("chapter-*.md"):
+            tail = f.stem.split("-", 1)[-1]
+            if tail.isdigit():
+                out.add(int(tail))
+    except OSError:
+        pass
+    return out
+
+
+def availability(sid: str, target_id: str | None = None, *,
+                 adapter_name: str = "meiko") -> dict:
+    """A quick count of what one series has ready to post, for the Posting overview.
+
+    ``plan_run`` answers this exactly, but it reads and converts every chapter: seconds
+    for a big novel, and two and a half minutes for 38 novels on this library's hard
+    drive, so it cannot run for every series on each visit. This counts from one
+    state.json and one folder listing per document, with the same title keys, site
+    reading and ledger that ``plan_run`` uses.
+
+    A pointer, not the gate. Every chapter ``plan_run`` would offer is counted here; the
+    reverse is not promised, because the plan can still hold one back for a rarer reason
+    (posted under another number, too long for the editor, an empty file). The plan
+    decides what a run posts.
+    """
+    series = series_mod.get_series(sid)
+    if series is None:
+        raise ValueError("That series doesn't exist.")
+    targets = series.get("publish_targets") or []
+    target = next((t for t in targets if t.get("id") == target_id), None) or (
+        targets[0] if len(targets) == 1 else None)
+    if target is None:
+        raise ValueError("Pick which site to post to.")
+    adapter = load_adapter(adapter_name)
+    site = load_site(sid, target["id"])
+    trusted = bool(site.get("trusted", True))
+    numbers_on_site = site_numbers(site["titles"], adapter)
+    age = _age_seconds(site.get("fetched_at"))
+    out = {
+        "target_id": target["id"],
+        "numbered": False,
+        "ready": 0,
+        "ready_numbers": [],
+        "unfinished": 0,
+        "low_confidence": 0,
+        "site": {
+            "fetched_at": site.get("fetched_at"),
+            "age_seconds": age,
+            "fresh": age is not None and age <= FRESH_READING_SECONDS,
+            "trusted": trusted,
+            "why": site.get("why") or "",
+            "max_posted": max(numbers_on_site) if numbers_on_site else None,
+        },
+    }
+    mapping = series_mod.load_mapping(sid)
+    if not mapping:
+        return out
+    out["numbered"] = True
+
+    naming = (learn_naming(site["titles"], (adapter.get("site") or {}).get("title_template"))
+              if trusted else {})
+    on_site = {site_title_key(t) for t in site["titles"]}
+    posted = {site_title_key(e.get("title"))
+              for e in load_ledger(sid, target["id"]).get("entries", [])
+              if e.get("status") == "posted"}
+
+    states: dict[str, dict] = {}
+    files: dict[str, set[int]] = {}
+    for row in series_mod.reading_order(series, mapping):
+        number = row.get("global")
+        # Side stories are never swept into a run by number (see plan_run), so they are
+        # not "ready" in the sense this page means.
+        if row.get("kind") == "side" or number is None:
+            continue
+        pid, index = row["project_id"], row["index"]
+        if pid not in states:
+            project = pj.get_project(pid)
+            if project is None:
+                states[pid], files[pid] = {}, set()
+            else:
+                cfg = pj.project_config(Config(), project)
+                states[pid] = State.load(cfg.paths.state_file).chapters or {}
+                files[pid] = _chapter_indexes(cfg.paths.output_dir)
+        key = site_title_key(chapter_title(row, adapter, None, naming))
+        if key in on_site or key in posted:
+            continue
+        status = (states[pid].get(str(index)) or {}).get("status") or "pending"
+        if status not in POSTABLE_STATUSES or index not in files[pid]:
+            if status in _UNFINISHED_STATUSES:
+                out["unfinished"] += 1
+            continue
+        if row.get("confidence") == "low":
+            out["low_confidence"] += 1
+            continue
+        out["ready_numbers"].append(number)
+
+    # A reading that can't be believed blocks every chapter in plan_run, so nothing is
+    # ready here either -- the page says why instead of showing a count.
+    if not trusted:
+        out["ready_numbers"] = []
+    out["ready_numbers"].sort()
+    out["ready"] = len(out["ready_numbers"])
+    return out
+
+
 def chapter_payload(sid: str, project_id: str, index: int,
                     *, adapter_name: str = "meiko",
                     target_id: str | None = None) -> dict:

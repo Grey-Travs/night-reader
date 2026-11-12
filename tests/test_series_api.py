@@ -640,5 +640,79 @@ def test_preserving_confirmed_rows_does_not_freeze_the_rest(client):
     assert [r["source"] == "manual" for r in _rows(m, a)] == [True, False, False, False]
 
 
+# ---- chapters added to the end of a document ------------------------------
+#
+# The real case: tabs 17-35 were added to the third document of a three-document novel
+# and translated, but the stored numbering stopped at 216, so the new chapters never
+# reached the Series or Posting pages until someone pressed "Re-read documents".
+
+
+def test_chapters_added_at_the_end_are_numbered_on_their_own(client):
+    a = _novel(client, "Grows", [1, 2, 3])
+    sid = _series(client, "Grows", [a])
+    _write_tabs(a, [1, 2, 3, 4, 5])
+    m = client.get(f"/api/series/{sid}/mapping").json()
+    assert [r["global"] for r in _rows(m, a)] == [1, 2, 3, 4, 5]
+    assert m["auto_numbered"] == [4, 5] and m["unnumbered"] == []
+    assert m["last"] == 5
+    # Saved, so the next visit finds nothing new to do.
+    again = client.get(f"/api/series/{sid}/mapping").json()
+    assert again["auto_numbered"] == [] and [r["global"] for r in _rows(again, a)] == [1, 2, 3, 4, 5]
+
+
+def test_numbering_new_chapters_leaves_every_existing_row_exactly_as_it_was(client):
+    a = _novel(client, "Kept", [1, 2, 3])
+    sid = _series(client, "Kept", [a])
+    client.put(f"/api/series/{sid}/mapping", json={"overrides": [
+        {"project_id": a, "index": 2, "label": "a person's label"}]})
+    before = _rows(client.get(f"/api/series/{sid}/mapping").json(), a)
+    _write_tabs(a, [1, 2, 3, 4])
+    after = _rows(client.get(f"/api/series/{sid}/mapping").json(), a)
+    assert after[:3] == before
+
+
+def test_a_later_document_gets_its_new_chapters_too(client):
+    a = _novel(client, "Two Docs", [1, 2])
+    b = _novel(client, "Two Docs 2", [3, 4])
+    sid = _series(client, "Two Docs", [a, b])
+    _write_tabs(b, [3, 4, 5, 6])
+    m = client.get(f"/api/series/{sid}/mapping").json()
+    assert m["auto_numbered"] == [5, 6]
+    assert [r["global"] for r in _rows(m, b)] == [3, 4, 5, 6]
+
+
+def test_a_chapter_slipped_in_mid_document_is_flagged_not_numbered(client):
+    # Inserting a tab shifts every tab after it, so the old rows would no longer describe
+    # the same chapters. That needs a person, not a guess.
+    a = _novel(client, "Shifted", [1, 2, 3])
+    sid = _series(client, "Shifted", [a])
+    first = _rows(client.get(f"/api/series/{sid}/mapping").json(), a)
+    _write_tabs(a, [1, 2, 99, 3])
+    m = client.get(f"/api/series/{sid}/mapping").json()
+    assert m["auto_numbered"] == []
+    assert [(w["project_id"], w["count"]) for w in m["unnumbered"]] == [(a, 1)]
+    assert _rows(m, a) == first
+
+
+def test_a_new_number_already_taken_by_the_next_document_is_flagged(client):
+    a = _novel(client, "Clash", [1, 2])
+    b = _novel(client, "Clash 2", [3, 4])
+    sid = _series(client, "Clash", [a, b])
+    _write_tabs(a, [1, 2, 3])
+    m = client.get(f"/api/series/{sid}/mapping").json()
+    assert m["auto_numbered"] == []
+    assert [w["project_id"] for w in m["unnumbered"]] == [a]
+    assert m["duplicates"] == []
+
+
+def test_re_reading_still_numbers_everything(client):
+    a = _novel(client, "Reread", [1, 2])
+    sid = _series(client, "Reread", [a])
+    _write_tabs(a, [1, 2, 3])
+    m = client.get(f"/api/series/{sid}/mapping?refresh=true").json()
+    assert [r["global"] for r in _rows(m, a)] == [1, 2, 3]
+    assert m["auto_numbered"] == [] and m["unnumbered"] == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

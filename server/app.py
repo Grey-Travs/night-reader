@@ -4652,6 +4652,68 @@ async def merge_series_glossary(sid: str, body: MergeGlossaries) -> dict:
         raise HTTPException(400, str(exc)) from exc
 
 
+def _local_member_chapters(pid: str) -> list:
+    """A member's chapters as this computer already has them, without going online.
+
+    The in-process cache first (it is the newest), then the stored source: pasted text
+    and photo novels keep theirs, a Google Doc keeps the snapshot cache_source wrote the
+    last time it was fetched. An empty list means "can't tell", never "no chapters".
+    """
+    if pid in _chapter_cache:
+        return _chapter_cache[pid]
+    project = pj.get_project(pid) or {}
+    if project.get("source_type") in ("text", "images"):
+        return pj.load_text_chapters(pid)
+    return pj.load_cached_source(pid)
+
+
+def _number_new_chapters(sid: str, series: dict, *, quick: bool = False) -> dict:
+    """Give numbers to chapters added at the end of a series' documents, and say which
+    new chapters could not be numbered safely.
+
+    Runs when the Series or Posting page asks for this series, so chapters added to a
+    document show up there without anyone pressing "Re-read documents". Cheap when nothing
+    changed: it only re-reads the numbering when a member holds a different number of
+    chapters than it has rows. series_mod.number_new_chapters decides what is safe.
+
+    ``quick`` is for the overview of every series at once. It first compares the chapter
+    count each document last reported (project.json, kept current whenever the app reads
+    the document) and reads chapter text only for a series where that differs, because
+    reading every document's text for 38 novels on each visit is too slow on this disk.
+    """
+    out = {"added": [], "waiting": []}
+    stored = series_mod.load_mapping(sid)
+    if not stored:
+        return out
+    rows_by_pid = {pid: len(m.get("rows") or [])
+                   for pid, m in (stored.get("members") or {}).items()}
+    if quick:
+        def known(pid: str) -> int:
+            cached = len(_chapter_cache.get(pid) or [])
+            return cached or int((pj.get_project(pid) or {}).get("chapter_count") or 0)
+        if all(known(pid) in (0, rows_by_pid.get(pid, 0))
+               for pid in series_mod.member_ids(series)):
+            return out
+    chapters_by_pid: dict[str, list] = {}
+    for pid in series_mod.member_ids(series):
+        try:
+            chapters_by_pid[pid] = _local_member_chapters(pid)
+        except Exception:  # noqa: BLE001 — a member that can't be read is left as it is
+            continue
+    if all(not chs or len(chs) == rows_by_pid.get(pid, 0)
+           for pid, chs in chapters_by_pid.items()):
+        return out
+    result = series_mod.number_new_chapters(series, chapters_by_pid)
+    if result["doc"] is not None:
+        series_mod.save_mapping(sid, result["doc"])
+    out["added"] = result["added"]
+    out["waiting"] = [
+        {"project_id": pid, "name": (pj.get_project(pid) or {}).get("name") or "", "count": n}
+        for pid, n in result["waiting"].items()
+    ]
+    return out
+
+
 @app.get("/api/series/{sid}/mapping")
 async def series_mapping(sid: str, refresh: bool = False) -> dict:
     """The resolved chapter numbering, plus the flags the review table needs.
@@ -4663,7 +4725,11 @@ async def series_mapping(sid: str, refresh: bool = False) -> dict:
     series = require_series(sid)
     stored = series_mod.load_mapping(sid)
     if stored and not refresh:
-        return {"series": _series_summary(series, stored), **stored}
+        auto = await run_in_threadpool(_number_new_chapters, sid, series)
+        if auto["added"]:
+            stored = series_mod.load_mapping(sid) or stored
+        return {"series": _series_summary(series, stored), **stored,
+                "auto_numbered": auto["added"], "unnumbered": auto["waiting"]}
 
     chapters_by_pid: dict[str, list] = {}
     for pid in series_mod.member_ids(series):
@@ -4676,7 +4742,8 @@ async def series_mapping(sid: str, refresh: bool = False) -> dict:
             errors.log_error(errors.explain(exc), where=f"series/{sid}/{pid}")
     doc = series_mod.resolve_mapping(series, chapters_by_pid)
     series_mod.save_mapping(sid, doc)
-    return {"series": _series_summary(series, doc), **doc}
+    return {"series": _series_summary(series, doc), **doc,
+            "auto_numbered": [], "unnumbered": []}
 
 
 @app.put("/api/series/{sid}/mapping")
@@ -4810,16 +4877,60 @@ async def posting_plan(sid: str, target_id: str | None = None,
                        site: str = "meiko") -> dict:
     """Everything a run would post, and every reason a chapter might be held back.
 
-    Writes nothing and opens no browser. Reads each chapter off disk to measure it, hence
-    the threadpool.
+    Opens no browser. The one thing it may write is the numbering for chapters newly
+    added at the end of a document (see _number_new_chapters); the plan itself writes
+    nothing. Reads each chapter off disk to measure it, hence the threadpool.
     """
-    require_series(sid)
+    series = require_series(sid)
+    # Before planning, so chapters just added to a document are in the plan rather than
+    # silently missing from it. Planning itself still writes nothing.
+    auto = await run_in_threadpool(_number_new_chapters, sid, series)
     try:
-        return await run_in_threadpool(
+        plan = await run_in_threadpool(
             posting.plan_run, sid, target_id, start=start, end=end, adapter_name=site
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    return {**plan, "auto_numbered": auto["added"], "unnumbered": auto["waiting"]}
+
+
+@app.get("/api/posting/available")
+def posting_available() -> dict:
+    """Every series with a publishing link, and how many chapters each has ready to post.
+
+    The overview at the top of the Posting page. A quick count per series
+    (posting.availability), not a plan: the plan for the series picked still decides what
+    a run posts. Chapters newly added to the end of a document are numbered first, the
+    same as on the Series and Posting pages, so they are counted. Views come from the
+    studio's own series list the extension pushes, so the busiest novels sort first.
+    """
+    views = {}
+    for row in importing.load_catalogue().get("series") or []:
+        views[str(row.get("uid") or "")] = int(row.get("views") or 0)
+    out = []
+    for series in series_mod.list_series():
+        for target in series.get("publish_targets") or []:
+            if (target.get("site") or "meiko") != "meiko":
+                continue
+            sid = series["id"]
+            try:
+                auto = _number_new_chapters(sid, series, quick=True)
+                summary = posting.availability(sid, target.get("id"))
+            except Exception as exc:  # noqa: BLE001 — one bad series must not hide the rest
+                errors.log_error(errors.explain(exc), where=f"posting/available/{sid}")
+                continue
+            match = re.search(r"/series/([^/?#]+)", str(target.get("series_url") or ""))
+            out.append({
+                "sid": sid,
+                "name": series.get("name") or "",
+                "archived": bool(series.get("archived")),
+                "views": views.get(match.group(1), 0) if match else 0,
+                **summary,
+                "auto_numbered": auto["added"],
+                "unnumbered": auto["waiting"],
+            })
+    out.sort(key=lambda r: (-r["views"], r["name"].casefold()))
+    return {"series": out, "fresh_seconds": posting.FRESH_READING_SECONDS}
 
 
 @app.get("/api/posting/payload")

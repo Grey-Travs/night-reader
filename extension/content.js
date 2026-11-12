@@ -1434,6 +1434,83 @@ async function pushCatalogue({ force = false } = {}) {
 }
 
 /**
+ * Read every linked novel's chapter list off the site, and hand each to Night Reader.
+ *
+ * The Posting page's "Available to post" counts are only as fresh as the last time each
+ * novel's page was opened here, and in November 2026 thirty of thirty-eight had not been
+ * for weeks or ever -- so a fully posted novel showed 233 chapters "ready". This is the
+ * one-press fix: the same read-only call refreshChapterIndex makes (no pages=true, so no
+ * text), once per novel, pushed exactly as opening that novel would push it.
+ *
+ * Merge, not replace, as everywhere else: a reading can only ever add titles, so a
+ * chapter deleted on the site leaves a ghost that blocks rather than a gap that permits a
+ * duplicate. Works from the studio list or any series page.
+ */
+async function readEveryNovel() {
+  if (busy) return
+  busy = true
+  startLog('# Reading every novel from the site')
+  try {
+    const studio_uid = (location.pathname.match(/\/page\/([^/]+)/) || [])[1] || ''
+    if (!studio_uid) throw new Error('open the studio or any novel on meiko.studio first')
+    const left = await tokenSecondsLeft()
+    if (left !== null && left <= 60) {
+      throw new Error('the site session is about to run out. Refresh this tab and press it again.')
+    }
+    const userid = observedParam('userid')
+    const res = await api('GET', '/app/series', { studio_uid, userid })
+    const all = (Array.isArray(res?.data) ? res.data : []).filter((s) => s && s.uid)
+    let read = 0
+    let notLinked = 0
+    let empty = 0
+    let failed = 0
+    for (const s of all) {
+      const name = String(s.displayName || s.uid)
+      let m = null
+      try {
+        m = await ask('match', { url: `${location.origin}/page/${studio_uid}/series/${s.uid}/` })
+      } catch { /* treated as not linked */ }
+      if (!m?.found) {
+        notLinked += 1
+        continue
+      }
+      try {
+        const chs = await api('GET', '/app/chapter', { studio_uid, series_uid: s.uid, userid })
+        const rows = (Array.isArray(chs?.data) ? chs.data : [])
+          .filter((r) => recordKind(r) === 'chapter' && String(r.series_uid || '') === s.uid
+            && r.displayName)
+          .map(toSiteRow)
+        if (!rows.length) {
+          // The app refuses an empty list (it can't tell "nothing posted" from a page that
+          // hadn't loaded), so there is nothing to send. Every chapter is unposted anyway.
+          empty += 1
+          say(`  ${name} · no chapters on the site yet`)
+        } else {
+          await ask('site', { sid: m.sid, targetId: m.target_id, rows, mode: 'merge', source: 'api' })
+          read += 1
+          say(`  ${name} · ${rows.length} chapters`)
+        }
+      } catch (e) {
+        failed += 1
+        say(`  ${name} · could not read it (${e.message})`)
+      }
+      // One novel at a time, a little apart: forty quick reads in a row is the kind of
+      // burst that looks worth rate-limiting.
+      await new Promise((r) => setTimeout(r, 400))
+    }
+    say(`\nRead ${read} novel${read === 1 ? '' : 's'}`
+      + `${empty ? `, ${empty} with nothing posted yet` : ''}`
+      + `${failed ? `, ${failed} failed` : ''}.`
+      + ` ${notLinked} on the site ${notLinked === 1 ? "isn't" : "aren't"} linked to a series in Night Reader.`)
+    say('Night Reader’s Posting page is up to date now — refresh it to see.')
+  } catch (e) {
+    say(`\nfailed: ${e.message}`)
+  } finally {
+    busy = false
+  }
+}
+
+/**
  * Read this series and report what importing it would do. Writes nothing, either side.
  *
  * Two presses on purpose. A hundred and fifty chapters arriving under the wrong name, or
@@ -2541,6 +2618,7 @@ function build() {
       <button class="nr-btn" data-act="check">Check this novel</button>
       <button class="nr-btn nr-go" data-act="import">Import it</button>
       <button class="nr-btn" data-act="catalogue">Send novel list</button>
+      <button class="nr-btn" data-act="readall">Read every novel</button>
     </div>
     <div class="nr-row nr-diag">
       <button class="nr-btn" data-act="probe">Probe page</button>
@@ -2642,6 +2720,7 @@ function build() {
         ? `\nSent ${n} novels. They are on the Import page now.`
         : '\nCould not read the list. Open the studio page and try again.'))
     }
+    if (act === 'readall') readEveryNovel()
     if (act === 'fetch1') probeChapterFetch()
     if (act === 'private' || act === 'public') {
       const box = panel.querySelector('.nr-count')
