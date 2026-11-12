@@ -1,4 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { api } from '../api'
 import { copyText } from '../clipboard'
 import { formatReport, toExplained } from '../errors'
 
@@ -34,9 +36,20 @@ const ACTION_LABEL = {
   setup: 'Run full setup',
 }
 
+// The missing-permission error is answered by the same sign-in, but asking for the WRITE
+// permission. A plain reconnect would re-approve read-only access, which the saved token
+// already has, so Google would never even show a consent screen and nothing would change.
+const wantsWrite = (e) => e.code === 'google-scope'
+const actionLabel = (e) =>
+  e.action === 'reconnect-google' && wantsWrite(e) ? 'Allow writing to Docs' : ACTION_LABEL[e.action]
+
 export function ErrorDialog({ e, context = '', onRetry, onAction, onClose }) {
   const [copied, setCopied] = useState(false)
+  const [connecting, setConnecting] = useState(false)
+  const [actionError, setActionError] = useState(null)
   const primaryRef = useRef(null)
+  const open = useRef(true)
+  const navigate = useNavigate()
 
   useEffect(() => {
     primaryRef.current?.focus()
@@ -44,6 +57,24 @@ export function ErrorDialog({ e, context = '', onRetry, onAction, onClose }) {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
+  useEffect(() => () => { open.current = false }, [])
+
+  // Sign-in waits for the person to finish in Google's window, so the dialog stays open
+  // and says so rather than vanishing as if it had worked. Once it has, the thing that
+  // failed is tried again: that is what they were doing, and the reason it stopped is gone.
+  async function reconnectGoogle() {
+    setConnecting(true); setActionError(null)
+    try {
+      await api.googleLogin(wantsWrite(e))
+      if (!open.current) return // closed while waiting: don't start anything behind their back
+      onClose()
+      onRetry?.()
+    } catch (err) {
+      if (!open.current) return
+      setActionError(String(err?.message || err))
+      setConnecting(false)
+    }
+  }
 
   async function copy() {
     const ok = await copyText(formatReport(e, context))
@@ -51,11 +82,19 @@ export function ErrorDialog({ e, context = '', onRetry, onAction, onClose }) {
     setTimeout(() => setCopied(false), 1800)
   }
 
-  // The action button only appears when we know what it should do: `retry` needs a
-  // handler from the caller, the navigational ones can act on their own.
-  const label = ACTION_LABEL[e.action]
-  const act = e.action === 'retry' ? onRetry : onAction
-  const showAction = !!label && (e.action !== 'retry' || !!onRetry)
+  // The action button only appears when something will actually happen. It used to show
+  // for every known action and call `onAction`, which no caller ever passed, so "Reconnect
+  // Google" closed the dialog and did nothing. Now the dialog handles the ones it can on
+  // its own; a caller's `onAction` still wins, and `retry` still needs the caller's handler.
+  const builtIn = {
+    'reconnect-google': reconnectGoogle,
+    settings: () => { onClose(); navigate('/settings') },
+  }
+  const label = actionLabel(e)
+  const act = e.action === 'retry'
+    ? (onRetry && (() => { onClose(); onRetry() }))
+    : onAction ? () => { onClose(); onAction() } : builtIn[e.action]
+  const showAction = !!label && !!act
 
   return (
     <div
@@ -91,14 +130,23 @@ export function ErrorDialog({ e, context = '', onRetry, onAction, onClose }) {
           </>
         )}
 
+        {connecting && (
+          <p className="mt-4 text-sm" role="status">
+            A Google window has opened on the computer running Night Reader. Approve it
+            there{onRetry ? ', and this will carry on by itself' : ''}.
+          </p>
+        )}
+        {actionError && <p className="mt-4 text-sm pill-review rounded-btn px-3 py-2">{actionError}</p>}
+
         <div className="mt-5 flex flex-wrap items-center gap-2">
           {showAction && (
             <button
               ref={primaryRef}
-              onClick={() => { onClose(); act?.() }}
-              className="btn btn-primary px-4 py-2 text-sm"
+              onClick={act}
+              disabled={connecting}
+              className="btn btn-primary px-4 py-2 text-sm disabled:opacity-60"
             >
-              {label}
+              {connecting ? 'Waiting for Google…' : label}
             </button>
           )}
           <button
