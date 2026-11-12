@@ -13,15 +13,21 @@ Where the tokens come from, and what is NOT counted:
   The quick look the phone asks for and the seam joins between pages record their cost
   but not their tokens, so they are absent from the token total (and present in the
   plan-equivalent cost through ``pages.json``).
+
+Chapters per month count each translated chapter once, in the month it was FIRST
+translated (``translation_bot.state.translated_at``), in this PC's time zone. Re-translating
+or editing a chapter later does not move it, so the months add up to "Chapters translated".
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 
-from translation_bot.state import DONE_STATUSES
+from translation_bot.state import DONE_STATUSES, translated_at
 
 from . import posting
 from . import projects as pj
@@ -55,6 +61,45 @@ def _add(acc: dict, usage) -> None:
             acc[key] += int(value)
 
 
+def _month(iso) -> str | None:
+    """The calendar month ("2026-09") a timestamp falls in on this PC's clock, or None.
+
+    Local rather than UTC because the PC is where the user is: a chapter finished at 1am
+    on the 1st belongs to the month on their calendar, not the one in Greenwich.
+    """
+    if not isinstance(iso, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+
+def _next_month(month: str) -> str:
+    year, mon = int(month[:4]), int(month[5:7])
+    return f"{year + mon // 12:04d}-{mon % 12 + 1:02d}"
+
+
+def monthly(chapters: Counter, novels: dict, current: str) -> list[dict]:
+    """One row per month from the first chapter to ``current``, quiet months included.
+
+    A month with nothing in it is a row with zero rather than a missing one, so a break
+    shows as a break instead of two busy months looking back to back.
+    """
+    if not chapters:
+        return []
+    out, month = [], min(chapters)
+    last = max(max(chapters), current)
+    while month <= last:
+        out.append({"month": month, "chapters": chapters.get(month, 0),
+                    "novels": len(novels.get(month) or ())})
+        month = _next_month(month)
+    return out
+
+
 def _git(*args: str) -> str | None:
     try:
         out = subprocess.run(["git", *args], cwd=pj.PROJECT_ROOT, capture_output=True,
@@ -86,6 +131,9 @@ def compute() -> dict:
     rewrites = 0
     unreadable = 0
     earliest = None
+    per_month: Counter = Counter()
+    month_projects: dict[str, set] = defaultdict(set)
+    undated = 0
 
     projects = pj.list_projects()
     for project in projects:
@@ -111,6 +159,12 @@ def compute() -> dict:
                     status = rec.get("status")
                     if status in DONE_STATUSES:
                         chapters["translated"] += 1
+                        month = _month(translated_at(rec))
+                        if month:
+                            per_month[month] += 1
+                            month_projects[month].add(pid)
+                        else:
+                            undated += 1
                     elif status == "needs-review":
                         chapters["needs_review"] += 1
                     elif status == "english-source":
@@ -155,6 +209,13 @@ def compute() -> dict:
     novels_archived = (sum(1 for s in series_list if s.get("archived"))
                        + sum(1 for p in standalone if p.get("archived")))
 
+    # "Novels" per month on the same terms: a series counts once however many of its
+    # documents had chapters translated that month.
+    novel_of = {str(m.get("project_id")): f"s:{s['id']}"
+                for s in series_list for m in s.get("members") or []}
+    month_novels = {month: {novel_of.get(pid, f"p:{pid}") for pid in pids}
+                    for month, pids in month_projects.items()}
+
     posted = 0
     novels_posting = 0
     last_post = None
@@ -188,6 +249,8 @@ def compute() -> dict:
         "tokens": {**tokens, "total": sum(tokens.values()), "by_source": sources},
         "cost_usd": round(cost, 2),
         "chapters": chapters,
+        "monthly": {"months": monthly(per_month, month_novels, _month(datetime.now().astimezone().isoformat())),
+                    "undated": undated},
         "novels": {"total": novels_total, "archived": novels_archived,
                    "active": novels_total - novels_archived},
         "posted": {"chapters": posted, "novels": novels_posting, "last_at": last_post},

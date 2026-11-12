@@ -27,9 +27,27 @@ STATUS_ENGLISH = "english-source"  # tab already in English — skipped, not tra
 # or the source hash changed).
 DONE_STATUSES = {STATUS_VALIDATED}
 
+# Statuses a chapter reaches only by Claude having translated it, whether or not the
+# checks then passed.
+TRANSLATED_STATUSES = {STATUS_VALIDATED, STATUS_NEEDS_REVIEW}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def translated_at(rec: dict) -> str | None:
+    """When this chapter was FIRST translated, as near as the record can say.
+
+    ``translated_at`` is stamped once and never moved, so re-translating, fixing pronouns
+    or editing the text later leaves it alone (``updated_at`` moves on every one of those).
+    Records from before it existed fall back to ``created_at``: the record is normally
+    created by the very update that saves the first translation, so that is when it
+    happened, give or take a rate-limit pause. :meth:`State.update` uses this same answer
+    when it stamps one of those old records, so a chapter never jumps month on the
+    Stats page just because it was touched again.
+    """
+    return rec.get("translated_at") or rec.get("created_at")
 
 
 class State:
@@ -79,9 +97,12 @@ class State:
 
     def update(self, index: int, **fields) -> dict:
         rec = self.chapters.setdefault(str(index), {})
+        before = rec.get("status")
         rec.update(fields)
         rec["updated_at"] = _now()
         rec.setdefault("created_at", rec["updated_at"])
+        if fields.get("status") in TRANSLATED_STATUSES and "translated_at" not in rec:
+            rec["translated_at"] = translated_at(rec) if before in TRANSLATED_STATUSES else rec["updated_at"]
         return rec
 
     def add_usage(self, index: int, usage: dict, cost: float) -> None:

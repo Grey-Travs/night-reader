@@ -104,6 +104,117 @@ function TokenHero({ tokens }) {
   )
 }
 
+// "2026-09" -> a date in that month, for the browser to name in the reader's language.
+const monthDate = (m) => new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)) - 1, 1)
+const monthLong = (m) => monthDate(m).toLocaleDateString(undefined, { month: 'long', year: 'numeric' })
+const monthShort = (m) => monthDate(m).toLocaleDateString(undefined, { month: 'short' })
+const plural = (n, word) => `${fmtInt(n)} ${word}${n === 1 ? '' : 's'}`
+
+// Chapters translated per month: one bar each, oldest on the left, this month last.
+// Only the best month and this month carry a number on the bar; every month's figures
+// show in the line above the bars on hover or focus (a line rather than a floating
+// tooltip, which the scrolling box would clip at either end), and in the table below.
+function MonthlyChapters({ monthly }) {
+  const [hover, setHover] = useState(null)
+  const months = monthly?.months || []
+  const undated = monthly?.undated || 0
+  if (!months.length) return null
+
+  const current = months[months.length - 1].month
+  const max = Math.max(1, ...months.map((r) => r.chapters))
+  const best = months.reduce((a, r) => (r.chapters > a.chapters ? r : a), months[0])
+  const full = months.filter((r) => r.month !== current)
+  const average = full.length ? Math.round(full.reduce((n, r) => n + r.chapters, 0) / full.length) : null
+  const describe = (r) => `${monthLong(r.month)}${r.month === current ? ' (so far)' : ''}: ${plural(r.chapters, 'chapter')}`
+    + (r.novels ? ` across ${plural(r.novels, 'novel')}` : '')
+
+  return (
+    <section className="card p-5 sm:p-6">
+      <h2 className="font-reading text-lg font-medium">Chapters translated per month</h2>
+      <p className="mt-0.5 text-sm text-hint">
+        Best: {monthLong(best.month)}, {plural(best.chapters, 'chapter')}
+        {average != null && <> · about {fmtInt(average)} a month</>}
+      </p>
+
+      <p className="mt-4 text-sm text-ink" style={{ minHeight: '1.25rem' }} aria-live="polite">
+        {hover ? describe(months.find((r) => r.month === hover)) : <span className="text-hint">Point at a month for its numbers.</span>}
+      </p>
+
+      <div className="mt-2 overflow-x-auto pb-1">
+        <ol className="flex min-w-full items-end gap-2" style={{ height: '11rem' }} aria-label="Chapters translated per month">
+          {months.map((r) => {
+            const labelled = r.month === best.month || r.month === current
+            return (
+              <li
+                key={r.month}
+                tabIndex={0}
+                aria-label={describe(r)}
+                className="flex h-full min-w-[2.5rem] flex-1 flex-col items-center justify-end rounded-sm outline-none focus-visible:ring-2"
+                onMouseEnter={() => setHover(r.month)}
+                onMouseLeave={() => setHover(null)}
+                onFocus={() => setHover(r.month)}
+                onBlur={() => setHover(null)}
+              >
+                {labelled && r.chapters > 0 && (
+                  <span className="mb-1 text-xs font-medium tabular-nums text-ink" aria-hidden>{fmtInt(r.chapters)}</span>
+                )}
+                <span
+                  aria-hidden
+                  className="block w-full max-w-[3rem]"
+                  style={{
+                    // Leaves room above the tallest bar for its number.
+                    height: `calc((100% - 1.25rem) * ${r.chapters / max})`,
+                    minHeight: r.chapters ? 2 : 0,
+                    background: 'var(--accent)',
+                    opacity: hover && hover !== r.month ? 0.55 : 1,
+                    borderRadius: '4px 4px 0 0',
+                  }}
+                />
+              </li>
+            )
+          })}
+        </ol>
+        <div className="flex min-w-full gap-2 border-t border-line pt-1.5" aria-hidden>
+          {months.map((r, i) => (
+            <div key={r.month} className="min-w-[2.5rem] flex-1 text-center text-xs leading-tight text-muted">
+              {monthShort(r.month)}
+              {(i === 0 || r.month.endsWith('-01')) && <div className="text-[10px] text-hint">{r.month.slice(0, 4)}</div>}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <details className="mt-4">
+        <summary className="cursor-pointer text-xs text-hint hover:text-accent-text">Show as a table</summary>
+        <div className="mt-2 overflow-x-auto">
+          <table className="w-full text-sm tabular-nums">
+            <thead>
+              <tr className="text-left text-xs text-muted">
+                <th className="py-1 pr-4 font-medium">Month</th>
+                <th className="py-1 pr-4 text-right font-medium">Chapters</th>
+                <th className="py-1 text-right font-medium">Novels</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...months].reverse().map((r) => (
+                <tr key={r.month} className="border-t border-line">
+                  <td className="py-1 pr-4">{monthLong(r.month)}{r.month === current ? ' (so far)' : ''}</td>
+                  <td className="py-1 pr-4 text-right">{fmtInt(r.chapters)}</td>
+                  <td className="py-1 text-right">{fmtInt(r.novels)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+
+      {undated > 0 && (
+        <p className="mt-3 text-xs text-hint">{plural(undated, 'older chapter')} {undated === 1 ? 'has' : 'have'} no date saved, so {undated === 1 ? 'it isn’t' : 'they aren’t'} in any month.</p>
+      )}
+    </section>
+  )
+}
+
 function Feature({ name, text }) {
   const [open, setOpen] = useState(false)
   const id = `feat-${name.replace(/\W+/g, '-').toLowerCase()}`
@@ -177,6 +288,8 @@ export default function StatsPage() {
             <StatCard label="Pages read from photos" value={fmtInt(data.pages_read)} sub="transcribed by Claude" />
             <StatCard label="Paragraph rewrites" value={fmtInt(data.rewrites)} sub="single paragraphs redone" />
           </section>
+
+          <MonthlyChapters monthly={data.monthly} />
 
           {data.unreadable > 0 && (
             <p className="text-xs text-hint">{data.unreadable} file{data.unreadable === 1 ? '' : 's'} could not be read and {data.unreadable === 1 ? 'is' : 'are'} left out of these totals.</p>

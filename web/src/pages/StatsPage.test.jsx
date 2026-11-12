@@ -22,6 +22,17 @@ const sample = {
   app_updates: { count: 73, since: '2026-06-10T23:10:03+08:00' },
   pages_read: 0, rewrites: 0, glossary_names: 4387,
   since: '2026-06-12T16:06:40+00:00', unreadable: 0,
+  monthly: {
+    months: [
+      { month: '2026-06', chapters: 908, novels: 9 },
+      { month: '2026-07', chapters: 812, novels: 11 },
+      { month: '2026-08', chapters: 683, novels: 8 },
+      { month: '2026-09', chapters: 1550, novels: 14 },
+      { month: '2026-10', chapters: 0, novels: 0 },
+      { month: '2026-11', chapters: 584, novels: 6 },
+    ],
+    undated: 0,
+  },
 }
 
 beforeEach(() => {
@@ -48,6 +59,34 @@ describe('stats page', () => {
     expect(screen.getByRole('tooltip').textContent).toMatch(/nothing goes up twice/)
     fireEvent.mouseLeave(chip)
     expect(screen.queryByRole('tooltip')).toBeNull()
+  })
+
+  it('shows chapters translated each month, with the best one called out', async () => {
+    render(<StatsPage />)
+    const chart = await screen.findByRole('list', { name: 'Chapters translated per month' })
+    expect(chart.querySelectorAll('li')).toHaveLength(6)
+    // Every month is readable without hovering, including the quiet one and this one.
+    expect(screen.getByLabelText(/September 2026: 1,550 chapters across 14 novels/)).toBeTruthy()
+    expect(screen.getByLabelText(/October 2026: 0 chapters$/)).toBeTruthy()
+    expect(screen.getByLabelText(/November 2026 \(so far\): 584 chapters/)).toBeTruthy()
+    // The average leaves out the month still in progress: (908+812+683+1550+0) / 5.
+    expect(screen.getByText(/Best: September 2026, 1,550 chapters/).textContent).toMatch(/about 791 a month/)
+  })
+
+  it('gives a month’s numbers when it is pointed at', async () => {
+    render(<StatsPage />)
+    const july = await screen.findByLabelText(/July 2026/)
+    fireEvent.mouseEnter(july)
+    expect(screen.getByText('July 2026: 812 chapters across 11 novels')).toBeTruthy()
+    fireEvent.mouseLeave(july)
+    expect(screen.getByText('Point at a month for its numbers.')).toBeTruthy()
+  })
+
+  it('leaves the chart out when no chapter has a date', async () => {
+    api.stats.mockResolvedValue({ ...sample, monthly: { months: [], undated: 3 } })
+    render(<StatsPage />)
+    await screen.findByText('198.1M')
+    expect(screen.queryByRole('list', { name: 'Chapters translated per month' })).toBeNull()
   })
 
   it('says so when the numbers cannot be loaded', async () => {

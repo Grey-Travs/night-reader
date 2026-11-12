@@ -9,6 +9,8 @@ parse skipped rather than moved aside.
 import json
 import os
 import sys
+from collections import Counter
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,6 +21,7 @@ import server.posting as posting  # noqa: E402
 import server.projects as pj  # noqa: E402
 import server.series as series_mod  # noqa: E402
 import server.stats as stats  # noqa: E402
+import translation_bot.state as state_mod  # noqa: E402
 
 
 def _write(path, doc):
@@ -103,6 +106,80 @@ def test_chapters_novels_posts_and_the_rest():
     assert out["glossary_names"] == 3
     assert out["since"] == "2026-01-01T00:00:00+00:00"
     assert out["unreadable"] == 0
+    # The fixture's chapters carry no dates at all: counted, but in no month.
+    assert out["monthly"] == {"months": [], "undated": 2}
+
+
+def test_chapters_are_counted_in_the_month_they_were_first_translated(library):
+    noon = lambda day: f"{day}T12:00:00+00:00"  # midday, so no time zone moves the month
+    _write(library / "aaaaaaaaaaaa" / "state.json", {"chapters": {
+        # Translated in June and edited in September: it stays in June.
+        "1": {"status": "validated", "translated_at": noon("2026-06-10"),
+              "created_at": noon("2026-06-10"), "updated_at": noon("2026-09-01")},
+        # From before the stamp existed: its created_at stands in.
+        "2": {"status": "validated", "created_at": noon("2026-06-20"), "updated_at": noon("2026-08-01")},
+        # Still waiting for review: not done, so not counted anywhere.
+        "3": {"status": "needs-review", "created_at": noon("2026-07-01")},
+        "4": {"status": "validated", "created_at": noon("2026-08-15")},
+    }})
+    _write(library / "bbbbbbbbbbbb" / "state.json", {"chapters": {
+        "1": {"status": "validated", "created_at": noon("2026-06-15")},
+    }})
+    out = stats.compute()
+    rows = {r["month"]: r for r in out["monthly"]["months"]}
+    # Two documents of the same series are one novel.
+    assert rows["2026-06"] == {"month": "2026-06", "chapters": 3, "novels": 1}
+    assert rows["2026-07"] == {"month": "2026-07", "chapters": 0, "novels": 0}
+    assert rows["2026-08"]["chapters"] == 1
+    assert "2026-09" in rows and rows["2026-09"]["chapters"] == 0
+    # The months add up to the headline count, and run without gaps up to this month.
+    assert sum(r["chapters"] for r in out["monthly"]["months"]) == out["chapters"]["translated"]
+    months = [r["month"] for r in out["monthly"]["months"]]
+    assert months[0] == "2026-06"
+    assert months[-1] == stats._month(datetime.now().astimezone().isoformat())
+    assert out["monthly"]["undated"] == 0
+
+
+def test_months_run_on_across_a_new_year():
+    rows = stats.monthly(Counter({"2026-11": 2, "2027-02": 1}), {"2026-11": {"x", "y"}}, "2027-01")
+    assert [(r["month"], r["chapters"], r["novels"]) for r in rows] == [
+        ("2026-11", 2, 2), ("2026-12", 0, 0), ("2027-01", 0, 0), ("2027-02", 1, 0)]
+    assert stats.monthly(Counter(), {}, "2026-11") == []
+
+
+# --- the date a chapter was translated (translation_bot/state.py)
+
+@pytest.fixture
+def clock(monkeypatch):
+    """A clock that says whatever the test last set it to."""
+    now = {"t": "2026-11-01T00:00:00+00:00"}
+    monkeypatch.setattr(state_mod, "_now", lambda: now["t"])
+    return now
+
+
+def test_the_first_translation_is_stamped_and_later_work_leaves_it(clock):
+    st = state_mod.State()
+    st.update(1, status="pending")
+    assert "translated_at" not in st.get(1)
+    clock["t"] = "2026-11-02T00:00:00+00:00"
+    st.update(1, status="needs-review")
+    assert st.get(1)["translated_at"] == "2026-11-02T00:00:00+00:00"
+    # Approved, re-translated and edited later: still the day Claude first translated it.
+    for later, fields in (("2026-11-05", {"status": "validated"}),
+                          ("2026-12-01", {"status": "validated"}),
+                          ("2026-12-02", {"manual_edit": True})):
+        clock["t"] = f"{later}T00:00:00+00:00"
+        st.update(1, **fields)
+    assert st.get(1)["translated_at"] == "2026-11-02T00:00:00+00:00"
+    assert st.get(1)["updated_at"] == "2026-12-02T00:00:00+00:00"
+
+
+def test_an_old_chapter_keeps_its_month_when_touched_again(clock):
+    st = state_mod.State({"chapters": {"1": {"status": "validated",
+                                             "created_at": "2026-06-10T00:00:00+00:00"}}})
+    clock["t"] = "2026-11-20T00:00:00+00:00"
+    st.update(1, status="validated")  # e.g. re-translated today
+    assert st.get(1)["translated_at"] == "2026-06-10T00:00:00+00:00"
 
 
 def test_an_unreadable_file_is_skipped_and_left_where_it_is(library):
