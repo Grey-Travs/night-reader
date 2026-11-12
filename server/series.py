@@ -391,6 +391,31 @@ def delete_series(sid: str) -> bool:
     return True
 
 
+def remove_member(sid: str, pid: str) -> dict | None:
+    """Take one document out of a series, and its rows out of the numbering.
+
+    For a novel that has been deleted. Left in, the series kept pointing at a folder that
+    no longer existed, and every page that walks the members answered "project not
+    found". Everything else the series holds -- the posting ledger, the glossary, the
+    other members and every number they already have -- is left exactly as it was.
+
+    Returns the updated series, or None when there is no such series or it never had
+    this document.
+    """
+    series = get_series(sid)
+    if not series or pid not in member_ids(series):
+        return None
+    series["members"] = [m for m in series.get("members") or []
+                         if m.get("project_id") != pid]
+    write_series(series)
+    doc = load_mapping(sid)
+    if doc and pid in (doc.get("members") or {}):
+        doc["members"].pop(pid)
+        doc.update(_series_totals(doc))
+        save_mapping(sid, doc)
+    return series
+
+
 def now() -> str:
     """A timestamp in the format every manifest here uses."""
     return _now()

@@ -1571,9 +1571,15 @@ def get_project(pid: str) -> dict:
 
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: str) -> dict:
+    series = series_mod.series_for_project(pid)
     if not pj.delete_project(pid):
         raise HTTPException(404, "project not found")
     _chapter_cache.pop(pid, None)
+    # A deleted document leaves its series too. Otherwise the series goes on pointing at
+    # a folder that is gone, and every page that walks its members fails with "project
+    # not found" -- which the error layer then dresses up as a missing Google Doc.
+    if series:
+        series_mod.remove_member(series["id"], pid)
     return {"ok": True}
 
 

@@ -247,6 +247,29 @@ def test_deleting_a_series_leaves_the_novels_alone(client):
         assert client.get(f"/api/projects/{pid}/chapters").status_code == 200
 
 
+def test_deleting_a_novel_takes_it_out_of_its_series(client):
+    a = _novel(client, "Gone Novel", [1, 2])
+    b = _novel(client, "Gone Novel2", [3, 4])
+    sid = _series(client, "Gone", [a, b])
+    assert client.delete(f"/api/projects/{a}").status_code == 200
+    assert series_mod.member_ids(series_mod.get_series(sid)) == [b]
+    assert series_mod.series_for_project(a) is None
+    # Its rows leave the numbering; the document that is left keeps its numbers.
+    mapping = series_mod.load_mapping(sid)
+    assert list(mapping["members"]) == [b]
+    assert [r["global"] for r in _rows(mapping, b)] == [3, 4]
+    assert client.get(f"/api/series/{sid}").status_code == 200
+
+
+def test_removing_a_document_the_series_never_had_changes_nothing(client):
+    a = _novel(client, "Kept Novel", [1, 2])
+    sid = _series(client, "Kept", [a])
+    before = series_mod.get_series(sid)
+    assert series_mod.remove_member(sid, "aaaaaaaaaaaa") is None
+    assert series_mod.remove_member("nosuchseries", a) is None
+    assert series_mod.get_series(sid) == before
+
+
 # ---- numbering ------------------------------------------------------------
 
 
