@@ -192,6 +192,33 @@ def _accumulate(into: dict, src: dict) -> None:
         into[k] = into.get(k, 0) + v
 
 
+def error_detail(result) -> str:
+    """What went wrong, from a result the agent flagged as an error.
+
+    The reason is usually in ``result``. Claude Code reports a refused or cut-off reply,
+    an over-long prompt or an expired login as an ordinary-looking result whose TEXT is
+    the error, and on exactly those its ``subtype`` says "success" -- which is how
+    "agent error: success" reached the screen with the real message thrown away. So the
+    subtype is only the last resort; the status code, the error list, the text and why
+    the reply stopped all come first.
+    """
+    parts = []
+    status = getattr(result, "api_error_status", None)
+    if status:
+        parts.append(f"HTTP {status}")
+    errors = getattr(result, "errors", None)
+    if errors:
+        parts.append("; ".join(str(e) for e in errors) if isinstance(errors, (list, tuple))
+                     else str(errors))
+    text = str(getattr(result, "result", None) or "").strip()
+    if text:
+        parts.append(text if len(text) <= 300 else text[:300] + "…")
+    stop = getattr(result, "stop_reason", None)
+    if stop and stop not in ("end_turn", "stop_sequence"):
+        parts.append(f"stopped: {stop}")
+    return " — ".join(parts) or str(getattr(result, "subtype", None) or "unknown error")
+
+
 def _extract_usage(result: ResultMessage) -> dict:
     out = {
         "input_tokens": 0,
@@ -353,7 +380,7 @@ class Translator:
                 cost = msg.total_cost_usd or 0.0
                 usage = _extract_usage(msg)
                 if msg.is_error:
-                    detail = msg.api_error_status or msg.errors or msg.subtype
+                    detail = error_detail(msg)
                     # A 429 is a rate limit — treat it like the rejected RateLimitEvent
                     # so it pauses/resumes gracefully instead of surfacing a raw error.
                     # The SDK often emits a warning RateLimitEvent (with resets_at)
