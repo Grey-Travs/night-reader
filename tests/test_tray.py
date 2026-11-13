@@ -274,9 +274,12 @@ def test_the_menu_is_rebuilt_only_when_the_status_changes():
     icon.refresh(_snap(jobs=[_job(current=88)], queued=1))
     assert len(updates) == 2
     import pystray
-    labels = [item.text for item in icon.menu_items() if item is not pystray.Menu.SEPARATOR]
-    assert labels[0] == "When That Day Comes: ch 88"
-    assert labels[-3:] == ["Open Night Reader", "Restart", "Quit Night Reader"]
+    items = list(icon.menu_items())
+    labels = [item.text for item in items]
+    # Actions on top, then a line, then the status.
+    assert labels[:5] == ["Open Night Reader", "- - - -", "Restart", "Quit Night Reader", "- - - -"]
+    assert labels[5] == "When That Day Comes: ch 88"
+    assert items[0].default and items[1] is pystray.Menu.SEPARATOR
 
 
 def test_a_status_line_opens_the_activity_page():

@@ -278,13 +278,14 @@ class Tray:
         says the status changed."""
         import pystray
 
-        for line in self._lines:
-            yield pystray.MenuItem(line, self.open_activity)
-        yield pystray.Menu.SEPARATOR
+        # The actions first and the status under them, the way the user laid it out.
         yield pystray.MenuItem("Open Night Reader", self.open, default=True)
         yield pystray.Menu.SEPARATOR
         yield pystray.MenuItem("Restart", self.restart)
         yield pystray.MenuItem("Quit Night Reader", self.quit)
+        yield pystray.Menu.SEPARATOR
+        for line in self._lines:
+            yield pystray.MenuItem(line, self.open_activity)
 
     def quit(self, *_) -> None:
         self._leave(restart=False)
