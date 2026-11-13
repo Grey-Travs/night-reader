@@ -102,3 +102,68 @@ def test_main_works_from_any_folder(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["launch.py"])
     launch.main()
     assert Path(os.getcwd()) == launch.ROOT
+
+
+# ---- what the icon says while it works --------------------------------------------------
+
+def _snap(**over):
+    snap = {"jobs": [], "queued": 0, "eta": None, "today": {"done": 0, "failed": 0},
+            "last_failed_at": None}
+    snap.update(over)
+    return snap
+
+
+def _job(**over):
+    job = {"pid": "p1", "name": "When That Day Comes", "kind": "translate", "current": 87,
+           "waiting": None, "hold": None, "paused": False}
+    job.update(over)
+    return job
+
+
+def test_hovering_says_the_chapter_the_novel_what_is_left_and_when():
+    eta = 1_800_000_000.0
+    text = tray.tooltip(_snap(jobs=[_job()], queued=12, eta=eta))
+    assert text == f"Night Reader: ch 87 · When That Day Comes · 12 left · done ~{tray._clock(eta)}"
+
+
+def test_hovering_when_idle_gives_todays_tally():
+    assert tray.tooltip(_snap(today={"done": 14, "failed": 1})) == \
+        "Night Reader: nothing running · today 14 done, 1 failed"
+    assert tray.tooltip(None) == "Night Reader"
+
+
+def test_a_long_tooltip_is_cut_to_what_windows_shows():
+    text = tray.tooltip(_snap(jobs=[_job(name="N" * 300)], queued=3))
+    assert len(text) <= tray.TIP_MAX and text.endswith("…")
+
+
+def test_the_dot_says_how_it_is_going():
+    now = 1_800_000_000.0
+    from datetime import datetime, timezone
+    recent = datetime.fromtimestamp(now - 600, timezone.utc).isoformat()
+    old = datetime.fromtimestamp(now - 7200, timezone.utc).isoformat()
+    assert tray.dot(_snap(), now) is None
+    assert tray.dot(_snap(jobs=[_job()]), now) == "working"
+    assert tray.dot(_snap(jobs=[_job(waiting={"resume_at": now + 60})]), now) == "waiting"
+    assert tray.dot(_snap(jobs=[_job(paused=True)]), now) == "waiting"
+    assert tray.dot(_snap(jobs=[_job()], last_failed_at=recent), now) == "failed"
+    assert tray.dot(_snap(jobs=[_job()], last_failed_at=old), now) == "working"
+
+
+def test_refresh_only_touches_the_icon_on_a_change():
+    icon, *_ = _tray()
+
+    class FakeIcon:
+        title, icon, sets = "", None, 0
+
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+            if name == "title":
+                object.__setattr__(self, "sets", self.sets + 1)
+
+    icon._icon = FakeIcon()
+    icon._images = {None: "plain", "working": "green"}
+    snap = _snap(jobs=[_job()], queued=2)
+    icon.refresh(snap)
+    icon.refresh(snap)
+    assert icon._icon.sets == 1 and icon._icon.icon == "green"

@@ -128,6 +128,7 @@ class StreamHooks:
     on_text: Callable[[str], None] | None = None            # a chunk of English arrived
     on_reset: Callable[[str], None] | None = None           # discard shown text (retry/chunk)
     on_chunk: Callable[[int, int], None] | None = None      # chunk i of n starting
+    on_stage: Callable[[str], None] | None = None           # e.g. "checking", for "what step"
     abort: threading.Event | None = None                    # set -> raise TranslationAborted
 
     def aborted(self) -> bool:
@@ -146,6 +147,9 @@ class StreamHooks:
 
     def chunk(self, i: int, n: int) -> None:
         _emit(self.on_chunk, i, n)
+
+    def stage(self, name: str) -> None:
+        _emit(self.on_stage, name)
 
 
 class RateLimitedError(RuntimeError):

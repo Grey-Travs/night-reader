@@ -383,6 +383,8 @@ def process_chapter(
     # call on chapters the fast checks already rejected; "always" checks every chapter.
     mode = getattr(cfg.translation, "deep_check", "flagged")
     if mode == "always" or (mode == "flagged" and not validation.ok):
+        if hooks is not None:
+            hooks.stage("checking")  # a second call with no streamed text: say what it is
         result, validation = _deep_check_and_fix(translator, src, result, validation, cfg, glossary.relevant_to(src.text))
 
     status = state_mod.STATUS_VALIDATED if validation.ok else state_mod.STATUS_NEEDS_REVIEW

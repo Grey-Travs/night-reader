@@ -217,6 +217,13 @@ export const api = {
     post(`/api/projects/${pid}/translate/cancel`, { stop_current: stopCurrent }),
   resumeNow: (pid) => post(`/api/projects/${pid}/translate/resume`),
   queueOverview: () => get('/api/queue'),
+  // What is running, how far along, when it should be done, today's tally, free memory.
+  // brief leaves out the failed-chapter list (only the Activity page lists it).
+  activity: (brief = false) => get(`/api/activity${brief ? '?brief=true' : ''}`),
+  activitySettings: (body) => put('/api/activity/settings', body),
+  pauseQueue: (pid) => post(`/api/projects/${pid}/translate/pause`),
+  continueQueue: (pid) => post(`/api/projects/${pid}/translate/continue`),
+  queueNext: (pid, index) => post(`/api/projects/${pid}/translate/next`, { index }),
   activeJob: (pid) => get(`/api/projects/${pid}/active-job`),
   streamUrl: (pid, jobId) => `/api/projects/${pid}/translate/${jobId}/stream`,
 

@@ -105,6 +105,7 @@ from . import glossary_merge
 from . import hands_free
 from . import importing
 from . import intake
+from . import activity
 from . import completion
 from . import keep_awake
 from . import pages as pages_mod
@@ -5455,6 +5456,15 @@ class Job:
         self.hands_free_chapters: set[int] = set()
         self.told_waiting = False
         self.novel = ""
+        # When the item in progress started, for "how long has this taken" and for
+        # learning how long a chapter usually takes.
+        self.item_started_at: float | None = None
+        # Pause: finish the chapter in progress, then wait with the queue kept, until
+        # Continue. Not Stop, which empties the queue. And while waiting, why:
+        # {reason: "paused" | "memory", since}. None when not holding.
+        self.user_paused = False
+        self.hold: dict | None = None
+        self.notices = activity.JobNotices()
 
     # ---- queue access (always under _pending_lock) ----
     def enqueue(self, items: list[tuple[int, bool, str]], *,
@@ -5495,6 +5505,22 @@ class Job:
         with self._pending_lock:
             self.pending.appendleft(item)
 
+    def move_to_front(self, index: int) -> bool:
+        """Make a waiting chapter the next one done. It goes behind any photos still
+        waiting to be read, which go first for the same reason ``enqueue`` puts them
+        there: the book is open now, and a translation can wait."""
+        with self._pending_lock:
+            at = next((pos for pos, (idx, _f, kind) in enumerate(self.pending)
+                       if idx == index and kind not in PAGE_TASK_KINDS), None)
+            if at is None:
+                return False
+            item = self.pending[at]
+            del self.pending[at]
+            front = next((pos for pos, (_i, _f, kind) in enumerate(self.pending)
+                          if kind not in PAGE_TASK_KINDS), len(self.pending))
+            self.pending.insert(front, item)
+            return True
+
     def drain(self) -> list[tuple[int, bool, str]]:
         """Remove and return everything still waiting."""
         with self._pending_lock:
@@ -5529,7 +5555,9 @@ class Job:
         return {"current": self.current, "kind": kind,
                 "pending": [i for i, _, _ in pending],
                 "resumable": self.resumable(),
-                "waiting": self.waiting}
+                "waiting": self.waiting,
+                "paused": self.user_paused,
+                "hold": self.hold}
 
     def publish(self, ev: dict) -> None:
         """Fan an event out to every connected stream and remember it for replay.
@@ -5547,6 +5575,11 @@ class Job:
         console.print_event(self.pid, ev)
         for q in list(self.subscribers):
             q.put_nowait(ev)
+        # Before hands-free, which forgets a chapter once it has told the phone about it.
+        try:
+            _activity_heard(self, ev)
+        except Exception as exc:  # noqa: BLE001 — a notice never breaks a job
+            errors.log_error(errors.explain(exc), where=f"activity/{self.pid}")
         if self.hands_free:
             try:
                 _hands_free_heard(self, ev)
@@ -5593,6 +5626,46 @@ _FALLBACK_WAIT = 5 * 60          # first retry when the SDK gave no resets_at
 _FALLBACK_WAIT_MAX = 60 * 60     # backoff cap for unknown reset times
 _MAX_WAIT = 12 * 3600            # sanity cap: distrust reset times further out than this
 _MAX_STRIKES = 6                 # consecutive rate-limited retries before giving up
+
+
+_HOLD_RECHECK = 15.0             # sec between looks while holding for memory
+
+
+def _hold_reason(job: Job, *, holding: str | None = None) -> str | None:
+    """Why this job should not start its next item now: ``"paused"`` by the user,
+    ``"memory"`` when the hold is switched on and memory is short, else None."""
+    if job.user_paused:
+        return "paused"
+    settings = activity.load_settings()
+    if activity.memory_low(settings, activity.free_memory(), holding=holding == "memory"):
+        return "memory"
+    return None
+
+
+async def _wait_while_held(job: Job) -> None:
+    """Wait, keeping the queue, while the job is paused or held for memory.
+
+    Woken early by Continue (``job.wake``). Rate-limit waiting is separate, in
+    ``_sleep_until``: Continue must not cut a rate-limit wait short, and doesn't, because
+    it only wakes a job that is holding here.
+    """
+    told: str | None = None
+    while not job.cancelled and job.pending:
+        reason = _hold_reason(job, holding=told)
+        if reason is None:
+            break
+        if reason != told:
+            job.hold = {"reason": reason, "since": time.time()}
+            job.publish({"type": "hold", "reason": reason})
+            told = reason
+        job.wake.clear()
+        try:
+            await asyncio.wait_for(job.wake.wait(), timeout=_HOLD_RECHECK)
+        except asyncio.TimeoutError:
+            pass
+    if told is not None:
+        job.hold = None
+        job.publish({"type": "released"})
 
 
 async def _sleep_until(job: Job, when: float) -> None:
@@ -5681,6 +5754,8 @@ def _build_hooks(job: Job, loop: asyncio.AbstractEventLoop) -> tuple[StreamHooks
             # reconnect/restart only lost the current chunk, so keep what earlier
             # chunks committed (see StreamHooks' docstring).
             job.live["english"] = "" if reason == "retry" else job.live.get("committed", "")
+            if reason == "retry":
+                job.live["attempt"] = job.live.get("attempt", 1) + 1
             job.publish_live({"type": "reset", "index": job.live.get("index"),
                               "reason": reason, "english": job.live["english"]})
         loop.call_soon_threadsafe(apply)
@@ -5698,8 +5773,16 @@ def _build_hooks(job: Job, loop: asyncio.AbstractEventLoop) -> tuple[StreamHooks
                               "chunk": [i, n]})
         loop.call_soon_threadsafe(apply)
 
+    def on_stage(name: str) -> None:
+        _flush(force=True)
+
+        def apply() -> None:
+            if job.live is not None:
+                job.live["stage"] = name
+        loop.call_soon_threadsafe(apply)
+
     hooks = StreamHooks(on_source=on_source, on_text=on_text, on_reset=on_reset,
-                        on_chunk=on_chunk, abort=job.abort)
+                        on_chunk=on_chunk, on_stage=on_stage, abort=job.abort)
     return hooks, lambda: _flush(force=True)
 
 
@@ -5931,6 +6014,11 @@ async def _run_worker(job: Job, cfg: Config) -> None:
     # work — start_translation keeps appending to this job while it waits).
     strikes = 0  # consecutive rate-limit hits; any completed chapter resets it
     while not job.cancelled:
+        # Between chapters only: Pause lets the chapter in progress finish.
+        if job.pending:
+            await _wait_while_held(job)
+            if job.cancelled:
+                break
         item = job.take_next()
         if item is None:
             # Hands-free: the queue ran dry, so look for what the work just done made
@@ -5943,6 +6031,7 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         idx, force, kind = item
         job.current = idx
         job.kind = kind
+        job.item_started_at = time.time()
         # A page item's index is a page sequence number, so it must NOT be looked up
         # in the chapter map below — after a build, page 5 and chapter 5 both exist.
         if kind in PAGE_TASK_KINDS:
@@ -6115,6 +6204,11 @@ async def _run_worker(job: Job, cfg: Config) -> None:
         rec = state.get(idx) or {}
         job.queued.discard(_queue_key(idx, kind))
         job.current = None
+        # Only a full translation that got somewhere teaches how long one takes: a repair
+        # or an empty/English tab would skew "done around".
+        if (kind == TASK_TRANSLATE and job.item_started_at
+                and status_val in state_mod.TRANSLATED_STATUSES):
+            activity.record_duration(time.time() - job.item_started_at)
         totals = state.totals()
         job.publish({"type": "chapter", "index": idx, "kind": kind,
                      "status": status_val,
@@ -6870,6 +6964,201 @@ def queue_overview() -> dict:
         project = pj.get_project(pid) or {}
         jobs.append({"pid": pid, "name": project.get("name", "Novel"), **job.queue_state()})
     return {"jobs": jobs}
+
+
+# ---- Activity: what is running, how far along, when it should be done ----------------
+#
+# One snapshot for the sidebar's status line, the Activity page and the icon by the clock,
+# so the three can never disagree. The figures that are not about live jobs (settings,
+# chapter times, today's tally, memory) live in server/activity.py.
+
+def _novel_name(job: Job) -> str:
+    return job.novel or (pj.get_project(job.pid) or {}).get("name") or "Your novel"
+
+
+def _step_text(live: dict) -> str | None:
+    """Where the chapter in progress is: "paragraph 34 of 80 · part 1 of 2", or
+    "checking the translation" once the English is in and a second look is being taken."""
+    if not live:
+        return None
+    if live.get("stage") == "checking":
+        return "checking the translation"
+    parts = []
+    source = live.get("source") or []
+    if source:
+        done = min(_paragraph_count(live.get("english") or ""), len(source))
+        parts.append(f"paragraph {done} of {len(source)}" if done else "starting")
+    chunk = live.get("chunk") or [1, 1]
+    if len(chunk) == 2 and chunk[1] > 1:
+        parts.append(f"part {chunk[0]} of {chunk[1]}")
+    if live.get("attempt", 1) > 1:
+        parts.append(f"try {live['attempt']}")
+    return " · ".join(parts) or None
+
+
+def _job_activity(job: Job, now: float, typical: float | None) -> dict:
+    pending = job.snapshot_pending()
+    live = job.live or {}
+    running = job.current is not None
+    kind = job.kind if running else (pending[0][2] if pending else job.kind)
+    page_work = kind in PAGE_TASK_KINDS
+    elapsed = (now - job.item_started_at) if running and job.item_started_at else None
+    chapters_waiting = sum(1 for _i, _f, k in pending if k not in PAGE_TASK_KINDS)
+    return {
+        "pid": job.pid,
+        "name": _novel_name(job),
+        "kind": kind,
+        "current": job.current,
+        "title": live.get("title") if running and not page_work else None,
+        "step": _step_text(live) if running and not page_work else None,
+        "elapsed": elapsed,
+        "pending": [i for i, _f, _k in pending],
+        "in_queue": (1 if running else 0) + len(pending),
+        "waiting": job.waiting,
+        "paused": job.user_paused,
+        "hold": job.hold,
+        "eta": activity.job_eta(
+            now=now, typical=typical, chapters_waiting=chapters_waiting,
+            elapsed=None if page_work else elapsed,
+            waiting_until=(job.waiting or {}).get("resume_at"),
+            held=job.user_paused or job.hold is not None),
+    }
+
+
+def activity_snapshot(*, brief: bool = False) -> dict:
+    """Everything the status line, the Activity page and the tray icon show.
+
+    ``brief`` leaves out the failed-chapter list, which only the Activity page lists.
+    ``now`` is the server's clock, so a phone with a slow clock still counts minutes right.
+    """
+    now = time.time()
+    typical = activity.typical_seconds()
+    settings = activity.load_settings()
+    jobs = []
+    for jid in list(_active_job_by_project.values()):
+        job = _jobs.get(jid)
+        if job is not None and not job.done:
+            jobs.append(_job_activity(job, now, typical))
+    report = activity.library_report(now)
+    known = [j["eta"] for j in jobs if j["eta"] is not None]
+    out = {
+        "now": now,
+        "jobs": jobs,
+        "queued": sum(j["in_queue"] for j in jobs),
+        # Novels translate side by side, so the whole lot is done when the slowest is.
+        "eta": max(known) if known else None,
+        "typical_seconds": typical,
+        "today": report["today"],
+        "failed_count": len(report["failed"]),
+        "last_failed_at": report["last_failed_at"],
+        "memory": activity.memory_state(settings),
+        "settings": settings,
+    }
+    if not brief:
+        out["failed"] = report["failed"]
+    return out
+
+
+_NOTICE_EVENTS = ("chapter", "waiting", "resumed", "paused", "done")
+
+
+def _activity_heard(job: Job, ev: dict) -> None:
+    """What a job's events mean for the Activity figures and the notices. On the loop,
+    from publish."""
+    kind = ev.get("type")
+    if kind not in _NOTICE_EVENTS:
+        return
+    if kind == "chapter":
+        activity.invalidate()
+    notice = job.notices.heard(
+        ev, novel=_novel_name(job), settings=activity.load_settings(),
+        hands_free_job=job.hands_free,
+        hands_free_chapter=ev.get("index") in job.hands_free_chapters,
+        cancelled=job.cancelled)
+    if notice:
+        remote.notify(*notice)
+
+
+@app.get("/api/activity")
+def activity_route(brief: bool = False) -> dict:
+    return activity_snapshot(brief=brief)
+
+
+class ActivitySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    notify_finished: bool | None = None
+    notify_failed: bool | None = None
+    notify_limit: bool | None = None
+    toasts: bool | None = None
+    hold_on_low_memory: bool | None = None
+    low_memory_mb: int | None = None
+
+
+@app.put("/api/activity/settings")
+async def activity_settings_route(body: ActivitySettings) -> dict:
+    change = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        settings = activity.update_settings(change)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # A job holding for memory looks again now, rather than in up to 15 seconds.
+    for jid in list(_active_job_by_project.values()):
+        job = _jobs.get(jid)
+        if job is not None and not job.done and job.hold is not None:
+            job.wake.set()
+    return {"settings": settings, "memory": activity.memory_state(settings)}
+
+
+def _running_job(pid: str) -> Job | None:
+    jid = _active_job_by_project.get(pid)
+    job = _jobs.get(jid) if jid else None
+    return job if job is not None and not job.done else None
+
+
+# These three are async on purpose: they publish to the job's streams and set its wake
+# event, which belong to the event loop and must not be touched from a request thread.
+@app.post("/api/projects/{pid}/translate/pause")
+async def pause_queue(pid: str) -> dict:
+    """Finish the chapter in progress, then wait with the queue kept until Continue.
+
+    Unlike Stop, nothing is dropped. The other novels carry on, so this is also how one
+    novel gets Claude's full attention: pause the others.
+    """
+    require_project(pid)
+    job = _running_job(pid)
+    if job is None:
+        raise HTTPException(409, "Nothing is running for this novel, so there's nothing to pause.")
+    if not job.user_paused:
+        job.user_paused = True
+        job.publish({"type": "pausing"})
+    return {"ok": True, **job.queue_state()}
+
+
+@app.post("/api/projects/{pid}/translate/continue")
+async def continue_queue(pid: str) -> dict:
+    require_project(pid)
+    job = _running_job(pid)
+    if job is None:
+        return {"ok": True, "continued": False}
+    job.user_paused = False
+    if job.hold is not None:
+        job.wake.set()   # only a job holding in _wait_while_held, never a rate-limit wait
+    return {"ok": True, "continued": True, **job.queue_state()}
+
+
+class QueueNext(BaseModel):
+    index: int
+
+
+@app.post("/api/projects/{pid}/translate/next")
+async def queue_next(pid: str, body: QueueNext) -> dict:
+    """Make a waiting chapter the next one translated."""
+    require_project(pid)
+    job = _running_job(pid)
+    if job is None or not job.move_to_front(body.index):
+        raise HTTPException(404, f"Chapter {body.index} isn't waiting in this novel's queue.")
+    job.publish({"type": "reordered", "index": body.index})
+    return {"ok": True, **job.queue_state()}
 
 
 @app.get("/api/projects/{pid}/active-job")

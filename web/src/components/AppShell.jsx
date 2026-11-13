@@ -1,6 +1,7 @@
 import { Suspense, useEffect, useState } from 'react'
-import { NavLink, Outlet } from 'react-router-dom'
+import { Link, NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
+import { statusLine, tabTitle, todayLine, useActivity } from '../activity'
 import { Dot } from './ui'
 import ThemeToggle from './ThemeToggle'
 import CommandPalette from './CommandPalette'
@@ -13,7 +14,7 @@ const NAV = [
   { to: '/series', icon: '📖', label: 'Series' },
   { to: '/posting', icon: '📤', label: 'Posting' },
   { to: '/import', icon: '📥', label: 'Import' },
-  { to: '/activity', icon: '⚡', label: 'Activity' },
+  { to: '/activity', icon: '⚡', label: 'Activity', badge: 'activity' },
   { to: '/review', icon: '🚩', label: 'Review' },
   { to: '/scans', icon: '📷', label: 'Scans' },
   { to: '/upkeep', icon: '🧹', label: 'Upkeep', badge: 'upkeep' },
@@ -39,7 +40,36 @@ function StatsLink({ className = '' }) {
   )
 }
 
+// What is running, always in view at the foot of the sidebar: the chapter, the novel, how
+// much is left and when it should be done. Opens the Activity page.
+export function StatusLine({ act }) {
+  const line = statusLine(act)
+  const today = todayLine(act)
+  if (!line && !today) return null
+  const failed = act?.today?.failed > 0
+  return (
+    <Link to="/activity" className="block rounded-btn px-2 py-1.5 text-xs hover:bg-[var(--b-muted-bg)]" aria-label="What's running">
+      {line && (
+        <>
+          <div className="flex items-center gap-1.5 font-medium text-ink">
+            <span
+              className={`inline-block h-2 w-2 shrink-0 rounded-full ${line.job.waiting || line.job.hold ? '' : 'animate-pulse'}`}
+              style={{ background: line.job.waiting || line.job.hold ? 'var(--b-review-tx)' : 'var(--accent)' }}
+              aria-hidden
+            />
+            <span className="truncate">{line.headline}</span>
+          </div>
+          <div className="mt-0.5 truncate text-muted">{line.detail}</div>
+        </>
+      )}
+      {today && <div className={`mt-0.5 truncate ${failed ? 'text-danger' : 'text-hint'}`}>{today}</div>}
+    </Link>
+  )
+}
+
 export default function AppShell({ status, setStatus, onSetup }) {
+  const [act] = useActivity({ brief: true, every: 5000 })
+  useEffect(() => { document.title = tabTitle(act) }, [act])
   // How many glossary suggestions are waiting library-wide. Cheap (one small JSON read
   // per novel) and fetched once per mount, so the sidebar can show there's work to do
   // without the user having to go looking for it.
@@ -51,7 +81,9 @@ export default function AppShell({ status, setStatus, onSetup }) {
       .catch(() => { /* a badge is not worth surfacing an error for */ })
     return () => { alive = false }
   }, [])
-  const badgeFor = (n) => (n.badge === 'upkeep' && upkeepCount > 0 ? upkeepCount : null)
+  const queued = act?.queued || 0
+  const badgeFor = (n) => (n.badge === 'upkeep' && upkeepCount > 0 ? upkeepCount
+    : n.badge === 'activity' && queued > 0 ? queued : null)
 
   return (
     <div className="flex min-h-screen bg-page text-ink">
@@ -79,6 +111,7 @@ export default function AppShell({ status, setStatus, onSetup }) {
           ))}
         </nav>
         <div className="mt-auto flex flex-col gap-3 px-2 pt-4">
+          <StatusLine act={act} />
           <div className="flex items-center gap-3 text-xs text-muted">
             <span className="flex items-center gap-1.5"><Dot ok={status?.google_logged_in} /> Google</span>
             <span className="flex items-center gap-1.5"><Dot ok={status?.claude_logged_in} /> Claude</span>
@@ -99,6 +132,9 @@ export default function AppShell({ status, setStatus, onSetup }) {
               <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => `navlink shrink-0 !py-1.5 ${isActive ? 'navlink-active' : ''}`} title={n.label}>
                 <span className="navicon" aria-hidden>{n.icon}</span>
                 <span className="text-xs">{n.label}</span>
+                {n.badge === 'activity' && queued > 0 && (
+                  <span className="pill pill-review !px-1 !py-0 text-[10px]">{queued}</span>
+                )}
               </NavLink>
             ))}
           </nav>

@@ -264,6 +264,16 @@ export default function ProjectLayout() {
         }
       } else if (e.type === 'queued') {
         setLog((l) => [...l, { kind: 'info', text: `Queued ${(e.added || []).length} chapter${(e.added || []).length === 1 ? '' : 's'}` }])
+      } else if (e.type === 'pausing') {
+        setLog((l) => [...l, { kind: 'info', text: 'Pausing after this chapter (the queue is kept)…' }])
+      } else if (e.type === 'hold') {
+        setLog((l) => [...l, { kind: 'warn', text: e.reason === 'memory'
+          ? 'Holding: free memory is low. It carries on by itself once there is room.'
+          : 'Paused. Press Continue on the Activity page to carry on.' }])
+      } else if (e.type === 'released') {
+        setLog((l) => [...l, { kind: 'info', text: 'Carrying on…' }])
+      } else if (e.type === 'reordered') {
+        setLog((l) => [...l, { kind: 'info', text: `Chapter ${e.index} moved to the front of the queue` }])
       } else if (e.type === 'waiting') {
         // The SERVER is riding this out and will resume by itself — keep the
         // stream open and `running` true; no client timer. localStorage is kept

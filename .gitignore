@@ -10,6 +10,9 @@ remote.json
 # taken in (see server/telegram_bot.py). The token is the key to the bot.
 telegram.json
 telegram_state.json
+# The Activity page's settings (notices, the low-memory hold) and recent chapter times
+# (see server/activity.py). Personal, not source.
+activity.json
 
 # Personal config (holds your settings; copy from config.example.toml)
 config.toml
