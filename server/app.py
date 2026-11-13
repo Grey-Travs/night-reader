@@ -7090,6 +7090,7 @@ class ActivitySettings(BaseModel):
     notify_failed: bool | None = None
     notify_limit: bool | None = None
     toasts: bool | None = None
+    popup_style: str | None = None
     hold_on_low_memory: bool | None = None
     low_memory_mb: int | None = None
 
@@ -7107,6 +7108,19 @@ async def activity_settings_route(body: ActivitySettings) -> dict:
         if job is not None and not job.done and job.hold is not None:
             job.wake.set()
     return {"settings": settings, "memory": activity.memory_state(settings)}
+
+
+@app.post("/api/activity/test-popup")
+def test_popup_route() -> dict:
+    """Show what a notice looks like on this PC, in the chosen style. Nothing goes to
+    Telegram or the phone."""
+    shown = activity.popup("Test pop-up", "This is how Night Reader will tell you something. "
+                                          "Press OK to close it.")
+    if not shown:
+        raise HTTPException(409, "This copy of the app has no icon by the clock, so it can't pop "
+                                 "anything up. The icon appears when Night Reader is started "
+                                 "with start.bat or at sign-in on Windows.")
+    return {"shown": True}
 
 
 def _running_job(pid: str) -> Job | None:

@@ -12,12 +12,12 @@ import { api } from '../api'
 vi.mock('../api', () => ({
   api: {
     activity: vi.fn(), activitySettings: vi.fn(), pauseQueue: vi.fn(), continueQueue: vi.fn(),
-    queueNext: vi.fn(), translate: vi.fn(), allPendingTerms: vi.fn(),
+    queueNext: vi.fn(), translate: vi.fn(), allPendingTerms: vi.fn(), testPopup: vi.fn(),
   },
 }))
 
 const SETTINGS = {
-  notify_finished: true, notify_failed: true, notify_limit: true, toasts: true,
+  notify_finished: true, notify_failed: true, notify_limit: true, toasts: true, popup_style: 'box',
   hold_on_low_memory: false, low_memory_mb: 500,
 }
 
@@ -43,7 +43,7 @@ describe('ActivityPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     api.activity.mockResolvedValue(snapshot())
-    for (const fn of ['pauseQueue', 'continueQueue', 'queueNext', 'translate']) api[fn].mockResolvedValue({ ok: true })
+    for (const fn of ['pauseQueue', 'continueQueue', 'queueNext', 'translate', 'testPopup']) api[fn].mockResolvedValue({ ok: true })
     api.activitySettings.mockImplementation(async (change) => ({
       settings: { ...SETTINGS, ...change }, memory: snapshot().memory,
     }))
@@ -92,6 +92,34 @@ describe('ActivityPage', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /A chapter fails/ }))
     await waitFor(() => expect(api.activitySettings).toHaveBeenCalledWith({ notify_failed: false }))
     expect(screen.getByText('2.8 GB free of 7.8 GB')).toBeTruthy()
+  })
+})
+
+describe('the desktop pop-up', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    api.activity.mockResolvedValue(snapshot())
+    api.testPopup.mockResolvedValue({ shown: true })
+    api.activitySettings.mockImplementation(async (change) => ({
+      settings: { ...SETTINGS, ...change }, memory: snapshot().memory,
+    }))
+  })
+
+  it('is a box that waits for OK unless the corner is chosen, and can be tried', async () => {
+    page()
+    const box = await screen.findByRole('radio', { name: /stays until I press OK/ })
+    expect(box.checked).toBe(true)
+    fireEvent.click(screen.getByRole('radio', { name: /in the corner/ }))
+    await waitFor(() => expect(api.activitySettings).toHaveBeenCalledWith({ popup_style: 'corner' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Show a test pop-up' }))
+    await waitFor(() => expect(api.testPopup).toHaveBeenCalled())
+  })
+
+  it('says why when this copy of the app cannot pop anything up', async () => {
+    api.testPopup.mockRejectedValue(new Error("This copy of the app has no icon by the clock"))
+    page()
+    fireEvent.click(await screen.findByRole('button', { name: 'Show a test pop-up' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('no icon by the clock')
   })
 })
 

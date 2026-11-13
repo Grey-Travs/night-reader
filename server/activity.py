@@ -41,9 +41,14 @@ DEFAULTS = {
     "notify_failed": True,        # a chapter failed
     "notify_limit": True,         # Claude's usage limit paused the work, and when it resumed
     "toasts": True,               # Windows pop-ups from the icon, as well as Telegram/phone
+    # "box": in the middle of the screen, on top, until OK is pressed -- the user wants a
+    # notice to interrupt them. "corner": the usual notification, which fades and which
+    # Windows hides altogether under Focus Assist.
+    "popup_style": "box",
     "hold_on_low_memory": False,  # an option, so off until the user turns it on
     "low_memory_mb": 500,
 }
+CHOICES = {"popup_style": ("box", "corner")}
 LOW_MEMORY_RANGE = (100, 16000)
 # Once holding for memory, carry on only with this much more than the threshold free, or
 # a chapter starting (and its process taking memory) would put it straight back.
@@ -82,7 +87,7 @@ def _clean(saved: dict) -> dict:
     out = dict(DEFAULTS)
     for key, default in DEFAULTS.items():
         value = saved.get(key)
-        if type(value) is type(default):
+        if type(value) is type(default) and value in CHOICES.get(key, (value,)):
             out[key] = value
     return out
 
@@ -105,10 +110,33 @@ def update_settings(change: dict) -> dict:
             if key == "low_memory_mb" and not LOW_MEMORY_RANGE[0] <= value <= LOW_MEMORY_RANGE[1]:
                 raise ValueError(f"The memory threshold must be between {LOW_MEMORY_RANGE[0]} "
                                  f"and {LOW_MEMORY_RANGE[1]} MB.")
+            if key in CHOICES and value not in CHOICES[key]:
+                raise ValueError(f"{key} must be one of {', '.join(CHOICES[key])}.")
             current[key] = value
         doc["settings"] = current
         _write(doc)
     return current
+
+
+# ---- the desktop pop-up ---------------------------------------------------------------
+#
+# The icon by the clock (server/tray.py) registers how it pops a notice up, so the
+# Activity page's test button can show one without sending anything to Telegram or the
+# phone. None when there is no icon: not Windows, or started some other way.
+_popup = {"show": None}
+
+
+def set_popup(show) -> None:
+    _popup["show"] = show
+
+
+def popup(title: str, body: str) -> bool:
+    """Pop a notice up on this PC now, in the chosen style. False when nothing can."""
+    show = _popup["show"]
+    if show is None:
+        return False
+    show(title, body)
+    return True
 
 
 # ---- how long a chapter takes ---------------------------------------------------------

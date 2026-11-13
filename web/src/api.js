@@ -221,6 +221,7 @@ export const api = {
   // brief leaves out the failed-chapter list (only the Activity page lists it).
   activity: (brief = false) => get(`/api/activity${brief ? '?brief=true' : ''}`),
   activitySettings: (body) => put('/api/activity/settings', body),
+  testPopup: () => post('/api/activity/test-popup'),
   pauseQueue: (pid) => post(`/api/projects/${pid}/translate/pause`),
   continueQueue: (pid) => post(`/api/projects/${pid}/translate/continue`),
   queueNext: (pid, index) => post(`/api/projects/${pid}/translate/next`, { index }),

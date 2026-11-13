@@ -49,6 +49,7 @@ def test_a_change_is_kept_and_the_rest_left_alone():
     {"low_memory_mb": True},        # True is an int in Python; it must not become 1 MB
     {"low_memory_mb": 20},
     {"toasts": "yes"},
+    {"popup_style": "loud"},
 ])
 def test_a_bad_setting_is_refused(change):
     with pytest.raises(ValueError):
@@ -58,8 +59,22 @@ def test_a_bad_setting_is_refused(change):
 
 def test_a_hand_edited_file_with_wrong_types_falls_back_to_defaults(tmp_path):
     (tmp_path / "activity.json").write_text(json.dumps(
-        {"settings": {"toasts": "no", "low_memory_mb": "lots"}}), encoding="utf-8")
+        {"settings": {"toasts": "no", "low_memory_mb": "lots", "popup_style": "loud"}}),
+        encoding="utf-8")
     assert act.load_settings() == act.DEFAULTS
+
+
+def test_the_pop_up_is_a_box_that_waits_unless_the_corner_is_chosen():
+    assert act.load_settings()["popup_style"] == "box"
+    assert act.update_settings({"popup_style": "corner"})["popup_style"] == "corner"
+
+
+def test_a_pop_up_needs_the_icon_to_show_it(monkeypatch):
+    monkeypatch.setitem(act._popup, "show", None)
+    assert act.popup("Test", "x") is False
+    shown = []
+    act.set_popup(lambda title, body: shown.append(title))
+    assert act.popup("Test", "x") is True and shown == ["Test"]
 
 
 # ---- how long a chapter takes, and when the queue is done -------------------------------

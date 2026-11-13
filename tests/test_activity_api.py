@@ -133,6 +133,17 @@ def test_the_settings_can_be_changed_and_a_bad_one_is_refused(client):
     assert client.put("/api/activity/settings", json={"nonsense": True}).status_code == 422
 
 
+def test_the_test_pop_up_shows_on_this_pc_only(client, monkeypatch):
+    shown = []
+    monkeypatch.setitem(activity._popup, "show", lambda title, body: shown.append(title))
+    sent = []
+    monkeypatch.setattr(remote, "notify", lambda *a: sent.append(a))
+    assert client.post("/api/activity/test-popup").json() == {"shown": True}
+    assert shown == ["Test pop-up"] and sent == []
+    monkeypatch.setitem(activity._popup, "show", None)
+    assert client.post("/api/activity/test-popup").status_code == 409
+
+
 def test_a_paused_job_waits_between_chapters_until_continue(client):
     pid = _novel(client)
     job = _job(pid)

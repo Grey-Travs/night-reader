@@ -77,7 +77,8 @@ export default function ActivityPage() {
 
       {act?.failed?.length > 0 && <FailedCard failed={act.failed} busy={busy} run={run} />}
       {act && <MemoryCard act={act} busy={busy} save={saveSettings} />}
-      {act && <NoticesCard settings={act.settings} busy={busy} save={saveSettings} />}
+      {act && <NoticesCard settings={act.settings} busy={busy} save={saveSettings}
+        test={() => run('popup', () => api.testPopup())} />}
     </div>
   )
 }
@@ -225,7 +226,12 @@ const NOTICES = [
   ['notify_limit', "Claude's limit pauses the work, and when it carries on"],
 ]
 
-function NoticesCard({ settings = {}, busy, save }) {
+const STYLES = [
+  ['box', 'A box in the middle of the screen that stays until I press OK'],
+  ['corner', 'A notification in the corner that fades by itself'],
+]
+
+function NoticesCard({ settings = {}, busy, save, test }) {
   return (
     <section className="card mt-6 p-4" aria-label="Notices">
       <h2 className="font-medium">Tell me when</h2>
@@ -240,8 +246,23 @@ function NoticesCard({ settings = {}, busy, save }) {
         <label className="flex items-center gap-2 border-t border-[var(--border)] pt-2 text-sm">
           <input type="checkbox" checked={!!settings.toasts} disabled={busy === 'settings'}
             onChange={(e) => save({ toasts: e.target.checked })} />
-          Pop up by the clock on this PC
+          Pop up on this PC
         </label>
+        {settings.toasts && (
+          <fieldset className="ml-6 space-y-1" aria-label="How it pops up">
+            {STYLES.map(([value, label]) => (
+              <label key={value} className="flex items-center gap-2 text-sm">
+                <input type="radio" name="popup_style" value={value} disabled={busy === 'settings'}
+                  checked={(settings.popup_style || 'box') === value}
+                  onChange={() => save({ popup_style: value })} />
+                {label}
+              </label>
+            ))}
+            <button className="btn btn-ghost mt-1 px-2 py-1 text-xs" disabled={busy === 'popup'} onClick={test}>
+              Show a test pop-up
+            </button>
+          </fieldset>
+        )}
       </div>
       <p className="mt-2 text-xs text-hint">
         These also go to your Telegram bot, if it's paired, and to phone notifications, if they're set up in Settings.

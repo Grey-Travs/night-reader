@@ -7,7 +7,9 @@ restarting while a job is still working asks first, because no job survives a re
 Hovering says what it is doing ("ch 87 of When That Day Comes · 12 left · done ~21:40"),
 and a dot on the icon says how it is going: green working, amber waiting (Claude's
 limit, paused, or short of memory), red a chapter failed in the last hour. The notices
-the phone and Telegram get also pop up here, unless that is switched off on Activity.
+the phone and Telegram get also pop up here: by default as a box in the middle of the
+screen that stays until OK, or as a notification in the corner, or not at all, as chosen
+on the Activity page.
 
 Optional on purpose: on an install from before pystray and Pillow were listed, or on
 anything but Windows, the app runs exactly as before, just without the icon.
@@ -15,6 +17,7 @@ anything but Windows, the app runs exactly as before, just without the icon.
 
 from __future__ import annotations
 
+import queue
 import sys
 import threading
 import time
@@ -121,6 +124,76 @@ def ask(question: str) -> bool:
     return ctypes.windll.user32.MessageBoxW(None, question, TITLE, flags) == IDYES
 
 
+POPUP_MAX = 8                   # notices listed in one box; the rest are counted
+POPUP_GATHER_S = 1.0            # notices this close together share a box
+_WARNING_WORDS = ("failed", "stopped", "waiting")
+
+
+def show_box(title: str, text: str, *, warning: bool = False) -> None:
+    """A box in the middle of the screen, above every other window, that stays until OK.
+
+    Blocks its thread until then, so it is only ever called from ``Popups``' own thread.
+    Windows may refuse to hand it the keyboard while you type elsewhere, but it is still
+    drawn on top; a game in exclusive full screen can still cover it.
+    """
+    import ctypes
+
+    MB_OK, MB_ICONWARNING, MB_ICONINFORMATION = 0x0, 0x30, 0x40
+    MB_SYSTEMMODAL, MB_SETFOREGROUND, MB_TOPMOST = 0x1000, 0x10000, 0x40000
+    flags = (MB_OK | (MB_ICONWARNING if warning else MB_ICONINFORMATION)
+             | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST)
+    ctypes.windll.user32.MessageBoxW(None, text, title, flags)
+
+
+def combine(items: list[tuple[str, str]]) -> tuple[str, str, bool]:
+    """Notices that arrived together, as one box: ``(title, text, warning)``. A warning
+    (the icon and sound Windows uses for one) when any of them is bad news."""
+    warning = any(word in (title or "").lower() for title, _ in items for word in _WARNING_WORDS)
+    if len(items) == 1:
+        title, body = items[0]
+        return f"{TITLE}: {title}", body or title, warning
+    lines = [f"{title}\n{body}" if body else title for title, body in items[:POPUP_MAX]]
+    if len(items) > POPUP_MAX:
+        lines.append(f"…and {len(items) - POPUP_MAX} more.")
+    return f"{TITLE}: {len(items)} notices", "\n\n".join(lines), warning
+
+
+class Popups:
+    """Boxes that wait for OK, one at a time. Notices arriving while one is open wait and
+    are shown together in the next, rather than stacking ten boxes deep."""
+
+    def __init__(self, show: Callable[..., None] = show_box, gather: float = POPUP_GATHER_S):
+        self._show = show
+        self._gather = gather
+        self._queue: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def add(self, title: str, body: str) -> None:
+        self._queue.put((title, body))
+        with self._lock:
+            if self._thread is None:
+                # One thread for good, asleep on the queue between notices. Daemon, so it
+                # never keeps the app alive.
+                self._thread = threading.Thread(target=self._run, name="tray-popup", daemon=True)
+                self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            items = [self._queue.get()]
+            time.sleep(self._gather)
+            while True:
+                try:
+                    items.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            title, text, warning = combine(items)
+            try:
+                self._show(title, text, warning=warning)
+            except Exception:  # noqa: BLE001 - one failed box must not end the pop-ups
+                pass
+
+
 def _question(jobs: int, restart: bool) -> str:
     what = "A job is" if jobs == 1 else f"{jobs} jobs are"
     if restart:
@@ -144,6 +217,7 @@ class Tray:
         self._images: dict[str | None, object] = {}
         self._shown: tuple[str, str | None] | None = None
         self._quit = threading.Event()
+        self._popups = Popups()
 
     def open(self, *_) -> None:
         self._open_url(self.url)
@@ -186,8 +260,9 @@ class Tray:
         threading.Thread(target=self._icon.run, name="tray", daemon=True).start()
         threading.Thread(target=self._watch, name="tray-status", daemon=True).start()
         try:
-            from server import remote
+            from server import activity, remote
             remote.add_sink(self.toast)
+            activity.set_popup(self.pop_up)
         except Exception:  # noqa: BLE001 - pop-ups are a nicety; the icon still works
             pass
         return True
@@ -211,14 +286,28 @@ class Tray:
             self.refresh(snapshot())
 
     def toast(self, title: str, body: str) -> None:
-        """A Windows pop-up for a notice. Called by remote.notify on any thread."""
-        if self._icon is None:
-            return
+        """A notice from remote.notify, on any thread: popped up unless that is off."""
         try:
             from server import activity
             if not activity.load_settings().get("toasts", True):
                 return
-            self._icon.notify(body or title, title)
+        except Exception:  # noqa: BLE001
+            return
+        self.pop_up(title, body)
+
+    def pop_up(self, title: str, body: str) -> None:
+        """Show a notice in the chosen style: a box that waits for OK, or a notification
+        in the corner. Never blocks the caller."""
+        try:
+            from server import activity
+            style = activity.load_settings().get("popup_style", "box")
+        except Exception:  # noqa: BLE001
+            style = "box"
+        try:
+            if style == "box":
+                self._popups.add(title, body)
+            elif self._icon is not None:
+                self._icon.notify(body or title, title)
         except Exception:  # noqa: BLE001 - a missed pop-up is not worth an error
             pass
 
@@ -226,8 +315,9 @@ class Tray:
         """Take the icon down, or Windows leaves a dead one by the clock until hovered."""
         self._quit.set()
         try:
-            from server import remote
+            from server import activity, remote
             remote.remove_sink(self.toast)
+            activity.set_popup(None)
         except Exception:  # noqa: BLE001
             pass
         if self._icon is None:

@@ -167,3 +167,59 @@ def test_refresh_only_touches_the_icon_on_a_change():
     icon.refresh(snap)
     icon.refresh(snap)
     assert icon._icon.sets == 1 and icon._icon.icon == "green"
+
+
+# ---- the pop-up that waits for OK --------------------------------------------------------
+
+def test_one_notice_is_one_box_and_bad_news_gets_the_warning_icon():
+    assert tray.combine([("Finished: Novel", "3 chapters translated.")]) == \
+        ("Night Reader: Finished: Novel", "3 chapters translated.", False)
+    assert tray.combine([("Chapter 31 failed", "Novel: refusal")])[2] is True
+
+
+def test_notices_that_arrive_together_share_one_box():
+    items = [(f"Chapter {i} failed", "why") for i in range(10)] + [("Finished: N", "done")]
+    title, text, warning = tray.combine(items)
+    assert title == "Night Reader: 11 notices" and warning
+    assert text.count("failed") == tray.POPUP_MAX and text.endswith("…and 3 more.")
+
+
+def test_boxes_are_shown_one_at_a_time_with_the_backlog_together():
+    import threading
+    shown, done = [], threading.Event()
+
+    def show(title, text, *, warning=False):
+        shown.append(title)
+        if len(shown) == 1:
+            done.wait(2)   # the first box stays open while more notices arrive
+
+    popups = tray.Popups(show=show, gather=0.05)
+    popups.add("Chapter 1 failed", "a")
+    import time
+    time.sleep(0.2)
+    popups.add("Chapter 2 failed", "b")
+    popups.add("Finished: N", "c")
+    done.set()
+    for _ in range(100):
+        if len(shown) == 2:
+            break
+        time.sleep(0.02)
+    assert shown == ["Night Reader: Chapter 1 failed", "Night Reader: 2 notices"]
+
+
+def test_a_notice_pops_up_in_the_chosen_style(monkeypatch, tmp_path):
+    from server import activity
+    monkeypatch.setenv("NR_ACTIVITY_SETTINGS", str(tmp_path / "activity.json"))
+    icon, *_ = _tray()
+    boxed, cornered = [], []
+    icon._popups = type("P", (), {"add": lambda self, t, b: boxed.append(t)})()
+    icon._icon = type("I", (), {"notify": lambda self, b, t: cornered.append(t)})()
+
+    icon.toast("Chapter 3 failed", "why")
+    activity.update_settings({"popup_style": "corner"})
+    icon.toast("Finished: N", "done")
+    activity.update_settings({"toasts": False})
+    icon.toast("Chapter 4 failed", "why")
+    icon.pop_up("Test pop-up", "shown even with notices off")
+    assert boxed == ["Chapter 3 failed"]
+    assert cornered == ["Finished: N", "Test pop-up"]
