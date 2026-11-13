@@ -129,6 +129,15 @@ POPUP_GATHER_S = 1.0            # notices this close together share a box
 _WARNING_WORDS = ("failed", "stopped", "waiting")
 
 
+def _log(message: str) -> None:
+    """A line in the launcher's log (logs/launch.log in the background): a pop-up that
+    fails must leave a trace, or "it didn't show" can never be looked into."""
+    try:
+        print(f"  [{time.strftime('%H:%M:%S')}] icon: {message}", flush=True)
+    except Exception:  # noqa: BLE001 - no console and no log: nothing more to do
+        pass
+
+
 def show_box(title: str, text: str, *, warning: bool = False) -> None:
     """A box in the middle of the screen, above every other window, that stays until OK.
 
@@ -190,8 +199,8 @@ class Popups:
             title, text, warning = combine(items)
             try:
                 self._show(title, text, warning=warning)
-            except Exception:  # noqa: BLE001 - one failed box must not end the pop-ups
-                pass
+            except Exception as exc:  # noqa: BLE001 - one failed box must not end the pop-ups
+                _log(f"a pop-up could not be shown: {exc!r}")
 
 
 def _question(jobs: int, restart: bool) -> str:
@@ -307,9 +316,10 @@ class Tray:
             if style == "box":
                 self._popups.add(title, body)
             elif self._icon is not None:
+                # Windows takes this and says nothing when Focus Assist then hides it.
                 self._icon.notify(body or title, title)
-        except Exception:  # noqa: BLE001 - a missed pop-up is not worth an error
-            pass
+        except Exception as exc:  # noqa: BLE001 - a missed pop-up is not worth an error dialog
+            _log(f"a {style} pop-up could not be shown: {exc!r}")
 
     def stop(self) -> None:
         """Take the icon down, or Windows leaves a dead one by the clock until hovered."""

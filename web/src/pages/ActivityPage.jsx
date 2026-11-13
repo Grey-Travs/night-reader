@@ -228,7 +228,9 @@ const NOTICES = [
 
 const STYLES = [
   ['box', 'A box in the middle of the screen that stays until I press OK'],
-  ['corner', 'A notification in the corner that fades by itself'],
+  // Found on this PC in November 2026: Focus Assist on "Priority only" swallowed every
+  // corner notification, Windows' own included, while the box still showed.
+  ['corner', 'A notification in the corner that fades by itself (Windows hides these while Focus Assist is on)'],
 ]
 
 function NoticesCard({ settings = {}, busy, save, test }) {
