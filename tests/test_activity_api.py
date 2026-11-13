@@ -35,6 +35,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("NR_ACTIVITY_SETTINGS", str(tmp_path / "activity.json"))
     monkeypatch.setattr(activity, "_durations", None)
     monkeypatch.setitem(activity._last_limit_notice, "at", 0.0)
+    monkeypatch.setitem(activity._pace, "at", None)
     activity.invalidate()
     monkeypatch.setattr(A, "load_global_config", lambda: Config())
     A._chapter_cache.clear()

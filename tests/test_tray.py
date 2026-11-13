@@ -223,3 +223,63 @@ def test_a_notice_pops_up_in_the_chosen_style(monkeypatch, tmp_path):
     icon.pop_up("Test pop-up", "shown even with notices off")
     assert boxed == ["Chapter 3 failed"]
     assert cornered == ["Finished: N", "Test pop-up"]
+
+
+# ---- the status at the top of the right-click menu --------------------------------------
+
+def test_the_menu_lists_each_novel_what_is_left_when_and_failures():
+    eta = 1_800_000_000.0
+    snap = _snap(jobs=[_job(pending=[2, 3, 4, 5, 6, 7], current=1, name="When That Day Comes 2")],
+                 queued=7, eta=eta, failed_count=2, today={"done": 398, "failed": 1})
+    assert tray.menu_lines(snap) == [
+        "When That Day Comes 2: ch 1, 6 waiting",
+        f"7 chapters left · done ~{tray._clock(eta)}",
+        "⚠ 2 failed chapters: open to retry",
+        "Today: 398 done",
+    ]
+
+
+def test_the_menu_when_idle_or_before_a_finish_time_is_known():
+    assert tray.menu_lines(_snap(today={"done": 3, "failed": 0})) == [
+        "Nothing running", "No failed chapters", "Today: 3 done"]
+    lines = tray.menu_lines(_snap(jobs=[_job(paused=True, current=None, hold={"reason": "paused"})],
+                                  queued=4))
+    assert lines[:2] == ["When That Day Comes: paused", "4 chapters left · finish time after this chapter"]
+    assert tray.menu_lines(None) == ["Starting…"]
+
+
+def test_many_novels_are_counted_and_an_ampersand_survives_windows():
+    jobs = [_job(pid=str(i), name=f"N{i}") for i in range(5)]
+    jobs[0]["name"] = "Love & War"
+    lines = tray.menu_lines(_snap(jobs=jobs, queued=9))
+    assert lines[0].startswith("Love && War: ch 87")
+    assert lines[3] == "…and 2 more novels"
+
+
+def test_the_menu_is_rebuilt_only_when_the_status_changes():
+    icon, *_ = _tray()
+    updates = []
+
+    class FakeIcon:
+        title, icon = "", None
+
+        def update_menu(self):
+            updates.append(1)
+
+    icon._icon = FakeIcon()
+    icon._images = {None: "plain", "working": "green"}
+    snap = _snap(jobs=[_job()], queued=2)
+    icon.refresh(snap)
+    icon.refresh(snap)
+    icon.refresh(_snap(jobs=[_job(current=88)], queued=1))
+    assert len(updates) == 2
+    import pystray
+    labels = [item.text for item in icon.menu_items() if item is not pystray.Menu.SEPARATOR]
+    assert labels[0] == "When That Day Comes: ch 88"
+    assert labels[-3:] == ["Open Night Reader", "Restart", "Quit Night Reader"]
+
+
+def test_a_status_line_opens_the_activity_page():
+    icon, _stops, _asked, opened = _tray()
+    icon.open_activity()
+    assert opened == ["http://localhost:8000/activity"]

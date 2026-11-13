@@ -22,6 +22,7 @@ def fresh(monkeypatch, tmp_path):
     monkeypatch.setenv("NR_ACTIVITY_SETTINGS", str(tmp_path / "activity.json"))
     monkeypatch.setattr(act, "_durations", None)
     monkeypatch.setitem(act._last_limit_notice, "at", 0.0)
+    monkeypatch.setitem(act._pace, "at", None)
     act._files.clear()
     act.invalidate()
     root = tmp_path / "projects"
@@ -94,6 +95,23 @@ def test_chapter_times_survive_a_restart(monkeypatch):
     act.record_duration(200)
     monkeypatch.setattr(act, "_durations", None)   # as a fresh process would start
     assert act.typical_seconds() == 200
+
+
+def test_before_any_chapter_is_timed_the_pace_comes_from_the_library(fresh):
+    base = datetime.now(timezone.utc) - timedelta(hours=2)
+    at = lambda s: (base + timedelta(seconds=s)).isoformat()   # noqa: E731
+    _novel(fresh, "alpha", {
+        "1": {"status": "validated", "translated_at": at(0)},
+        "2": {"status": "validated", "translated_at": at(240)},     # took 4 min
+        "3": {"status": "validated", "translated_at": at(480)},     # 4 min
+        "4": {"status": "needs-review", "translated_at": at(780)},  # 5 min
+        "5": {"status": "validated", "translated_at": at(5000)},    # a break, not a chapter
+        "6": {"status": "validated", "translated_at": at(5003)},    # arrived translated
+    })
+    assert act.library_pace() == 240
+    assert act.typical_seconds() == 240
+    act.record_duration(100)                 # once a chapter is timed here, that wins
+    assert act.typical_seconds() == 100
 
 
 def test_eta_counts_the_waiting_chapters_and_what_is_left_of_this_one():

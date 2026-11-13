@@ -171,9 +171,55 @@ def record_duration(seconds: float) -> None:
 
 def typical_seconds() -> float | None:
     """How long a chapter usually takes: the median of the recent ones, which one stalled
-    retry doesn't drag the way it would an average."""
+    retry doesn't drag the way it would an average. Until a chapter has been timed here,
+    the pace read off the library (``library_pace``) stands in, so "done around" shows
+    from the first chapter rather than after it."""
     recent = list(_load_durations())[-_TYPICAL_OF:]
-    return float(statistics.median(recent)) if recent else None
+    if recent:
+        return float(statistics.median(recent))
+    return library_pace()
+
+
+_PACE_TTL = 3600.0
+_PACE_WINDOW = 7 * 86400.0          # finishes older than a week say little about now
+_PACE_GAP = (20.0, 1800.0)          # shorter is an import, longer is a break between runs
+_pace = {"at": None, "value": None}
+
+
+def _epoch(stamp: str | None) -> float | None:
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def library_pace(now: float | None = None) -> float | None:
+    """How long a chapter has been taking, read from when recent ones finished.
+
+    A novel has one worker, so its chapters finish one after another, and the gap between
+    two finishing back to back is how long the second took. Gaps shorter than 20 s are
+    chapters that arrived already translated; longer than half an hour, a break between
+    runs. The median of the 30 most recent gaps; cached for an hour.
+    """
+    now = time.time() if now is None else now
+    if _pace["at"] is not None and time.monotonic() - _pace["at"] < _PACE_TTL:
+        return _pace["value"]
+    gaps: list[tuple[float, float]] = []
+    for project in pj.list_projects():
+        pid = str(project.get("id") or "")
+        if not pid:
+            continue
+        stamps = sorted(
+            t for rec in _chapters(pj.PROJECTS_DIR / pid / "state.json").values()
+            if isinstance(rec, dict) and rec.get("status") in state_mod.TRANSLATED_STATUSES
+            and (t := _epoch(rec.get("translated_at"))) is not None and now - t < _PACE_WINDOW)
+        gaps += [(later, later - earlier) for earlier, later in zip(stamps, stamps[1:])
+                 if _PACE_GAP[0] <= later - earlier <= _PACE_GAP[1]]
+    recent = [gap for _end, gap in sorted(gaps, reverse=True)[:_DURATIONS_KEPT]]
+    _pace.update(at=time.monotonic(), value=float(statistics.median(recent)) if recent else None)
+    return _pace["value"]
 
 
 def job_eta(*, now: float, typical: float | None, chapters_waiting: int,

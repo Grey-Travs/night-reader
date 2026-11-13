@@ -48,6 +48,54 @@ def _clock(epoch: float) -> str:
     return time.strftime("%H:%M", time.localtime(epoch))
 
 
+def _doing(job: dict) -> str:
+    """What one novel's queue is doing, in a few words."""
+    if job.get("waiting"):
+        at = job["waiting"].get("resume_at")
+        return f"waiting for Claude's limit{f' until {_clock(at)}' if at else ''}"
+    if job.get("hold"):
+        return "paused" if job["hold"].get("reason") == "paused" else "holding: memory is low"
+    if job.get("current") is not None:
+        noun = "page" if job.get("kind") in ("ocr", "ocr-verify") else "ch"
+        return f"{noun} {job['current']}" + (" (pausing after it)" if job.get("paused") else "")
+    return "paused" if job.get("paused") else "starting"
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+MENU_NOVELS = 3                 # novels listed by name in the menu; the rest are counted
+
+
+def menu_lines(snap: dict | None) -> list[str]:
+    """The status at the top of the icon's right-click menu: each novel and its chapter,
+    what is left and when it should be done, failed chapters, and today's tally."""
+    if not snap:
+        return ["Starting…"]
+    jobs = snap.get("jobs") or []
+    lines = []
+    for job in jobs[:MENU_NOVELS]:
+        waiting = len(job.get("pending") or [])
+        lines.append(f"{job.get('name') or 'Novel'}: {_doing(job)}"
+                     + (f", {waiting} waiting" if waiting else ""))
+    if len(jobs) > MENU_NOVELS:
+        lines.append(f"…and {_plural(len(jobs) - MENU_NOVELS, 'more novel')}")
+    if jobs:
+        left = f"{_plural(snap.get('queued', 0), 'chapter')} left"
+        lines.append(left + (f" · done ~{_clock(snap['eta'])}" if snap.get("eta")
+                             else " · finish time after this chapter"))
+    else:
+        lines.append("Nothing running")
+    failed = snap.get("failed_count") or 0
+    lines.append(f"⚠ {_plural(failed, 'failed chapter')}: open to retry" if failed
+                 else "No failed chapters")
+    today = snap.get("today") or {}
+    lines.append(f"Today: {today.get('done', 0)} done")
+    # A menu item's "&" marks a shortcut key on Windows, which would swallow it from a name.
+    return [line.replace("&", "&&") for line in lines]
+
+
 def tooltip(snap: dict | None) -> str:
     """One line for hovering over the icon."""
     if not snap:
@@ -60,18 +108,7 @@ def tooltip(snap: dict | None) -> str:
         text = f"{TITLE}: nothing running · {tally}"
     else:
         job = next((j for j in jobs if j.get("current") is not None), jobs[0])
-        if job.get("waiting"):
-            at = job["waiting"].get("resume_at")
-            doing = f"waiting for Claude's limit{f' until {_clock(at)}' if at else ''}"
-        elif job.get("hold"):
-            doing = ("paused" if job["hold"].get("reason") == "paused"
-                     else "holding: memory is low")
-        elif job.get("current") is not None:
-            noun = "page" if job.get("kind") in ("ocr", "ocr-verify") else "ch"
-            doing = f"{noun} {job['current']}"
-        else:
-            doing = "starting"
-        parts = [f"{doing} · {job.get('name') or 'Novel'}"]
+        parts = [f"{_doing(job)} · {job.get('name') or 'Novel'}"]
         others = len(jobs) - 1
         parts.append(f"{snap.get('queued', 0)} left" + (f" in {others + 1} novels" if others else ""))
         if snap.get("eta"):
@@ -225,11 +262,29 @@ class Tray:
         self._icon = None
         self._images: dict[str | None, object] = {}
         self._shown: tuple[str, str | None] | None = None
+        self._lines: list[str] = menu_lines(None)
         self._quit = threading.Event()
         self._popups = Popups()
 
     def open(self, *_) -> None:
         self._open_url(self.url)
+
+    def open_activity(self, *_) -> None:
+        """A status line was clicked: open the page with the detail, and Retry."""
+        self._open_url(self.url.rstrip("/") + "/activity")
+
+    def menu_items(self):
+        """The menu, from the latest status. pystray calls this whenever ``update_menu``
+        says the status changed."""
+        import pystray
+
+        for line in self._lines:
+            yield pystray.MenuItem(line, self.open_activity)
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Open Night Reader", self.open, default=True)
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Restart", self.restart)
+        yield pystray.MenuItem("Quit Night Reader", self.quit)
 
     def quit(self, *_) -> None:
         self._leave(restart=False)
@@ -256,12 +311,9 @@ class Tray:
         self._images = {None: image}
         for name, colour in DOTS.items():
             self._images[name] = _with_dot(image, colour)
-        menu = pystray.Menu(
-            pystray.MenuItem("Open Night Reader", self.open, default=True),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Restart", self.restart),
-            pystray.MenuItem("Quit Night Reader", self.quit),
-        )
+        # Built from a function, so the status lines at the top can change; on Windows the
+        # menu is made ahead of time, so ``refresh`` calls update_menu when they do.
+        menu = pystray.Menu(self.menu_items)
         self._icon = pystray.Icon("NightReader", image, TITLE, menu)
         # pystray makes its window on the thread that runs it, and that thread pumps the
         # window's messages, so the whole icon lives there. Daemon, so it can never be
@@ -280,6 +332,13 @@ class Tray:
         """Bring the tooltip and the dot up to date, touching the icon only on a change."""
         if self._icon is None:
             return
+        lines = menu_lines(snap)
+        if lines != self._lines:
+            self._lines = lines
+            try:
+                self._icon.update_menu()
+            except Exception:  # noqa: BLE001 - not up yet, or already gone
+                self._lines = []
         shown = (tooltip(snap), dot(snap))
         if shown == self._shown:
             return
