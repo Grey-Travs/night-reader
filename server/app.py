@@ -105,6 +105,7 @@ from . import glossary_merge
 from . import hands_free
 from . import importing
 from . import intake
+from . import completion
 from . import keep_awake
 from . import pages as pages_mod
 from . import pdf_pages
@@ -4563,7 +4564,11 @@ def create_series_route(body: CreateSeries) -> dict:
     for member, seed in zip(series["members"], seeds):
         member["start_chapter"] = seed["start_chapter"]
     series_mod.write_series(series)
-    return _series_summary(series, None)
+    # The status now lives on the series, so a part whose source already shows the end
+    # has to say so there.
+    for pid in body.project_ids:
+        completion.recheck(pid)
+    return _series_summary(series_mod.get_series(series["id"]) or series, None)
 
 
 @app.get("/api/series/{sid}")
@@ -4616,6 +4621,9 @@ def add_series_member_route(sid: str, body: AddMember) -> dict:
         series = series_mod.add_member(sid, body.project_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # A finished part 2 joining its series finishes the series.
+    if completion.recheck(body.project_id):
+        series = series_mod.get_series(sid) or series
     mapping = series_mod.load_mapping(sid)
     out = _series_summary(series, mapping)
     # The stored mapping was resolved before this document existed, so it has no rows for

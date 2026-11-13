@@ -30,6 +30,8 @@ from translation_bot.chapter_numbers import (  # noqa: E402
     KIND_DUPLICATE,
     KIND_SIDE,
     detect_gaps_duplicates,
+    ending_signal,
+    find_ending,
     infer_mapping,
     parse_chapter_number,
     parse_tab_title,
@@ -262,6 +264,80 @@ def test_index_is_never_renumbered():
     # previous/, audit/ and variants/. Only `global` is new.
     rows = infer_mapping(_doc([101, 102, 1, 2]), start_hint=101)
     assert [r.index for r in rows] == [1, 2, 3, 4]
+
+
+# ---- side stories and the end of the novel ---------------------------------
+#
+# The shape of "When That Day Comes": every line of the export header is its own
+# paragraph, so the heading that says "외전" is the SECOND block, under the URL line.
+
+NOTICE = "※ 본 저작물의 권리는 저작권자에게 있습니다. 저작물을 복사, 복제, 수정, 배포할 경우"
+
+
+def _tab(index, heading, *, closing=None, body=BODY):
+    paragraphs = [f"ridibooks.com/books/{3885049000 + index}/view", f"{TITLE} {heading}",
+                  "4-5 minutes", body]
+    if closing:
+        paragraphs.append(closing)
+    paragraphs.append(NOTICE)
+    return Chapter(index=index, title=f"Tab {index}", paragraphs=paragraphs)
+
+
+def test_a_document_of_only_side_stories_takes_no_chapter_numbers():
+    # "When That Day Comes 2" is side stories 24-30. Read as chapters, the series hint
+    # made them chapters 139-145 at HIGH confidence -- nothing asked anyone.
+    tabs = [_tab(i, f"외전 {23 + i}화") for i in range(1, 8)]
+    rows = infer_mapping(tabs, start_hint=139, taken=set(range(1, 139)))
+    assert {r.kind for r in rows} == {KIND_SIDE}
+    assert [r.global_number for r in rows] == [None] * 7
+    assert [r.header_number for r in rows] == list(range(24, 31))
+    assert {r.confidence for r in rows} == {"high"}
+
+
+def test_side_stories_after_the_finale_need_no_review():
+    # A restart alone is a guess, so it is forced into review (see the test above). A
+    # restart whose headings SAY "외전 N화" is not a guess.
+    tabs = [_tab(1, "137화"), _tab(2, "138화 (완결)"), _tab(3, "외전 1화"), _tab(4, "외전 2화")]
+    rows = infer_mapping(tabs, start_hint=137)
+    assert [(r.global_number, r.kind) for r in rows[:2]] == [(137, KIND_CHAPTER), (138, KIND_CHAPTER)]
+    assert [(r.global_number, r.kind, r.confidence) for r in rows[2:]] == [
+        (None, KIND_SIDE, "high"), (None, KIND_SIDE, "high")]
+
+
+def test_the_finale_is_found_from_its_heading():
+    tabs = [_tab(1, "137화"), _tab(2, "138화 (완결)")]
+    assert find_ending(tabs) == {"index": 2, "kind": "story", "signal": "heading"}
+
+
+def test_the_last_side_story_is_the_end_when_it_says_so():
+    tabs = [_tab(1, "138화 (완결)"), _tab(2, "외전 1화"), _tab(3, "외전 2화 (완결)")]
+    assert find_ending(tabs) == {"index": 3, "kind": "side", "signal": "heading"}
+
+
+def test_the_finale_is_found_from_its_closing_line():
+    # The heading of the last chapter does not always carry the tag; the export still
+    # closes the book with "<title> 마침" above the publisher's notice.
+    tabs = [_tab(1, "146화"), _tab(2, "147화", closing=f"{TITLE} 마침")]
+    assert find_ending(tabs) == {"index": 2, "kind": "story", "signal": "closing line"}
+    assert ending_signal("Tab 9", _tab(9, "69화", closing="-完-").text) == "closing line"
+    assert ending_signal("Tab 9", _tab(9, "25화", closing=f"『{TITLE}』 완결").text) == "closing line"
+
+
+def test_the_end_of_a_part_or_an_arc_is_not_the_end_of_the_novel():
+    # All real heading shapes: part one ending, an arc closing with "(완)", a subtitle
+    # that merely contains "마지막 화…", and a closing line ending part one.
+    assert ending_signal("Tab 1", _tab(1, "100화 (1부 완결)").text) is None
+    assert ending_signal("Tab 1", _tab(1, "1부 최종화").text) is None
+    assert ending_signal("Tab 1", _tab(1, "45화 그날 (완)").text) is None
+    assert ending_signal("Tab 1", _tab(1, "12화 마지막 화살").text) is None
+    assert ending_signal("Tab 1", _tab(1, "47화", closing=f"〈{TITLE}〉 1부 완결").text) is None
+
+
+def test_an_ordinary_chapter_is_not_an_ending():
+    assert ending_signal("Tab 1", _tab(1, "12화").text) is None
+    # A line of dialogue or narration that happens to be "끝." is not an end marker.
+    assert ending_signal("Tab 1", _tab(1, "12화", closing="끝.").text) is None
+    assert find_ending([_tab(1, "1화"), _tab(2, "2화")]) is None
 
 
 if __name__ == "__main__":

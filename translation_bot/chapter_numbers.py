@@ -84,6 +84,34 @@ _KIND_WORDS = (
     ("side story", KIND_SIDE),
 )
 
+# A side-story word with its own number right after it: "외전 3화", "번외 2", "Side Story 4".
+_SIDE_NUMBERED_RE = re.compile(r"(?:외전|번외|side\s*story)\s*(?:제\s*)?\d", re.IGNORECASE)
+
+# --- the end of the novel ---------------------------------------------------
+# How the source marks its finale. In the export, the last chapter's heading is tagged
+# "138화 (완결)" -- and so is the last side story, "외전 30화 (완결)" -- and the final
+# book closes with "<title> 마침" (or "<title> 외전 마침") just above the publisher's notice.
+#
+# The tag has to be the WHOLE bracket. "(1부 완결)" ends part one, not the novel, and
+# "(완)" closes a story arc ("그날 (1)", "(2)", "(완)") -- both are common in chapter
+# headings, so a looser match would call ongoing novels finished.
+_END_TAG_RE = re.compile(
+    r"[(\[<〈《【]\s*(?:완결|최종화|마지막\s*화|完結|end|final|completed?)\s*[)\]>〉》】]",
+    re.IGNORECASE)
+# "마지막 화" but not "마지막 화살" (the last arrow).
+_END_WORD_RE = re.compile(r"최종화|마지막\s*화(?![가-힣])|final\s+chapter", re.IGNORECASE)
+# "1부 최종화", "2권 완결": the end of a part, which is checked for and NOT counted.
+_PART_END_RE = re.compile(r"\d+\s*(?:부|권|시즌)\s*(?:완결|최종화|마지막)")
+# The closing line: "웬 댓 데이 컴즈 마침", "<완결>", "- 끝 -", "完", "THE END".
+_CLOSING_WORD_RE = re.compile(r"(?:^|[\s(\[<〈《【\-–—])(?:마침|완결)\s*[)\]>〉》】\-–—]*$")
+_CLOSING_MARK_RE = re.compile(
+    r"[\s\-–—<〈(\[《【]*(?:完|the\s+end)[\s\-–—>〉)\]》】.]*"
+    r"|[\s\-–—<〈(\[《【]+(?:끝|end|fin)[\s\-–—>〉)\]》】.]+",
+    re.IGNORECASE)
+# The publisher's rights notice that follows the story ("※ 본 저작물의 권리는 …").
+_NOTICE_RE = re.compile(r"^\s*(?:※|ⓒ|©|copyright\b)", re.IGNORECASE)
+_CLOSING_MAX_CHARS = 40
+
 # A generic tab name carries no information. Treated as an explicit no-signal sentinel
 # rather than as the number it appears to contain.
 _GENERIC_TAB_RE = re.compile(r"^\s*tab\s*\d+\s*$", re.IGNORECASE)
@@ -191,9 +219,21 @@ def parse_tab_title(title: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _heading(title: str, text: str) -> str:
+    """The tab title plus the chapter's opening header lines -- where a chapter says what
+    it is.
+
+    The same two blocks the number is read from. It used to be one, which is only ever
+    the export's URL line ("ridibooks.com/books/…/view"), so a heading like
+    "웬 댓 데이 컴즈 외전 1화" on the line below was never seen: its "1화" was read as
+    chapter 1 while its "외전" was missed.
+    """
+    return f"{title or ''}\n{_first_blocks(text)}"
+
+
 def classify_kind(title: str, text: str) -> tuple[str, str]:
     """``(kind, label)`` from a tab's title and text, defaulting to a plain chapter."""
-    haystack = f"{title or ''}\n{_first_blocks(text, 1)}".casefold()
+    haystack = _heading(title, text).casefold()
     for word, kind in _KIND_WORDS:
         if word in haystack:
             return kind, (title or "").strip()
@@ -367,9 +407,21 @@ def infer_mapping(chapters, *, start_hint: int | None = None,
 def _mark_kinds(rows: list[Row], titles: list[str], texts: list[str]) -> None:
     """Apply prologue/epilogue/side/extra classification without losing a number."""
     for row, title, text in zip(rows, titles, texts):
-        if row.kind != KIND_CHAPTER:
+        if row.kind not in (KIND_CHAPTER, KIND_SIDE):
             continue
         kind, label = classify_kind(title, text)
+        if kind == KIND_SIDE and _SIDE_NUMBERED_RE.search(_heading(title, text)):
+            # The heading names it a side story AND numbers it ("외전 3화"), which is as
+            # certain as a chapter's own "138화" -- so it needs no one to confirm it. This
+            # also settles the rows a restart already guessed were side stories.
+            row.kind = KIND_SIDE
+            row.label = label
+            row.global_number = None
+            row.source = SRC_HEADER
+            row.confidence = CONF_HIGH
+            continue
+        if row.kind != KIND_CHAPTER:
+            continue
         if kind == KIND_CHAPTER:
             continue
         row.kind = kind
@@ -402,6 +454,50 @@ def _mark_duplicates(rows: list[Row], chapters) -> None:
             row.confidence = CONF_HIGH
         else:
             seen[digest] = row.index
+
+
+def _closing_line(text: str) -> str:
+    """The story's last line: the final non-empty line above the publisher's notice."""
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if line and not _NOTICE_RE.match(line):
+            return line
+    return ""
+
+
+def ending_signal(title: str, text: str) -> str | None:
+    """How this chapter says the novel ends here -- ``"heading"`` or ``"closing line"`` --
+    or None for an ordinary chapter."""
+    heading = _heading(title, text)
+    if not _PART_END_RE.search(heading) and (
+            _END_TAG_RE.search(heading) or _END_WORD_RE.search(heading)):
+        return "heading"
+    line = _closing_line(text)
+    # "〈그 혐오스런 희생양〉 1부 완결" closes part one of a novel that carries on.
+    if line and len(line) <= _CLOSING_MAX_CHARS and not _PART_END_RE.search(line) and (
+            _CLOSING_WORD_RE.search(line) or _CLOSING_MARK_RE.fullmatch(line)):
+        return "closing line"
+    return None
+
+
+def find_ending(chapters) -> dict | None:
+    """The last tab that marks the end of the novel, or None if nothing does.
+
+    Returns ``{"index", "kind", "signal"}``, where ``kind`` is ``"side"`` when the tab
+    marked is the last side story (which comes after the story itself has ended) and
+    ``"story"`` otherwise. Either one means the novel is finished.
+    """
+    found = None
+    for chapter in chapters or []:
+        title = getattr(chapter, "title", "") or ""
+        text = getattr(chapter, "text", "") or ""
+        signal = ending_signal(title, text)
+        if signal:
+            kind, _ = classify_kind(title, text)
+            found = {"index": getattr(chapter, "index", None),
+                     "kind": "side" if kind == KIND_SIDE else "story",
+                     "signal": signal}
+    return found
 
 
 def detect_gaps_duplicates(rows: list[Row]) -> dict:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -130,6 +131,12 @@ def _write_project(project: dict) -> dict:
     return project
 
 
+def save_project(project: dict) -> dict:
+    """Write a project record the server itself changed (not a user edit -- that is
+    ``update_project``, which only accepts the editable fields)."""
+    return _write_project(project)
+
+
 def update_project(pid: str, **fields) -> dict:
     """Patch editable project fields (name, style_note, instructions, honorific_note)."""
     project = get_project(pid)
@@ -165,7 +172,11 @@ def create_text_project(name: str, chapters: list[Chapter], *, pid: str | None =
         "chapter_count": len(chapters),
         "created_at": _now(),
     }
-    return _write_project(project)
+    _write_project(project)
+    # Again now that the record exists: the snapshot above was written before there was
+    # a novel to mark, so a finished novel imported whole would otherwise read "ongoing".
+    _notice_ending(pid, chapters)
+    return get_project(pid) or project
 
 
 # ---- image-source projects (photographed / scanned pages) --------------------
@@ -216,6 +227,19 @@ def cache_source(pid: str, chapters: list[Chapter]) -> None:
     atomic_write_text(
         path, json.dumps(chapters_to_records(chapters), ensure_ascii=False, indent=2)
     )
+    # Every source -- a Google Doc re-read, a paste, an import, a page build -- passes
+    # through here, so this is the one place that sees a finale arrive.
+    _notice_ending(pid, chapters)
+
+
+def _notice_ending(pid: str, chapters: list[Chapter]) -> None:
+    """Mark the novel completed if its source shows the end. Best-effort, like the
+    snapshot: noticing the end must never stop a novel from being read."""
+    try:
+        from server.completion import record_ending  # completion -> series -> this module
+        record_ending(pid, chapters)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("could not check %s for its last chapter", pid)
 
 
 def load_cached_source(pid: str) -> list[Chapter]:

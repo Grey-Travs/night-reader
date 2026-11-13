@@ -696,7 +696,11 @@ def _series_totals(doc: dict) -> dict:
     for member in (doc.get("members") or {}).values():
         for row in member.get("rows") or []:
             n = row.get("global")
-            if isinstance(n, int):
+            # A side story numbered in its own sequence ("외전 1화" beside chapter 1) is
+            # neither a duplicate of that chapter nor a chapter of the count. Posting
+            # already keeps them apart by kind (see posting.plan_run); this did not, so
+            # such a series showed every side story as a duplicated chapter.
+            if isinstance(n, int) and row.get("kind") != "side":
                 numbers.append(n)
     if not numbers:
         return {"first": None, "last": None, "gaps": [], "duplicates": [], "total": 0}
